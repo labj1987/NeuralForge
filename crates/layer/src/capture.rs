@@ -284,6 +284,8 @@ pub unsafe fn run(
     physical_device: vk::PhysicalDevice,
     queue: vk::Queue,
     queue_family: u32,
+    capture_image: vk::Image,
+    capture_layout: vk::ImageLayout,
     image: vk::Image,
     width: u32,
     height: u32,
@@ -319,6 +321,7 @@ pub unsafe fn run(
     // throughput for either, and both are rare, deliberately-triggered cases (a
     // developer toggling a debug view, or a one-shot dump request), not the normal
     // per-frame path this function otherwise replaces.
+    if capture_image != image && (settings.debug_view != 0 || shm.capture_request_pending()) { return None; }
     if settings.debug_view != 0 || shm.capture_request_pending() {
         return unsafe {
             run_sync(
@@ -377,7 +380,7 @@ pub unsafe fn run(
             return None;
         }
         let r = resources.as_ref().expect("just ensured above");
-        if capture_pristine(device, r, queue, image, width, height, frame_bytes, original_scratch) {
+        if capture_pristine(device, r, queue, capture_image, capture_layout, width, height, frame_bytes, original_scratch) {
             shm.set_frame_info(width, height, proxy_format);
             shm.write_proxy(original_scratch);
             shm.prepare_motion(instance, physical_device, width, height, proxy_format, original_scratch);
@@ -415,7 +418,7 @@ pub unsafe fn run(
             return None;
         }
         let r = resources.as_ref().expect("just ensured above");
-        if capture_pristine(device, r, queue, image, width, height, frame_bytes, original_scratch) {
+        if capture_pristine(device, r, queue, capture_image, capture_layout, width, height, frame_bytes, original_scratch) {
             shm.set_frame_info(width, height, proxy_format);
             shm.write_proxy(original_scratch);
             shm.prepare_motion(instance, physical_device, width, height, proxy_format, original_scratch);
@@ -524,6 +527,7 @@ fn capture_pristine(
     r: &CaptureResources,
     queue: vk::Queue,
     image: vk::Image,
+    initial_layout: vk::ImageLayout,
     width: u32,
     height: u32,
     frame_bytes: u64,
@@ -541,7 +545,7 @@ fn capture_pristine(
     }
     let to_transfer_src = barrier(
         image,
-        vk::ImageLayout::PRESENT_SRC_KHR,
+        initial_layout,
         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
         vk::AccessFlags::empty(),
         vk::AccessFlags::TRANSFER_READ,
@@ -587,7 +591,7 @@ fn capture_pristine(
     let to_present = barrier(
         image,
         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-        vk::ImageLayout::PRESENT_SRC_KHR,
+        initial_layout,
         vk::AccessFlags::TRANSFER_READ,
         vk::AccessFlags::empty(),
     );
@@ -1265,6 +1269,8 @@ mod tests {
                     physical_device,
                     queue,
                     queue_family,
+                    image,
+                    vk::ImageLayout::PRESENT_SRC_KHR,
                     image,
                     width,
                     height,

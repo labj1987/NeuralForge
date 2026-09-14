@@ -123,6 +123,7 @@ struct State {
     /// creation.  This is diagnostic-only: it never changes a game command buffer.
     observed_swapchain_writes: HashSet<vk::Image>,
     tapped_source_layouts: HashMap<vk::Image, vk::ImageLayout>,
+    tap_sources_by_destination: HashMap<vk::Image, vk::Image>,
 }
 
 type CleanupState = (Arc<ash::Device>, Arc<Mutex<State>>);
@@ -265,7 +266,10 @@ impl NeuralForgeDeviceInfo {
                 kind, src, src_layout, dst, dst_layout, region_count);
             crate::logging::flush();
         }
-        if known { state.tapped_source_layouts.insert(src, src_layout); }
+        if known {
+            state.tapped_source_layouts.insert(src, src_layout);
+            state.tap_sources_by_destination.insert(dst, src);
+        }
     }
 }
 
@@ -450,6 +454,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         {
             let mut state = self.state.lock().unwrap();
             if let Some(old) = state.swapchains.remove(&swapchain) {
+                for image in &old.images { state.tap_sources_by_destination.remove(image); }
                 if let Some(gpu) = &mut state.gpu_compose { gpu.retire_present_images(&old.images); }
             }
         }
@@ -487,13 +492,15 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             let mut state = self.state.lock().unwrap();
             for (&sc, &image_index) in swapchains.iter().zip(image_indices) {
                 let Some(sw) = state.swapchains.get(&sc) else { continue };
-                if sw.pass_through {
+                let Some(&image) = sw.images.get(image_index as usize) else { break };
+                let tap = state.tap_sources_by_destination.get(&image).and_then(|source|
+                    state.tapped_source_layouts.get(source).map(|layout| (*source, *layout)));
+                if sw.pass_through && !matches!(tap, Some((_, vk::ImageLayout::GENERAL))) {
                     continue;
                 }
                 if !claim_primary(self.device.handle(), sc, sw.width, sw.height) {
                     break;
                 }
-                let Some(&image) = sw.images.get(image_index as usize) else { break };
                 let Some(&queue_family) = state.queue_families.get(&queue) else {
                     // We've never seen this queue via a hooked `vkGetDeviceQueue`/
                     // `vkGetDeviceQueue2` call (e.g. an app using `VK_KHR_synchronization2`
@@ -505,6 +512,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 let height = sw.height;
                 let proxy_format = swapchain::proxy_format_for(sw.format);
                 let bgr_order = swapchain::is_bgr_order(sw.format);
+                let (capture_image, capture_layout) = tap.unwrap_or((image, vk::ImageLayout::PRESENT_SRC_KHR));
                 let State { shm, capture, gpu_compose, original_scratch, inflight, answer_scratch, last_answer, hotkey, .. } = &mut *state;
                 shm.poll_toggle_hotkey(hotkey);
                 if shm.model_known_unavailable() {
@@ -532,6 +540,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                             self.physical_device,
                             queue,
                             queue_family,
+                            capture_image,
+                            capture_layout,
                             image,
                             width,
                             height,
