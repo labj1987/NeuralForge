@@ -13,22 +13,17 @@
 //! [`vulkan_layer::DeviceHooks`] for the handful of functions it actually cares about;
 //! everything else falls through to the next layer/driver automatically.
 //!
-//! Milestone 4 status: `queue_present_khr` now really captures the primary swapchain's
-//! image into the shared-memory proxy region and writes a result back (`capture.rs`)
-//! instead of always presenting the frame unmodified. Still open: the real GPU compute
-//! composition (`composition/`'s math is real and tested but not yet dispatched --
-//! `capture.rs` currently writes the captured bytes straight back, an identity
-//! passthrough through the transport rather than a real edit), the
-//! inert-on-non-NVIDIA-device check, `pidfd_getfd` descriptor adoption (an optional
-//! future zero-copy optimization, not required for the transport that exists today),
-//! hotkey polling. Cross-process ownership is enforced by `ownership`; the
-//! size filter additionally excludes small overlay swapchains.
+//! Host shared-memory capture and GPU composition are implemented. Cross-process
+//! ownership and executable filtering guard the channel; the swapchain size filter
+//! additionally excludes small overlays. DMA-BUF remains experimental. See
+//! HARDWARE_VALIDATION.md for presentation-validation failures still under review.
 
 mod capture;
 mod optical_flow;
 mod composition;
 mod device;
 mod ownership;
+mod loader_data;
 mod dump;
 mod logging;
 mod hotkey;
@@ -143,7 +138,7 @@ impl Layer for NeuralForgeLayer {
         manifest.name = LAYER_NAME;
         manifest.spec_version = vk::API_VERSION_1_1;
         manifest.implementation_version = 1;
-        manifest.description = "DLSS 5 Neural Rendering injection layer (Linux side)";
+        manifest.description = "NeuralForge neural rendering injection layer (Linux side)";
         manifest
     }
 
@@ -165,7 +160,7 @@ impl Layer for NeuralForgeLayer {
     fn create_device_info(
         &self,
         physical_device: vk::PhysicalDevice,
-        _create_info: &vk::DeviceCreateInfo,
+        create_info: &vk::DeviceCreateInfo,
         _allocator: Option<&vk::AllocationCallbacks>,
         device: Arc<ash::Device>,
         next_get_device_proc_addr: vk::PFN_vkGetDeviceProcAddr,
@@ -176,7 +171,7 @@ impl Layer for NeuralForgeLayer {
         // only matters for a hypothetical device created against an instance from
         // before this layer was loaded, which never happens for an implicit layer.
         let instance = CURRENT_INSTANCE.lock().unwrap().clone();
-        NeuralForgeDeviceInfo::new(instance, physical_device, device, next_get_device_proc_addr)
+        NeuralForgeDeviceInfo::new(instance, physical_device, device, next_get_device_proc_addr, create_info)
     }
 }
 

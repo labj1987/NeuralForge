@@ -33,6 +33,9 @@ Do not reapply the reverted capture/composition fence changes. Validate actual G
 operations and establish matched upstream/NeuralForge measurements before performance
 changes. Keep the Rust implementation independent; review licenses before source reuse.
 
+Current target-machine evidence and unresolved Vulkan errors are in
+[HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md).
+
 ## Historical evidence
 
 [Pre-rename development notes](docs/history/development-before-neuralforge.md) retain

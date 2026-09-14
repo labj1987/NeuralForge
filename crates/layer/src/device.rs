@@ -72,6 +72,7 @@ unsafe fn resolve<F: Copy>(get_proc: vk::PFN_vkGetDeviceProcAddr, device: vk::De
 }
 
 pub struct NeuralForgeDeviceInfo {
+    _loader_data: crate::loader_data::Registration,
     device: Arc<ash::Device>,
     /// `None` only in the hypothetical case `create_device_info`'s own doc comment
     /// notes (a device created against an instance from before this layer loaded,
@@ -125,6 +126,7 @@ impl NeuralForgeDeviceInfo {
         physical_device: vk::PhysicalDevice,
         device: Arc<ash::Device>,
         next_get_device_proc_addr: vk::PFN_vkGetDeviceProcAddr,
+        create_info: &vk::DeviceCreateInfo,
     ) -> Self {
         let handle = device.handle();
         // SAFETY: `next_get_device_proc_addr` is the next layer/driver's own
@@ -169,6 +171,8 @@ impl NeuralForgeDeviceInfo {
         // nothing forced a flush past this first, coincidentally-flushed call).
         crate::logging::flush();
         Self {
+            // SAFETY: create_info is the loader chain for this newly created device.
+            _loader_data: unsafe { crate::loader_data::register(handle, create_info) },
             device,
             instance,
             physical_device,

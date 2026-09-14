@@ -14,12 +14,13 @@ see [Legal](#legal) before you use it.
 Repository: [labj1987/neuralforge](https://github.com/labj1987/neuralforge).
 
 See [PHASE1.md](PHASE1.md) for coexistence, installation, migration and the approved benchmark roadmap.
+Current NVIDIA presentation-validation findings are tracked in [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md); the GTA benchmark is not yet validated.
 
 ## Screenshots
 
 | Settings |
 |---|
-| ![Settings window showing Model, Motion, and Composition groups](screenshots/settings.png) |
+| ![NeuralForge settings window with Model, Motion, Composition, Debug, and Status tabs](screenshots/settings.png) |
 
 ## What it does
 

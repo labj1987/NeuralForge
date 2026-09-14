@@ -89,7 +89,7 @@ fn ensure(
         .level(vk::CommandBufferLevel::PRIMARY)
         .command_buffer_count(1);
     // SAFETY: `pool` was just created above.
-    let cmd = match unsafe { device.allocate_command_buffers(&alloc_info) } {
+    let cmd = match unsafe { crate::loader_data::allocate_commands(device, &alloc_info) } {
         Ok(bufs) => bufs[0],
         Err(_) => {
             // SAFETY: `pool` owns no other resources yet.

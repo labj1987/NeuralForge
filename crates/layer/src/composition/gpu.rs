@@ -229,7 +229,7 @@ impl ComposeSlot {
         let descriptor_set = unsafe { device.allocate_descriptor_sets(&alloc_info) }.ok()?[0];
         let cmd_alloc_info = vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
         // SAFETY: `pool` was created by the caller with `RESET_COMMAND_BUFFER`.
-        let Ok(cmd) = (unsafe { device.allocate_command_buffers(&cmd_alloc_info) }) else { return None };
+        let Ok(cmd) = (unsafe { crate::loader_data::allocate_commands(device, &cmd_alloc_info) }) else { return None };
         let cmd = cmd[0];
         let fence_info = vk::FenceCreateInfo::builder().flags(vk::FenceCreateFlags::SIGNALED);
         // SAFETY: starting signaled means this slot's first real use never blocks on a
