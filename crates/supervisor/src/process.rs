@@ -36,6 +36,7 @@ pub fn start_detached(
 
     let mut cmd = Command::new(program);
     cmd.args(args).envs(envs.iter().cloned()).stdin(std::process::Stdio::null()).stdout(log).stderr(log_err);
+    isolate_helper_layers(&mut cmd, std::env::var("VK_INSTANCE_LAYERS").ok().as_deref());
     // SAFETY: `setsid()` is async-signal-safe and the only thing this closure does;
     // it runs in the forked child before exec, exactly what `pre_exec` guarantees.
     unsafe {
@@ -53,6 +54,21 @@ pub fn start_detached(
     // background thread this short-lived CLI invocation has no use for.
     std::mem::forget(child);
     Ok(pid)
+}
+
+// The helper creates its own compute device; it must not inherit game injection.
+// Preserve unrelated layers (notably validation) and never change the parent/session.
+fn isolate_helper_layers(command: &mut Command, layers: Option<&str>) {
+    command.env_remove("VKLayer_DLSS5")
+        .env_remove("DLSSNR_ENABLE")
+        .env_remove("NEURALFORGE_ENABLE");
+    if let Some(layers) = layers {
+        let kept = layers.split(':').filter(|name| !matches!(*name,
+            "VK_LAYER_NV_dlssnr" | "VK_LAYER_dlssnr_neural" | "VK_LAYER_neuralforge_neural"))
+            .collect::<Vec<_>>().join(":");
+        if kept.is_empty() { command.env_remove("VK_INSTANCE_LAYERS"); }
+        else { command.env("VK_INSTANCE_LAYERS", kept); }
+    }
 }
 
 pub fn running_pid(pid_file: &str) -> Option<i32> {
@@ -97,6 +113,16 @@ pub fn stop(pid_file: &str, timeout: Duration) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helper_drops_game_injection_but_keeps_validation_layers() {
+        let mut command = Command::new("sh");
+        command.env_clear().env("VKLayer_DLSS5", "1")
+            .env("DLSSNR_ENABLE", "1").env("NEURALFORGE_ENABLE", "1");
+        isolate_helper_layers(&mut command, Some("VK_LAYER_NV_dlssnr:VK_LAYER_KHRONOS_validation:VK_LAYER_neuralforge_neural:VK_LAYER_NV_present"));
+        let result = command.args(["-c", "test -z \"$VKLayer_DLSS5$DLSSNR_ENABLE$NEURALFORGE_ENABLE\" && test \"$VK_INSTANCE_LAYERS\" = VK_LAYER_KHRONOS_validation:VK_LAYER_NV_present"]).status().unwrap();
+        assert!(result.success());
+    }
 
     fn scratch_path(name: &str) -> String {
         format!("{}/neuralforge-cli-test-{}-{name}", std::env::temp_dir().display(), std::process::id())

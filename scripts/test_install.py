@@ -37,6 +37,11 @@ class InstallTests(unittest.TestCase):
             run('install', '--appdir', str(app))
             run('install', '--appdir', str(app))
             binary = data / 'neuralforge/bin/neuralforge'
+            with binary.open('rb') as running_image:
+                (app / 'usr/bin/neuralforge').write_text('updated gui')
+                run('install', '--appdir', str(app))
+                self.assertEqual(running_image.read(), b'gui')
+                self.assertEqual(binary.read_text(), 'updated gui')
             binary.write_text('user changed')
             run('install', '--appdir', str(app), ok=False)
             run('uninstall')

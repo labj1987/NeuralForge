@@ -42,6 +42,7 @@ python3 scripts/install.py install --appdir build-appimage/AppDir
 The installer places binaries under `$XDG_DATA_HOME/neuralforge/bin`; use that full
 path or add it to PATH. It writes a persistent manifest with an absolute library path,
 plus the desktop/icon/metainfo files. It refuses unknown or modified destinations.
+Updates replace files atomically, preserving mapped binaries in running processes.
 `python3 scripts/install.py uninstall` removes only unchanged, hash-recorded files;
 it retains config, binaries imported by the user, prefix, logs and runtime data.
 It never calls a package manager or stops another app.
@@ -64,7 +65,9 @@ Known Wine desktop, Xalia, Rockstar, Social Club, Steam and helper executables a
 excluded before swapchain setup. `NEURALFORGE_TARGET_EXE` accepts a case-insensitive,
 comma-separated list of executable basenames; configure it for the actual game exe.
 For GTA Enhanced use `GTA5_Enhanced.exe` after confirming that process name locally.
-The Steam AppID alone is insufficient: launchers inherit it too.
+The Steam AppID alone is insufficient: launchers inherit it too. The helper launcher
+also strips game-rendering layer selections from its child environment, preserving
+unrelated diagnostic layers and leaving the parent/desktop environment unchanged.
 
 The first eligible process to open a channel takes a nonblocking kernel file lease.
 Other processes cannot attach, write frames or change its dimensions. The lease lasts

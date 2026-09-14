@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import tempfile
 
 APP_ID = 'io.github.labj1987.NeuralForge'
 LAYER = 'VK_LAYER_neuralforge_neural'
@@ -78,8 +79,18 @@ def main():
     new = {}
     for path, content in files.items():
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(content)
-        path.chmod(0o755 if path.parent == root / 'bin' else 0o644)
+        # Replace the inode atomically: never truncate an executable/library
+        # that an already-running GUI, game or Wine helper may have mapped.
+        fd, staged = tempfile.mkstemp(prefix='.neuralforge-', dir=path.parent)
+        try:
+            with os.fdopen(fd, 'wb') as output:
+                output.write(content)
+                output.flush()
+                os.fsync(output.fileno())
+            os.chmod(staged, 0o755 if path.parent == root / 'bin' else 0o644)
+            os.replace(staged, path)
+        finally:
+            if os.path.exists(staged): os.unlink(staged)
         new[str(path)] = digest(path)
     record.write_text(json.dumps(new, indent=2) + '\n')
     print(f'Installed NeuralForge. CLI: {root / "bin/neuralforge-cli"}')

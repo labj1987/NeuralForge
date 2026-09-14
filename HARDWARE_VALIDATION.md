@@ -20,6 +20,19 @@ For continued validation it was relaunched with a transient user service,
 process tree outside the short-lived SSH session. This is not a boot-enabled service.
 Verify the actual helper process and advancing counters before any benchmark.
 
+The user service environment also inherited
+`VK_INSTANCE_LAYERS=VK_LAYER_NV_dlssnr:VK_LAYER_NV_present`. This caused upstream's
+NR layer to load into the compute helper. The supervisor now removes game-rendering
+layer selections and activation flags from its child environment, preserving unrelated
+layers such as validation and NV_present. The desktop manager's environment is unchanged.
+A real child-process test verifies that separation.
+
+Installer updates now replace files atomically. Previously they overwrote files in
+place, which is unsafe when a running Wine helper or game has mapped an executable or
+library. An integration test holds the old file open across an update and verifies
+that it retains the old bytes while new opens see the replacement. No active process
+is automatically stopped by the installer.
+
 ## Presentation test and dispatch fix
 
 A 120-frame, 1280x720 Wayland `vkcube` smoke test with Khronos validation exits 0
