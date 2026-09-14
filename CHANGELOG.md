@@ -1,3 +1,15 @@
+# NeuralForge changelog
+
+## Unreleased — NeuralForge Phase 1
+
+- Rename the application and GitHub repository to NeuralForge; update binaries,
+  Vulkan identity, private environment variables, paths, desktop metadata and releases.
+- Isolate process ownership and add explicit game targeting; preserve upstream installs.
+- Add safe installation/removal and identity-checked legacy manifest archival.
+- Keep the host-transport GTA baseline; document benchmarks before later optimizations.
+
+## Historical releases before the NeuralForge rename
+
 > Historical record: pre-NeuralForge names and deployment instructions below are
 > archival, not current instructions. Do not remove or modify upstream installations.
 > See PHASE1.md for current paths, safety constraints and the benchmark plan.

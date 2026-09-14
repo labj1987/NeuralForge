@@ -1,6 +1,6 @@
 # NeuralForge
 
-A Linux Vulkan implicit layer plus Windows helper that forwards presented frames to
+NeuralForge is a Linux Vulkan implicit layer plus Windows helper that forwards presented frames to
 NVIDIA's DLSS 5 Neural Rendering model, running the model itself under Wine/Proton.
 Written in Rust with GTK4 and libadwaita. A from-scratch rebuild of
 [DLSS5VKLayer](https://github.com/bmitch87/DLSS5VKLayer)'s architecture, not a fork —
@@ -10,6 +10,8 @@ came from.
 This is experimental, personal-use software. It works around an authorization check in
 NVIDIA's proprietary NGX DLL to run the model outside its intended integration path —
 see [Legal](#legal) before you use it.
+
+Repository: [labj1987/neuralforge](https://github.com/labj1987/neuralforge).
 
 See [PHASE1.md](PHASE1.md) for coexistence, installation, migration and the approved benchmark roadmap.
 
@@ -26,8 +28,8 @@ See [PHASE1.md](PHASE1.md) for coexistence, installation, migration and the appr
 - Fail-open: if the helper isn't running or the model fails to initialize, the layer
   just presents the original frame — nothing about the game's rendering depends on it.
 - The Windows-side helper runs NVIDIA's `nvngx_dlssnr.dll` (Feature 18) under Wine or a
-  Proton build, using synthetic motion vectors from `VK_NV_optical_flow` where the GPU
-  supports it.
+  Proton build. The experimental `VK_NV_optical_flow` motion path is disabled in
+  the known-good baseline.
 - HDR-aware capture: on an HDR swapchain the model sees a float16 proxy of the frame's
   real light (PQ-decoded first), not a tone-mapped 8-bit copy.
 - A composition pass blends the model's output back into the frame — tone/structure/
@@ -65,12 +67,25 @@ or from the GUI's binaries import flow. Files are copied into
 
 ## Install
 
-Download the AppImage from [Releases](../../releases):
+Download the AppImage from [Releases](https://github.com/labj1987/neuralforge/releases):
 
 ```bash
 chmod +x NeuralForge-*-x86_64.AppImage
 ./NeuralForge-*-x86_64.AppImage
 ```
+
+For Steam games launched separately from the GUI, install the extracted AppDir into
+persistent user storage so Vulkan can find the layer after the AppImage exits:
+
+```bash
+python3 scripts/install.py install --appdir build-appimage/AppDir
+```
+
+The GUI is `neuralforge`; the CLI is `neuralforge-cli`; the Windows helper is
+`neuralforge-helper.exe`. Use `NEURALFORGE_ENABLE=1` to activate the layer. Config,
+data and state use their own `neuralforge` directories. Upstream DLSS5VKLayer can
+remain installed; its launch variables and files are separate. See [PHASE1.md](PHASE1.md)
+for executable targeting, migration, uninstall and the exact GTA baseline.
 
 ## Building from source
 

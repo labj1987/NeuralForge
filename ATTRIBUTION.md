@@ -1,6 +1,6 @@
 # Attribution
 
-`dlssnr` is a from-scratch Rust/GTK4 rebuild of the architecture behind
+**NeuralForge** is a from-scratch Rust/GTK4 rebuild of the architecture behind
 [DLSS5VKLayer](https://github.com/bmitch87/DLSS5VKLayer) (bmitch87) — a Linux Vulkan
 layer plus Windows NGX helper that runs NVIDIA DLSS 5 Neural Rendering on Linux and
 Proton games. No source from that project (or anything it in turn depends on) was
