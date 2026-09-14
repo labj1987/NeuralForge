@@ -414,9 +414,10 @@ impl ShmHeader {
             p.reset_to_defaults();
         }
 
-        self.mvec_enabled.store(1, Ordering::Relaxed);
+        // GTA host-transport baseline: motion disabled, quality 0.
+        self.mvec_enabled.store(0, Ordering::Relaxed);
         self.mvec_scale_mode.store(mvec_scale_mode::PIXELS, Ordering::Relaxed);
-        self.mvec_quality.store(mvec_quality::BALANCED, Ordering::Relaxed);
+        self.mvec_quality.store(mvec_quality::FAST, Ordering::Relaxed);
         self.seq_ok.store(0, Ordering::Relaxed);
         // Neural rendering should affect the presented image by default. A
         // bypassed composition is an explicit debug choice, not the normal mode.

@@ -1,4 +1,4 @@
-//! The on-disk config file (`~/.config/dlssnr/config.ini`): the same flat
+//! The on-disk config file (`~/.config/neuralforge/config.ini`): the same flat
 //! `key=value` format upstream's shell script used (a contract other tooling/the
 //! user's own scripts might already read, and there's no reason to invent a new
 //! format for the same handful of fields), read/written with plain string parsing --
@@ -19,7 +19,7 @@ pub struct Config {
     pub dxvk_vendor: String,
     pub dxvk_device: String,
     /// Every `set_<name>=<value>` line -- the model/composition tuning
-    /// `dlssnr_protocol::persist` round-trips through here so it survives a reboot
+    /// `neuralforge_protocol::persist` round-trips through here so it survives a reboot
     /// (unlike the SHM mapping itself, which lives under `/tmp`). Kept as raw
     /// strings rather than parsed here: this crate doesn't need to know what any of
     /// these settings mean, only that they persist.
@@ -53,17 +53,17 @@ impl Config {
         };
         // A config written by an older build (or a stray manual edit) pinning the
         // mapping to $XDG_RUNTIME_DIR is exactly the path a Steam game cannot see
-        // (see dlssnr_protocol's own doc comment on this) -- treat that one value as
+        // (see neuralforge_protocol's own doc comment on this) -- treat that one value as
         // unset rather than let it silently reintroduce the bug it exists to avoid.
         if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-            if cfg.shm == format!("{runtime_dir}/dlssnr/shm.bin") {
+            if cfg.shm == format!("{runtime_dir}/neuralforge/shm.bin") {
                 cfg.shm.clear();
             }
         }
-        if cfg.shm.is_empty() {
-            cfg.shm = dlssnr_protocol::shm_default_path();
+        if cfg.shm.is_empty() || !neuralforge_protocol::isolated_path(&cfg.shm) {
+            cfg.shm = neuralforge_protocol::shm_default_path();
         }
-        if cfg.log.is_empty() {
+        if cfg.log.is_empty() || !neuralforge_protocol::isolated_path(&cfg.log) {
             cfg.log = paths::log_file();
         }
         // Whatever's left in `map` after pulling out the known fields above is every

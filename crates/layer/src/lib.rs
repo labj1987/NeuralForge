@@ -1,8 +1,8 @@
-//! `VK_LAYER_dlssnr_neural` — the Linux-side Vulkan implicit layer.
+//! `VK_LAYER_neuralforge_neural` — the Linux-side Vulkan implicit layer.
 //!
 //! Hooks the swapchain lifecycle (`vkCreateSwapchainKHR`/`vkDestroySwapchainKHR`/
 //! `vkQueuePresentKHR`) and exchanges frames with the helper over the shared-memory
-//! transport defined in `dlssnr_protocol`. This crate never knows or cares whether the
+//! transport defined in `neuralforge_protocol`. This crate never knows or cares whether the
 //! helper on the other end of that mapping is running under Wine/Proton today or a
 //! native Linux process later — that's the whole point of the seam.
 //!
@@ -21,16 +21,14 @@
 //! passthrough through the transport rather than a real edit), the
 //! inert-on-non-NVIDIA-device check, `pidfd_getfd` descriptor adoption (an optional
 //! future zero-copy optimization, not required for the transport that exists today),
-//! hotkey polling. Also open: real cross-process arbitration for which swapchain gets
-//! to be "primary" -- today's `device::PRIMARY` only elects one per *process*, so a
-//! second Vulkan process (the Steam overlay, observed in testing) independently elects
-//! its own small swapchain as primary too; `swapchain::is_plausible_game_size` is a
-//! blunt, documented-as-such filter for that, not a real fix.
+//! hotkey polling. Cross-process ownership is enforced by `ownership`; the
+//! size filter additionally excludes small overlay swapchains.
 
 mod capture;
 mod optical_flow;
 mod composition;
 mod device;
+mod ownership;
 mod dump;
 mod logging;
 mod hotkey;
@@ -47,7 +45,7 @@ use vulkan_layer::{
     LayerResult, StubInstanceInfo, VkLayerInstanceLink,
 };
 
-use device::DlssnrDeviceInfo;
+use device::NeuralForgeDeviceInfo;
 
 /// The most recently created `VkInstance`, so `create_device_info` (which the
 /// `vulkan_layer` framework calls with no way to reach whatever `create_instance_info`
@@ -58,15 +56,15 @@ use device::DlssnrDeviceInfo;
 /// one-swapchain-at-a-time assumption.
 static CURRENT_INSTANCE: Mutex<Option<Arc<ash::Instance>>> = Mutex::new(None);
 
-pub const LAYER_NAME: &str = "VK_LAYER_dlssnr_neural";
+pub const LAYER_NAME: &str = "VK_LAYER_neuralforge_neural";
 
-/// Whether the pass should do anything at all. Off by default (`VKLayer_DLSS5` unset)
+/// Whether the pass should do anything at all. Off by default (`NEURALFORGE_ENABLE` unset)
 /// so the layer is a true no-op for every game that hasn't opted in via its launch
 /// options — checked once and cached, same as upstream, since it can't change for the
 /// life of the process.
 pub(crate) fn layer_enabled() -> bool {
     static ENABLED: Lazy<bool> = Lazy::new(|| {
-        env_flag("VKLayer_DLSS5") || env_flag("DLSSNR_ENABLE")
+        env_flag("NEURALFORGE_ENABLE") && !env_flag("NEURALFORGE_DISABLE")
     });
     *ENABLED
 }
@@ -93,10 +91,10 @@ fn env_flag(name: &str) -> bool {
 /// `create_instance` ourselves and resolving only the one entry point this layer
 /// actually needs avoids ever making the query that crashes.
 #[derive(Default)]
-struct DlssnrGlobalHooks;
+struct NeuralForgeGlobalHooks;
 
 #[auto_globalhooksinfo_impl]
-impl GlobalHooks for DlssnrGlobalHooks {
+impl GlobalHooks for NeuralForgeGlobalHooks {
     fn create_instance(
         &self,
         create_info: &vk::InstanceCreateInfo,
@@ -126,17 +124,17 @@ impl GlobalHooks for DlssnrGlobalHooks {
 }
 
 #[derive(Default)]
-struct DlssnrLayer(DlssnrGlobalHooks);
+struct NeuralForgeLayer(NeuralForgeGlobalHooks);
 
-impl Layer for DlssnrLayer {
-    type GlobalHooksInfo = DlssnrGlobalHooks;
+impl Layer for NeuralForgeLayer {
+    type GlobalHooksInfo = NeuralForgeGlobalHooks;
     type InstanceInfo = StubInstanceInfo;
-    type DeviceInfo = DlssnrDeviceInfo;
+    type DeviceInfo = NeuralForgeDeviceInfo;
     type InstanceInfoContainer = StubInstanceInfo;
-    type DeviceInfoContainer = DlssnrDeviceInfo;
+    type DeviceInfoContainer = NeuralForgeDeviceInfo;
 
     fn global_instance() -> impl Deref<Target = Global<Self>> + 'static {
-        static GLOBAL: Lazy<Global<DlssnrLayer>> = Lazy::new(Default::default);
+        static GLOBAL: Lazy<Global<NeuralForgeLayer>> = Lazy::new(Default::default);
         &*GLOBAL
     }
 
@@ -178,8 +176,8 @@ impl Layer for DlssnrLayer {
         // only matters for a hypothetical device created against an instance from
         // before this layer was loaded, which never happens for an implicit layer.
         let instance = CURRENT_INSTANCE.lock().unwrap().clone();
-        DlssnrDeviceInfo::new(instance, physical_device, device, next_get_device_proc_addr)
+        NeuralForgeDeviceInfo::new(instance, physical_device, device, next_get_device_proc_addr)
     }
 }
 
-declare_introspection_queries!(Global::<DlssnrLayer>);
+declare_introspection_queries!(Global::<NeuralForgeLayer>);

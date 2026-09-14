@@ -1,6 +1,6 @@
-//! A minimal logging sink: `DLSSNR_LOG` names a file to append to, otherwise stderr.
+//! A minimal logging sink: `NEURALFORGE_LOG` names a file to append to, otherwise stderr.
 //! One handle for the process, not one per call site. Same shape as
-//! `dlssnr_layer::logging` — kept as a separate copy rather than a shared crate since
+//! `neuralforge_layer::logging` — kept as a separate copy rather than a shared crate since
 //! it's this small and the two crates otherwise share nothing OS-specific here
 //! (`std::env`/`std::fs`/`std::io` are already portable).
 
@@ -14,12 +14,12 @@ use std::sync::{Mutex, OnceLock};
 // as a Windows guest binary under Wine/Proton, where a single such syscall against a
 // real host-filesystem path has been measured, on real hardware, at ~150-180ms.
 // `Sink::Stderr` used to skip the wrapper (reasoned as "already unbuffered and cheap
-// to flush") -- wrong: `dlssnr_layer::logging`'s identical, un-wrapped `Stderr` was
+// to flush") -- wrong: `neuralforge_layer::logging`'s identical, un-wrapped `Stderr` was
 // confirmed via `strace -e trace=write` on `lordnikon` (2026-09-10) to fragment a
 // single `crate::log!` call into several separate blocking `write()` syscalls (one per
 // literal/formatted segment) against a redirected pipe, every single frame -- the same
 // risk applies here whenever this binary's stdout/stderr isn't a real terminal (i.e.
-// whenever `DLSSNR_LOG` isn't set and Proton/Steam has redirected it, same as the
+// whenever `NEURALFORGE_LOG` isn't set and Proton/Steam has redirected it, same as the
 // layer's case), so both variants get the same fix rather than assuming Stderr is
 // always cheap.
 enum Sink {
@@ -51,9 +51,9 @@ static FLUSH_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU3
 
 fn sink() -> &'static Mutex<Sink> {
     SINK.get_or_init(|| {
-        let sink = std::env::var("DLSSNR_LOG")
+        let sink = std::env::var("NEURALFORGE_LOG")
             .ok()
-            .filter(|p| !p.is_empty())
+            .filter(|p| !p.is_empty() && neuralforge_protocol::isolated_path(p))
             .and_then(|path| OpenOptions::new().create(true).append(true).open(path).ok())
             .map(|f| Sink::File(BufWriter::new(f)))
             .unwrap_or_else(|| Sink::Stderr(BufWriter::new(std::io::stderr())));
@@ -61,11 +61,11 @@ fn sink() -> &'static Mutex<Sink> {
     })
 }
 
-/// Writes one `[dlssnr-helper] ...` line. Never called directly -- use the
+/// Writes one `[neuralforge-helper] ...` line. Never called directly -- use the
 /// [`crate::log!`] macro so every call site gets the same prefix and newline handling.
 pub fn log(args: Arguments<'_>) {
     let Ok(mut sink) = sink().lock() else { return };
-    let _ = writeln!(sink, "[dlssnr-helper] {args}");
+    let _ = writeln!(sink, "[neuralforge-helper] {args}");
     if FLUSH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 64 == 0 {
         let _ = sink.flush();
     }

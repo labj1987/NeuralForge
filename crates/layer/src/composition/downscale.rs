@@ -2,7 +2,7 @@
 //! (Lanczos, Catmull-Rom, Mitchell-Netravali/"bicubic", Kaiser-windowed sinc), each
 //! implemented directly from its mathematical definition — none of this needs, or
 //! reads, upstream's `.spv`/`.h` pairs. Matches
-//! [`dlssnr_protocol::enums::downscaler`]'s numbering (kept because it's a settings
+//! [`neuralforge_protocol::enums::downscaler`]'s numbering (kept because it's a settings
 //! contract, not an algorithm — see that module's doc comment).
 //!
 //! Each filter here is a 1D kernel; a 2D resample separably applies it along each
@@ -11,7 +11,7 @@
 //! reference the shader is translated from and the thing `#[test]`s below check
 //! against known closed-form values.
 
-use dlssnr_protocol::enums::downscaler;
+use neuralforge_protocol::enums::downscaler;
 
 /// `sinc(x) = sin(pi*x) / (pi*x)`, with the removable singularity at 0 filled in.
 fn sinc(x: f32) -> f32 {
@@ -93,7 +93,7 @@ fn bessel_i0(x: f32) -> f32 {
 }
 
 /// The 1D kernel value at offset `x` (in samples) for the given
-/// [`dlssnr_protocol::enums::downscaler`] value. Unsupported/unknown values (`FSR1`,
+/// [`neuralforge_protocol::enums::downscaler`] value. Unsupported/unknown values (`FSR1`,
 /// or anything out of range) fall back to `LANCZOS3`, matching the protocol's own
 /// documented fallback behavior for a value this pipeline can't run.
 pub fn kernel(x: f32, downscaler_kind: u32) -> f32 {

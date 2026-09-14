@@ -99,7 +99,7 @@ mod tests {
     use super::*;
 
     fn scratch_path(name: &str) -> String {
-        format!("{}/dlssnr-cli-test-{}-{name}", std::env::temp_dir().display(), std::process::id())
+        format!("{}/neuralforge-cli-test-{}-{name}", std::env::temp_dir().display(), std::process::id())
     }
 
     // Ignored in this dev sandbox specifically: confirmed by direct reproduction that

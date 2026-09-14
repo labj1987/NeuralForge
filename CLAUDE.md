@@ -1,3 +1,7 @@
+> Historical record: pre-NeuralForge names and deployment instructions below are
+> archival, not current instructions. Do not remove or modify upstream installations.
+> See PHASE1.md for current paths, safety constraints and the benchmark plan.
+
 # 2026-09-12 (later still): v0.1.33/v0.1.34's Vulkan sync changes reverted -- made
 # things worse, not better; handed off. Read this section before touching
 # `capture.rs`/`composition/gpu.rs` fence-wait code again.

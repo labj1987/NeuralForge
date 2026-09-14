@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cross-compiles dlssnr-helper and its examples for x86_64-pc-windows-gnu, then runs
+# Cross-compiles neuralforge-helper and its examples for x86_64-pc-windows-gnu, then runs
 # the example tests under Wine. See crates/helper/examples/*.rs for what each one
 # actually checks, and CLAUDE.md's "helper gotchas" for the bug this already caught.
 #
@@ -13,10 +13,14 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 TOOLCHAIN="+stable-x86_64-unknown-linux-gnu"
 TARGET="x86_64-pc-windows-gnu"
 
-echo "==> cross-compiling dlssnr-helper + examples"
-cargo "$TOOLCHAIN" build --target "$TARGET" -p dlssnr-helper \
-    --example guard_test --example spoof_test --example spoof_install_test
+echo "==> cross-compiling neuralforge-helper + examples"
+cargo "$TOOLCHAIN" build --target "$TARGET" -p neuralforge-helper \
+    --bin neuralforge-helper --example guard_test --example spoof_test --example spoof_install_test
 
+SCRATCH="$(mktemp -d)"
+export WINEPREFIX="$SCRATCH/prefix"
+export WINEDEBUG=-all
+trap 'WINEPREFIX="$SCRATCH/prefix" wineserver -k 2>/dev/null || true; WINEPREFIX="$SCRATCH/prefix" wineserver -w 2>/dev/null || true; rm -rf "$SCRATCH"' EXIT
 BIN_DIR="target/$TARGET/debug"
 FAIL=0
 for example in guard_test spoof_test spoof_install_test; do
@@ -30,15 +34,13 @@ for example in guard_test spoof_test spoof_install_test; do
 done
 
 echo
-echo "==> running the full dlssnr_helper.exe binary for a few seconds (expect a clean"
+echo "==> running the full neuralforge-helper.exe binary for a few seconds (expect a clean"
 echo "    fail-open: no nvngx_dlssnr.dll is available on this dev machine)"
-SCRATCH="$(mktemp -d)"
-trap 'rm -rf "$SCRATCH"' EXIT
-DLSSNR_LOG="$SCRATCH/helper.log" DLSSNR_UID="helper-test-$$" \
-    timeout 8 wine "$BIN_DIR/dlssnr_helper.exe" > "$SCRATCH/stdout.log" 2>&1 || true
+NEURALFORGE_LOG="$SCRATCH/helper.log" NEURALFORGE_UID="helper-test-$$" \
+    timeout 8 wine "$BIN_DIR/neuralforge-helper.exe" > "$SCRATCH/stdout.log" 2>&1 || true
 echo "--- helper log ---"
 cat "$SCRATCH/helper.log" 2>/dev/null || echo "(no log written)"
-rm -rf "/tmp/dlssnr-helper-test-$$"
+rm -rf "/tmp/neuralforge-helper-test-$$"
 
 if [ "$FAIL" -ne 0 ]; then
     echo

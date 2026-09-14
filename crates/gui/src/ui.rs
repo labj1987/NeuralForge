@@ -5,7 +5,7 @@
 
 use std::sync::atomic::Ordering;
 
-use dlssnr_protocol::enums::{colour_mode, downscaler, mvec_quality, mvec_scale_mode, reversible_mode};
+use neuralforge_protocol::enums::{colour_mode, downscaler, mvec_quality, mvec_scale_mode, reversible_mode};
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
@@ -302,7 +302,7 @@ pub fn build_ui(app: &adw::Application) {
     // work and are the version-compatible choice.
     let switcher_title = adw::ViewSwitcherTitle::new();
     switcher_title.set_stack(Some(&view_stack));
-    switcher_title.set_title("dlssnr");
+    switcher_title.set_title("NeuralForge");
 
     let header = adw::HeaderBar::new();
     header.set_title_widget(Some(&switcher_title));
@@ -324,7 +324,7 @@ pub fn build_ui(app: &adw::Application) {
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .title("dlssnr")
+        .title("NeuralForge")
         .default_width(620)
         .default_height(700)
         .content(&toasts)
@@ -334,7 +334,7 @@ pub fn build_ui(app: &adw::Application) {
         let window = window.clone();
         about_btn.connect_clicked(move |_| {
             let dialog = adw::AboutDialog::builder()
-                .application_name("dlssnr")
+                .application_name("NeuralForge")
                 .version(env!("CARGO_PKG_VERSION"))
                 .developers(vec!["Linnard Alex Brown Jr."])
                 .comments("Vulkan layer and settings GUI for running NVIDIA DLSS 5 Neural Rendering on Linux/Proton games.")
@@ -355,9 +355,9 @@ pub fn build_ui(app: &adw::Application) {
 ///
 /// The one exception is the "NGX binaries" row's Import button: unlike everything
 /// else here, it's an action, not a live readout, because it's the only place besides
-/// `dlssnr-cli import-binaries` to get NVIDIA's DLLs into `binaries_dir()` -- there's
+/// `neuralforge-cli import-binaries` to get NVIDIA's DLLs into `binaries_dir()` -- there's
 /// no separate menu for it.
-fn build_status_group(shm: &std::sync::Arc<dlssnr_protocol::mapping::Mapping>, toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
+fn build_status_group(shm: &std::sync::Arc<neuralforge_protocol::mapping::Mapping>, toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
     group.set_title("Status");
 
@@ -385,7 +385,7 @@ fn build_status_group(shm: &std::sync::Arc<dlssnr_protocol::mapping::Mapping>, t
         // should reflect what clicking it will actually do, not the helper's own
         // self-reported state.
         if start_stop_button_for_timer.is_sensitive() {
-            start_stop_button_for_timer.set_label(if dlssnr_supervisor::is_running().is_some() { "Stop" } else { "Start" });
+            start_stop_button_for_timer.set_label(if neuralforge_supervisor::is_running().is_some() { "Stop" } else { "Start" });
         }
         glib::ControlFlow::Continue
     });
@@ -394,21 +394,21 @@ fn build_status_group(shm: &std::sync::Arc<dlssnr_protocol::mapping::Mapping>, t
         let toasts = toasts.clone();
         start_stop_button.connect_clicked(move |button| {
             let toasts = toasts.clone();
-            if dlssnr_supervisor::is_running().is_some() {
+            if neuralforge_supervisor::is_running().is_some() {
                 // Stopping waits up to 5s for a graceful exit before escalating to
-                // SIGKILL (see dlssnr_supervisor::stop) -- a brief, bounded main-thread
+                // SIGKILL (see neuralforge_supervisor::stop) -- a brief, bounded main-thread
                 // block on an explicit user click, not worth the async plumbing this
                 // small a GUI doesn't otherwise need.
                 button.set_sensitive(false);
                 button.set_label("Stopping…");
-                match dlssnr_supervisor::stop(std::time::Duration::from_secs(5)) {
+                match neuralforge_supervisor::stop(std::time::Duration::from_secs(5)) {
                     Ok(()) => toasts.add_toast(adw::Toast::new("Helper stopped")),
                     Err(e) => toasts.add_toast(adw::Toast::new(&format!("Stop failed: {e}"))),
                 }
                 button.set_sensitive(true);
             } else {
-                let cfg = dlssnr_supervisor::Config::load();
-                match dlssnr_supervisor::start(&cfg) {
+                let cfg = neuralforge_supervisor::Config::load();
+                match neuralforge_supervisor::start(&cfg) {
                     Ok(started) => toasts.add_toast(adw::Toast::new(&format!("Helper started (pid {})", started.pid))),
                     Err(e) => toasts.add_toast(adw::Toast::new(&format!("Start failed: {e}"))),
                 }
@@ -456,7 +456,7 @@ fn binaries_status_subtitle() -> String {
 }
 
 fn helper_state_label(state: u32) -> &'static str {
-    use dlssnr_protocol::enums::helper_state::*;
+    use neuralforge_protocol::enums::helper_state::*;
     match state {
         STARTING => "starting",
         NO_VULKAN => "no NVIDIA Vulkan device",
@@ -472,9 +472,9 @@ fn build_error_window(app: &adw::Application) {
     let status = adw::StatusPage::builder()
         .icon_name("dialog-error-symbolic")
         .title("Couldn't open the shared-memory mapping")
-        .description("Check the helper's log; dlssnr-cli doctor may also help.")
+        .description("Check the helper's log; neuralforge-cli doctor may also help.")
         .build();
-    let window = adw::ApplicationWindow::builder().application(app).title("dlssnr").content(&status).build();
+    let window = adw::ApplicationWindow::builder().application(app).title("NeuralForge").content(&status).build();
     window.present();
 }
 

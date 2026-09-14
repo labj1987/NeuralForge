@@ -1,5 +1,5 @@
 [package]
-name = "dlssnr-layer"
+name = "neuralforge-layer"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -7,11 +7,11 @@ license.workspace = true
 description = "Vulkan implicit layer: captures presented frames, runs the composition, talks to the helper over shared memory"
 
 [lib]
-name = "dlssnr_layer"
+name = "neuralforge_layer"
 crate-type = ["cdylib"]
 
 [dependencies]
-dlssnr-protocol = { path = "../protocol" }
+neuralforge-protocol = { path = "../protocol" }
 # Pinned to the exact commit vulkan-layer itself was built against, and ash pinned to
 # the exact version vulkan-layer depends on (0.37.3): vulkan-layer's public API is
 # expressed in terms of `ash::vk` types, and Cargo treats different 0.x versions of the

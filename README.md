@@ -1,4 +1,4 @@
-# dlssnr
+# NeuralForge
 
 A Linux Vulkan implicit layer plus Windows helper that forwards presented frames to
 NVIDIA's DLSS 5 Neural Rendering model, running the model itself under Wine/Proton.
@@ -10,6 +10,8 @@ came from.
 This is experimental, personal-use software. It works around an authorization check in
 NVIDIA's proprietary NGX DLL to run the model outside its intended integration path —
 see [Legal](#legal) before you use it.
+
+See [PHASE1.md](PHASE1.md) for coexistence, installation, migration and the approved benchmark roadmap.
 
 ## Screenshots
 
@@ -35,10 +37,10 @@ see [Legal](#legal) before you use it.
   not ported from any GPL-licensed code — see ATTRIBUTION.md.
 - GTK4/libadwaita settings app for all of the above, live-bound to the running layer
   over the same shared-memory segment.
-- A CLI (`dlssnr-cli`) for runner discovery, starting/stopping the helper, status,
+- A CLI (`neuralforge-cli`) for runner discovery, starting/stopping the helper, status,
   diagnostics, importing the NVIDIA NGX DLLs, and raw settings introspection
   (`shmctl status`/`set`/`toggle`/`capture`) — no bash script, no root step.
-- Everything lives under `~/.local/share`, `~/.config`, and `/tmp/dlssnr-$UID/`. No
+- Everything lives under `~/.local/share`, `~/.config`, and `/tmp/neuralforge-$UID/`. No
   polkit, no pkexec, no privileged install step at all.
 
 ## Requirements
@@ -55,26 +57,26 @@ see [Legal](#legal) before you use it.
 from your own NVIDIA driver/SDK install and import it with:
 
 ```bash
-dlssnr-cli import-binaries /path/to/dlls
+neuralforge-cli import-binaries /path/to/dlls
 ```
 
 or from the GUI's binaries import flow. Files are copied into
-`$XDG_DATA_HOME/dlssnr/binaries`; restart the helper afterward.
+`$XDG_DATA_HOME/neuralforge/binaries`; restart the helper afterward.
 
 ## Install
 
 Download the AppImage from [Releases](../../releases):
 
 ```bash
-chmod +x dlssnr-*-x86_64.AppImage
-./dlssnr-*-x86_64.AppImage
+chmod +x NeuralForge-*-x86_64.AppImage
+./NeuralForge-*-x86_64.AppImage
 ```
 
 ## Building from source
 
 ```bash
 cargo build --release          # protocol, layer, gui, cli (native Linux)
-cargo +stable build --release --target x86_64-pc-windows-gnu -p dlssnr-helper
+cargo +stable build --release --target x86_64-pc-windows-gnu -p neuralforge-helper
 ./build-appimage.sh            # packs everything into an AppImage
 ```
 

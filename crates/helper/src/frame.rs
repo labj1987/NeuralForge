@@ -12,11 +12,11 @@
 //! four resources) this crate never bound before -- a real, plausible cause of a first
 //! real visual check (see `CLAUDE.md`) turning up a solid-white `EvaluateFeature`
 //! answer despite a `0x1` success code. There is no real depth buffer to
-//! give it yet (`dlssnr_layer::capture` only ever captures the presented color image),
+//! give it yet (`neuralforge_layer::capture` only ever captures the presented color image),
 //! so this hands the model a constant, synthetic "far plane, no real depth" value --
 //! an honest stand-in, not a real per-pixel depth buffer.
 //!
-//! Same staging-copy discipline as `dlssnr_layer::capture`: images are populated via
+//! Same staging-copy discipline as `neuralforge_layer::capture`: images are populated via
 //! an explicit host-visible-buffer upload/download, not a zero-copy import.
 
 use ash::vk;
@@ -47,7 +47,7 @@ pub struct FrameResources {
 
     /// Host-visible staging, sized to the larger of upload (Color/MVec) or download
     /// (Output) -- one buffer, reused sequentially, same simplification
-    /// `dlssnr_layer::capture` makes for its own single staging buffer.
+    /// `neuralforge_layer::capture` makes for its own single staging buffer.
     staging_buffer: vk::Buffer,
     staging_memory: vk::DeviceMemory,
     staging_ptr: *mut u8,
@@ -67,7 +67,7 @@ pub struct FrameResources {
 unsafe impl Send for FrameResources {}
 
 fn color_format(proxy: u32) -> Option<vk::Format> {
-    use dlssnr_protocol::enums::proxy_format;
+    use neuralforge_protocol::enums::proxy_format;
     match proxy {
         proxy_format::RGBA8 => Some(vk::Format::R8G8B8A8_UNORM),
         proxy_format::BGRA8 => Some(vk::Format::B8G8R8A8_UNORM),
@@ -79,7 +79,7 @@ const MVEC_FORMAT: vk::Format = vk::Format::R16G16_SFLOAT;
 // (`EvaluateFeature Color=%p MVec=%p Depth=%p Output=%p` -- confirmed present via
 // `strings` against the real binary, 2026-09-10) but were never bound here before --
 // this crate had no depth buffer to give it and the real capture path
-// (`dlssnr_layer::capture`) only ever captures the presented color image, never a
+// (`neuralforge_layer::capture`) only ever captures the presented color image, never a
 // depth attachment. A color-aspect (not a real `D32_SFLOAT` depth-aspect image, to
 // avoid the different layout/aspect-mask rules those need) constant-far-plane image is
 // a synthetic stand-in -- "no usable depth" as honestly as this crate can currently
@@ -162,7 +162,7 @@ fn create_image(
 impl FrameResources {
     /// Builds every resource `EvaluateFeature` needs for a `width`x`height` frame.
     /// `None` on any failure -- callers treat that as "skip evaluate this frame",
-    /// mirroring `dlssnr_layer::capture`'s own fail-open discipline.
+    /// mirroring `neuralforge_layer::capture`'s own fail-open discipline.
     pub fn new(
         device: &ash::Device,
         instance: &ash::Instance,
@@ -292,7 +292,7 @@ impl FrameResources {
         motion: &[u8],
         motion_scale: [f32; 2],
         reset_history: bool,
-        tuning: dlssnr_protocol::PassTuning,
+        tuning: neuralforge_protocol::PassTuning,
         answer_out: &mut [u8],
     ) -> bool {
         let pixel_count = (self.width as usize) * (self.height as usize);
@@ -682,7 +682,7 @@ enum TransferKind {
 
 #[cfg(test)] mod format_tests {
     use super::*;
-    use dlssnr_protocol::enums::proxy_format;
+    use neuralforge_protocol::enums::proxy_format;
     #[test]
     #[ignore = "requires Vulkan under Wine on real hardware"]
     fn rgba_and_bgra_resources_recreate_on_format_change() {

@@ -1,8 +1,8 @@
-//! `dlssnr-cli` — the helper-manager: init/setup/start/stop/restart/status/doctor/
+//! `neuralforge-cli` — the helper-manager: init/setup/start/stop/restart/status/doctor/
 //! config/runners/detect-gpu/import-binaries. Replaces upstream's ~900-line bash
-//! `dlssnr-helper` script with the same command surface (a CLI contract, not
+//! `neuralforge-helper` script with the same command surface (a CLI contract, not
 //! upstream's expression of it) reimplemented in Rust, sharing logic with the GUI
-//! through `dlssnr_protocol` instead of duplicating it in shell.
+//! through `neuralforge_protocol` instead of duplicating it in shell.
 
 mod gpu;
 mod runners;
@@ -11,11 +11,11 @@ mod shmctl;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use dlssnr_supervisor::{install_dir, paths, Config};
+use neuralforge_supervisor::{install_dir, paths, Config};
 
 fn usage() {
     eprintln!(
-        "usage: dlssnr-cli <command>\n\n\
+        "usage: neuralforge-cli <command>\n\n\
          commands:\n\
          \x20 init                 create default config\n\
          \x20 setup                init config, dxvk config, and managed prefix if needed\n\
@@ -49,7 +49,7 @@ fn default_config() -> Config {
         cfg.dxvk_vendor = format!("{vendor:04x}");
         cfg.dxvk_device = format!("{device:04x}");
     }
-    cfg.shm = dlssnr_protocol::shm_default_path();
+    cfg.shm = neuralforge_protocol::shm_default_path();
     cfg.log = paths::log_file();
     cfg
 }
@@ -122,12 +122,12 @@ fn cmd_detect_gpu() -> ExitCode {
 }
 
 fn cmd_status() -> ExitCode {
-    match dlssnr_supervisor::is_running() {
+    match neuralforge_supervisor::is_running() {
         Some(pid) => println!("helper running (pid {pid})"),
         None => println!("helper not running"),
     }
     println!("  config: {}", paths::config_file());
-    println!("  runtime: {}", dlssnr_protocol::shm_runtime_dir());
+    println!("  runtime: {}", neuralforge_protocol::shm_runtime_dir());
     println!("  state: {}", paths::state_dir());
     ExitCode::SUCCESS
 }
@@ -140,7 +140,7 @@ fn cmd_doctor() -> ExitCode {
     if std::path::Path::new(&paths::config_file()).exists() {
         println!("ok");
     } else {
-        println!("missing (run `dlssnr-cli init`)");
+        println!("missing (run `neuralforge-cli init`)");
         ok = false;
     }
 
@@ -176,7 +176,7 @@ fn cmd_doctor() -> ExitCode {
     if ngx_dll.exists() {
         println!("ok");
     } else {
-        println!("error -- missing (required; see `dlssnr-cli import-binaries DIR`)");
+        println!("error -- missing (required; see `neuralforge-cli import-binaries DIR`)");
         ok = false;
     }
 
@@ -187,7 +187,7 @@ fn cmd_doctor() -> ExitCode {
         println!("missing (only needed for the system-Wine fallback runner)");
     }
 
-    print!("runtime dir: {}\n  ", dlssnr_protocol::shm_runtime_dir());
+    print!("runtime dir: {}\n  ", neuralforge_protocol::shm_runtime_dir());
     match paths::ensure_dirs() {
         Ok(()) => println!("ok"),
         Err(e) => {
@@ -210,14 +210,14 @@ fn cmd_setup() -> ExitCode {
 
 fn cmd_start() -> ExitCode {
     let cfg = Config::load();
-    match dlssnr_supervisor::start(&cfg) {
+    match neuralforge_supervisor::start(&cfg) {
         Ok(started) => {
             println!("helper started (pid {})", started.pid);
             println!("  runner: {} {}", started.runner_type, started.runner_path);
             println!("  log: {}", started.log);
             ExitCode::SUCCESS
         }
-        Err(dlssnr_supervisor::StartError::AlreadyRunning(_)) => {
+        Err(neuralforge_supervisor::StartError::AlreadyRunning(_)) => {
             println!("helper already running");
             ExitCode::SUCCESS
         }
@@ -229,7 +229,7 @@ fn cmd_start() -> ExitCode {
 }
 
 fn cmd_stop() -> ExitCode {
-    match dlssnr_supervisor::stop(Duration::from_secs(5)) {
+    match neuralforge_supervisor::stop(Duration::from_secs(5)) {
         Ok(()) => {
             println!("helper stopped");
             ExitCode::SUCCESS
@@ -243,7 +243,7 @@ fn cmd_stop() -> ExitCode {
 
 fn cmd_import_binaries(dir: Option<&String>) -> ExitCode {
     let Some(dir) = dir else {
-        eprintln!("usage: dlssnr-cli import-binaries DIR");
+        eprintln!("usage: neuralforge-cli import-binaries DIR");
         return ExitCode::FAILURE;
     };
     let src = std::path::Path::new(dir);

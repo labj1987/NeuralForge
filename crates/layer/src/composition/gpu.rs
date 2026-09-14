@@ -684,7 +684,7 @@ pub struct GpuCompose {
 // SAFETY: every field is either a plain Vulkan handle or (inside a slot's own
 // `Sized_`) a `vkMapMemory` pointer into memory that slot owns exclusively -- never
 // aliased outside the `Mutex<State>` this whole struct always lives behind in
-// `DlssnrDeviceInfo`, same reasoning as `capture::CaptureResources`.
+// `NeuralForgeDeviceInfo`, same reasoning as `capture::CaptureResources`.
 unsafe impl Send for GpuCompose {}
 
 impl GpuCompose {

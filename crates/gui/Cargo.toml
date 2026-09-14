@@ -1,18 +1,18 @@
 [package]
-name = "dlssnr-gui"
+name = "neuralforge"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "GTK4 + libadwaita settings GUI for dlssnr"
+description = "GTK4 + libadwaita settings GUI for neuralforge"
 
 [[bin]]
-name = "dlssnr-gui"
+name = "neuralforge"
 path = "src/main.rs"
 
 [dependencies]
-dlssnr-protocol = { path = "../protocol" }
-dlssnr-supervisor = { path = "../supervisor" }
+neuralforge-protocol = { path = "../protocol" }
+neuralforge-supervisor = { path = "../supervisor" }
 gtk4 = { version = "0.11", features = ["v4_12"] }
 libadwaita = { version = "0.9", features = ["v1_4", "v1_5"] }
 glib = "0.22"

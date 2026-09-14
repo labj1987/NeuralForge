@@ -1,4 +1,4 @@
-//! Shared-memory contract between the three processes that make up dlssnr:
+//! Shared-memory contract between the three processes that make up neuralforge:
 //!
 //!   the Linux Vulkan layer   captures the frame, runs the composition, presents the result
 //!   the Windows helper       owns the NGX model and runs it (today under Wine/Proton; a
@@ -36,12 +36,12 @@ pub mod persist;
 pub mod motion;
 
 pub use header::{load64, store64, PassControl, PassTuning, ShmHeader};
-pub use path::{shm_default_path, shm_runtime_dir};
+pub use path::{isolated_path, shm_default_path, shm_runtime_dir};
 
-/// Identifies a dlssnr mapping. Bumped only if the protocol is ever forked into an
+/// Identifies a neuralforge mapping. Bumped only if the protocol is ever forked into an
 /// incompatible variant; a mismatch here means "not our mapping at all", not "an older
 /// version of our mapping" — that distinction is `SHM_VERSION`'s job.
-pub const SHM_MAGIC: u32 = u32::from_le_bytes(*b"DSN1");
+pub const SHM_MAGIC: u32 = u32::from_le_bytes(*b"NFR1");
 
 /// The wire contract version (v2 adds BGRA8 and a motion payload region).
 /// The header layout version. A mismatch (matching magic, different version) means

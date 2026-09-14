@@ -1,9 +1,9 @@
-//! Hardware release check. Requires the candidate helper on the same DLSSNR_SHM,
+//! Hardware release check. Requires the candidate helper on the same NEURALFORGE_SHM,
 //! a gameplay PNG argument, and an output directory argument. Never use the live SHM.
 #[path = "../src/optical_flow.rs"]
 mod optical_flow;
 use std::{fs::File, os::unix::fs::FileExt, sync::atomic::Ordering, time::{Duration,Instant}};
-use dlssnr_protocol::{enums::proxy_format, mapping};
+use neuralforge_protocol::{enums::proxy_format, mapping};
 fn save(path: &std::path::Path, pixels:&[u8],w:u32,h:u32) {
     let mut enc=png::Encoder::new(File::create(path).unwrap(),w,h);
     enc.set_color(png::ColorType::Rgba);enc.set_depth(png::BitDepth::Eight);
@@ -28,9 +28,9 @@ fn main() {
     let mut flow=optical_flow::OpticalFlow::new(&instance,pd,w,h,1).unwrap();
     println!("motion quality={}",flow.quality);
     let m=mapping::open().unwrap();let hdr=m.header();
-    let file=std::fs::OpenOptions::new().read(true).write(true).open(std::env::var("DLSSNR_SHM").unwrap()).unwrap();
+    let file=std::fs::OpenOptions::new().read(true).write(true).open(std::env::var("NEURALFORGE_SHM").unwrap()).unwrap();
     let deadline=Instant::now()+Duration::from_secs(30);
-    while hdr.helper_state.load(Ordering::Acquire)!=dlssnr_protocol::enums::helper_state::RUNNING {
+    while hdr.helper_state.load(Ordering::Acquire)!=neuralforge_protocol::enums::helper_state::RUNNING {
         assert!(Instant::now()<deadline,"helper did not start");std::thread::sleep(Duration::from_millis(25));
     }
     let mut outputs=vec![];
@@ -41,14 +41,14 @@ fn main() {
             let vectors=flow.estimate(&input,false).unwrap();
             let motion=if frame==0 {None}else{vectors};
             if format==proxy_format::BGRA8 {for p in input.chunks_exact_mut(4) {p.swap(0,2);}}
-            file.write_all_at(&input,dlssnr_protocol::proxy_offset() as u64).unwrap();
-            if let Some(v)=&motion {file.write_all_at(&dlssnr_protocol::motion::encode(v,[1.0,1.0]),dlssnr_protocol::motion_offset() as u64).unwrap();}
+            file.write_all_at(&input,neuralforge_protocol::proxy_offset() as u64).unwrap();
+            if let Some(v)=&motion {file.write_all_at(&neuralforge_protocol::motion::encode(v,[1.0,1.0]),neuralforge_protocol::motion_offset() as u64).unwrap();}
             hdr.width.store(w,Ordering::Relaxed);hdr.height.store(h,Ordering::Relaxed);hdr.proxy_format.store(format,Ordering::Relaxed);
             hdr.frame_mvec_valid.store(u32::from(motion.is_some()),Ordering::Relaxed);hdr.frame_mvec_scale_mode.store(1,Ordering::Relaxed);
             let req=hdr.seq_req.load(Ordering::Relaxed)+1;let start=Instant::now();hdr.seq_req.store(req,Ordering::Release);
             while hdr.seq_resp.load(Ordering::Acquire)!=req {assert!(start.elapsed()<Duration::from_secs(30),"request timed out");std::thread::sleep(Duration::from_millis(2));}
             assert_eq!(hdr.model_up.load(Ordering::Relaxed),1,"model not available");
-            let mut answer=vec![0u8;input.len()];file.read_exact_at(&mut answer,dlssnr_protocol::answer_offset() as u64).unwrap();
+            let mut answer=vec![0u8;input.len()];file.read_exact_at(&mut answer,neuralforge_protocol::answer_offset() as u64).unwrap();
             if format==proxy_format::BGRA8 {for p in answer.chunks_exact_mut(4) {p.swap(0,2);}}
             println!("format={format} frame={frame} response={:?}",start.elapsed());
             save(&out.join(format!("output-{i}-{frame}.png")),&answer,w,h);

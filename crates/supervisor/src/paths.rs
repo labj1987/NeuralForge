@@ -1,6 +1,6 @@
 //! XDG-aware paths, matching upstream's own reasoning (see the plan's `layer`
 //! section and upstream's README for why the runtime/SHM path specifically lives
-//! under `/tmp`, not `$XDG_RUNTIME_DIR` — that one's `dlssnr_protocol::shm_runtime_dir`,
+//! under `/tmp`, not `$XDG_RUNTIME_DIR` — that one's `neuralforge_protocol::shm_runtime_dir`,
 //! already shared code; everything else here is config/data/state, which has no
 //! Steam-container wrinkle to work around.
 
@@ -13,7 +13,7 @@ fn xdg(var: &str, fallback_under_home: &str) -> String {
 }
 
 pub fn config_dir() -> String {
-    format!("{}/dlssnr", xdg("XDG_CONFIG_HOME", ".config"))
+    format!("{}/neuralforge", xdg("XDG_CONFIG_HOME", ".config"))
 }
 
 pub fn config_file() -> String {
@@ -21,11 +21,11 @@ pub fn config_file() -> String {
 }
 
 pub fn data_dir() -> String {
-    format!("{}/dlssnr", xdg("XDG_DATA_HOME", ".local/share"))
+    format!("{}/neuralforge", xdg("XDG_DATA_HOME", ".local/share"))
 }
 
 pub fn state_dir() -> String {
-    format!("{}/dlssnr", xdg("XDG_STATE_HOME", ".local/state"))
+    format!("{}/neuralforge", xdg("XDG_STATE_HOME", ".local/state"))
 }
 
 pub fn log_file() -> String {
@@ -36,11 +36,11 @@ pub fn binaries_dir() -> String {
     format!("{}/binaries", data_dir())
 }
 
-/// The managed Wine/Proton prefix `dlssnr` creates and owns, distinct from any
+/// The managed Wine/Proton prefix `neuralforge` creates and owns, distinct from any
 /// prefix a game or Steam manages -- so importing NGX DLLs into it, or a bad prefix
 /// state, never touches anything else.
 pub fn prefix_dir() -> String {
-    format!("{}/dlssnr/prefix", xdg("XDG_DATA_HOME", ".local/share"))
+    format!("{}/neuralforge/prefix", xdg("XDG_DATA_HOME", ".local/share"))
 }
 
 pub fn ensure_dirs() -> std::io::Result<()> {
@@ -63,7 +63,7 @@ pub fn ensure_dirs() -> std::io::Result<()> {
 /// The real Steam client install root (the directory containing `steamapps/`,
 /// `compatibilitytools.d/`, etc.) -- what `STEAM_COMPAT_CLIENT_INSTALL_PATH` needs to
 /// point at for Proton's own launch script to run at all (`start()`'s own doc comment
-/// explains why this has to be set). Same candidate list `dlssnr-cli`'s own Proton
+/// explains why this has to be set). Same candidate list `neuralforge-cli`'s own Proton
 /// discovery (`runners.rs::candidate_dirs`) already scans for
 /// `compatibilitytools.d` -- this just checks the *parent* of each and returns the
 /// first that's a real directory, since a real Steam install is what actually creates
@@ -106,7 +106,7 @@ mod tests {
     #[test]
     fn finds_a_real_steam_install_under_xdg_data_home() {
         let _guard = XDG_DATA_HOME_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let scratch = std::env::temp_dir().join(format!("dlssnr-steam-detect-test-{}", std::process::id()));
+        let scratch = std::env::temp_dir().join(format!("neuralforge-steam-detect-test-{}", std::process::id()));
         let steam_dir = scratch.join("Steam");
         std::fs::create_dir_all(&steam_dir).unwrap();
 
@@ -126,7 +126,7 @@ mod tests {
     #[test]
     fn returns_none_when_no_candidate_exists() {
         let _guard = XDG_DATA_HOME_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let scratch = std::env::temp_dir().join(format!("dlssnr-steam-detect-test-none-{}", std::process::id()));
+        let scratch = std::env::temp_dir().join(format!("neuralforge-steam-detect-test-none-{}", std::process::id()));
         // Deliberately do not create `scratch` itself -- every candidate under it is
         // real-but-nonexistent, the case this function must fail open on.
 

@@ -1,12 +1,12 @@
-//! Importing NVIDIA's NGX DLLs into `dlssnr_supervisor::paths::binaries_dir()` --
-//! the same destination `dlssnr-cli import-binaries` uses. The path itself now comes
-//! from the shared `dlssnr-supervisor` crate; only the actual file-copy loop is kept
+//! Importing NVIDIA's NGX DLLs into `neuralforge_supervisor::paths::binaries_dir()` --
+//! the same destination `neuralforge-cli import-binaries` uses. The path itself now comes
+//! from the shared `neuralforge-supervisor` crate; only the actual file-copy loop is kept
 //! here, since it's a handful of lines with nothing else in `supervisor` needing it.
 
 const NGX_FILES: [&str; 3] = ["nvngx_dlssnr.dll", "nvngx.dll", "nvapi64.dll"];
 
 pub fn dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(dlssnr_supervisor::paths::binaries_dir())
+    std::path::PathBuf::from(neuralforge_supervisor::paths::binaries_dir())
 }
 
 /// Copies whichever of the known NGX DLLs are present in `src` into [`dir`]. Returns
@@ -31,8 +31,8 @@ mod tests {
 
     #[test]
     fn import_from_copies_known_files_and_skips_unknown_ones() {
-        let src = std::env::temp_dir().join(format!("dlssnr-binaries-test-src-{}", std::process::id()));
-        let dest_home = std::env::temp_dir().join(format!("dlssnr-binaries-test-home-{}", std::process::id()));
+        let src = std::env::temp_dir().join(format!("neuralforge-binaries-test-src-{}", std::process::id()));
+        let dest_home = std::env::temp_dir().join(format!("neuralforge-binaries-test-home-{}", std::process::id()));
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("nvngx_dlssnr.dll"), b"model").unwrap();
         std::fs::write(src.join("nvapi64.dll"), b"nvapi").unwrap();

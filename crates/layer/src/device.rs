@@ -71,7 +71,7 @@ unsafe fn resolve<F: Copy>(get_proc: vk::PFN_vkGetDeviceProcAddr, device: vk::De
     Some(unsafe { std::mem::transmute_copy::<_, F>(&p) })
 }
 
-pub struct DlssnrDeviceInfo {
+pub struct NeuralForgeDeviceInfo {
     device: Arc<ash::Device>,
     /// `None` only in the hypothetical case `create_device_info`'s own doc comment
     /// notes (a device created against an instance from before this layer loaded,
@@ -119,7 +119,7 @@ struct State {
     hotkey: crate::hotkey::Poller,
 }
 
-impl DlssnrDeviceInfo {
+impl NeuralForgeDeviceInfo {
     pub fn new(
         instance: Option<Arc<ash::Instance>>,
         physical_device: vk::PhysicalDevice,
@@ -205,7 +205,7 @@ impl DlssnrDeviceInfo {
     }
 }
 
-impl DeviceInfo for DlssnrDeviceInfo {
+impl DeviceInfo for NeuralForgeDeviceInfo {
     type HooksType = Self;
     type HooksRefType<'a> = &'a Self;
 
@@ -224,7 +224,7 @@ impl DeviceInfo for DlssnrDeviceInfo {
     }
 }
 
-impl DeviceHooks for DlssnrDeviceInfo {
+impl DeviceHooks for NeuralForgeDeviceInfo {
     fn create_swapchain_khr(
         &self,
         create_info: &vk::SwapchainCreateInfoKHR,
@@ -248,9 +248,10 @@ impl DeviceHooks for DlssnrDeviceInfo {
         }
 
         let hdr_kind = swapchain::detect_hdr_kind(create_info.image_format, create_info.image_color_space);
-        let pass_through = !swapchain::is_supported_format(create_info.image_format)
-            || create_info.image_extent.width > dlssnr_protocol::MAX_W
-            || create_info.image_extent.height > dlssnr_protocol::MAX_H
+        let pass_through = !crate::ownership::eligible()
+            || !swapchain::is_supported_format(create_info.image_format)
+            || create_info.image_extent.width > neuralforge_protocol::MAX_W
+            || create_info.image_extent.height > neuralforge_protocol::MAX_H
             || !swapchain::is_plausible_game_size(create_info.image_extent.width, create_info.image_extent.height);
         let images = if pass_through { Vec::new() } else { self.fetch_swapchain_images(swapchain) };
         let state = SwapchainState {

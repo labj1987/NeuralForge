@@ -1,11 +1,11 @@
 //! Opens (or creates) the mapping on Linux and hands back a live `&ShmHeader` — the
 //! "just attach and read/write settings" case the GUI and CLI both need, as opposed
-//! to `dlssnr_layer`'s own copy of this same open/create/mmap dance (kept separate
+//! to `neuralforge_layer`'s own copy of this same open/create/mmap dance (kept separate
 //! there because it's entangled with that crate's request/response round-trip state
 //! machine, which the GUI/CLI have no reason to duplicate or depend on).
 //!
 //! Linux-only (`cfg(unix)`, though in practice only ever built for Linux in this
-//! workspace) — the Windows-side equivalent is `dlssnr_helper::shm`, a different
+//! workspace) — the Windows-side equivalent is `neuralforge_helper::shm`, a different
 //! enough set of Win32 APIs that sharing this module across the OS boundary would
 //! cost more in `cfg` noise than it would save in shared logic.
 
@@ -41,15 +41,16 @@ impl Mapping {
     }
 }
 
-/// Opens the mapping at `$DLSSNR_SHM` (or the default runtime path), creating it if
+/// Opens the mapping at `$NEURALFORGE_SHM` (or the default runtime path), creating it if
 /// necessary. Returns `None` on any I/O failure (permissions, disk full, etc.) — there
 /// is nothing a caller can usefully do about those beyond reporting them.
 pub fn open() -> Option<Mapping> {
-    let path = std::env::var("DLSSNR_SHM").ok().filter(|s| !s.is_empty()).unwrap_or_else(shm_default_path);
+    let path = std::env::var("NEURALFORGE_SHM").ok().filter(|s| !s.is_empty()).unwrap_or_else(shm_default_path);
     open_at(&path)
 }
 
 pub(crate) fn open_at(path: &str) -> Option<Mapping> {
+    if !crate::isolated_path(path) { return None; }
     if let Some(slash) = path.rfind('/') {
         let dir = &path[..slash];
         if !dir.is_empty() {
@@ -57,14 +58,14 @@ pub(crate) fn open_at(path: &str) -> Option<Mapping> {
             // Real bug, found 2026-09-12: `create_dir_all` alone leaves the directory's
             // mode at `0o777 & !umask` -- whatever the *first* process to ever create it
             // (typically the CLI/supervisor at login, starting the helper) happened to
-            // have as its own umask, not necessarily private. `dlssnr_layer`'s own
+            // have as its own umask, not necessarily private. `neuralforge_layer`'s own
             // `ensure_private_parent_dir` (a real, deliberate security check --
             // `crates/layer/src/shm.rs`) refuses to use a mapping whose parent directory
             // isn't private, and has no way to fix it, only to permanently refuse it for
             // the rest of that process's life -- so a permissive first-creation silently
             // disabled every game's neural rendering for the whole session, with no
             // error visible anywhere except the layer's own log (which nothing sets
-            // `DLSSNR_LOG` to see, for a real game launch). `set_permissions` runs
+            // `NEURALFORGE_LOG` to see, for a real game launch). `set_permissions` runs
             // unconditionally here, every call, not just on first creation, so it also
             // self-heals a directory a previous, buggy version of this function already
             // created with the wrong mode -- no manual `chmod` should ever be needed
@@ -122,7 +123,7 @@ mod tests {
     fn scratch_path() -> String {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        format!("{}/dlssnr-mapping-test-{}-{n}/shm.bin", std::env::temp_dir().display(), std::process::id())
+        format!("{}/neuralforge-mapping-test-{}-{n}/shm.bin", std::env::temp_dir().display(), std::process::id())
     }
 
     #[test]

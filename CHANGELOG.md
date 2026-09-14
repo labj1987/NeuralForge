@@ -1,3 +1,7 @@
+> Historical record: pre-NeuralForge names and deployment instructions below are
+> archival, not current instructions. Do not remove or modify upstream installations.
+> See PHASE1.md for current paths, safety constraints and the benchmark plan.
+
 # Changelog
 
 ## 0.1.30 — 2026-09-11

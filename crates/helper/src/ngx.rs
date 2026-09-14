@@ -44,7 +44,7 @@ fn resolve_bin_dir() -> Option<String> {
     // `std::env::var` already goes through the real `GetEnvironmentVariableW` on this
     // target -- no reason to hand-rolled that call the way `spoof.rs`'s PE parsing
     // genuinely needs to hand-roll PE-specific things.
-    let dir = std::env::var("DLSSNR_BIN_DIR").ok()?;
+    let dir = std::env::var("NEURALFORGE_BIN_DIR").ok()?;
     if dir.is_empty() {
         return None;
     }
@@ -130,7 +130,7 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
     s.device = device;
 
     let Some(bin_dir) = resolve_bin_dir() else {
-        crate::log!("[ngx] DLSSNR_BIN_DIR not set or nvngx_dlssnr.dll not found there");
+        crate::log!("[ngx] NEURALFORGE_BIN_DIR not set or nvngx_dlssnr.dll not found there");
         s.disabled = true;
         return s;
     };
@@ -462,7 +462,7 @@ impl NgxSnippet {
 /// Creates the feature at `width`x`height` if one doesn't already exist. A no-op
 /// (returns whatever [`NgxSnippet::has_feature`] already reports) once a feature
 /// exists -- this crate doesn't yet handle resizing/rebuilding on a size change (see
-/// `dlssnr_protocol::ShmHeader::tuning_seq`'s own doc comment for the debounced-rebuild
+/// `neuralforge_protocol::ShmHeader::tuning_seq`'s own doc comment for the debounced-rebuild
 /// design this would eventually hook into); most games never resize their swapchain
 /// mid-session, and a size change today is simply not picked up until the helper
 /// restarts.
@@ -537,7 +537,7 @@ fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue,
                 abi::ngx_set_f32(params, name("DLSSNR.LocalToneStrength").as_ptr(), 1.0);
                 abi::ngx_set_f32(params, name("DLSSNR.LocalStructureStrength").as_ptr(), 1.0);
                 // -1 follows local structure; it is not a strength of zero -- same
-                // convention `dlssnr_protocol::PassControl::reset_to_defaults`
+                // convention `neuralforge_protocol::PassControl::reset_to_defaults`
                 // already documents for this exact field.
                 abi::ngx_set_f32(params, name("DLSSNR.SkinStructureStrength").as_ptr(), -1.0);
                 abi::ngx_set_u32(params, name("DLSSNR.UseAutoMask").as_ptr(), 1);
@@ -545,7 +545,7 @@ fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue,
                 abi::ngx_set_f32(params, name("NVSDK_NGX_Parameter_ExposureScale").as_ptr(), 1.0);
                 abi::ngx_set_f32(params, name("NVSDK_NGX_Parameter_PreExposure").as_ptr(), 1.0);
                 // This helper always captures the swapchain as a plain 8-bit UNORM
-                // proxy today (see `dlssnr_layer::capture`) regardless of the
+                // proxy today (see `neuralforge_layer::capture`) regardless of the
                 // swapchain's own HDR-ness -- SDR is the only honest hint to give
                 // until the real HDR float16 path (mentioned in the project's own
                 // README, not yet implemented) exists.

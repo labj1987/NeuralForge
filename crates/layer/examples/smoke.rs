@@ -1,12 +1,12 @@
 //! A real-loader smoke test, not a unit test: creates an actual `VkInstance`/`VkDevice`
 //! through the system Vulkan loader with the layer enabled, so it exercises the parts
 //! `cargo test` cannot -- the manifest negotiation, `vulkan_layer`'s dispatch-table
-//! wiring, and `DlssnrDeviceInfo::new`'s function-pointer resolution -- against a real
+//! wiring, and `NeuralForgeDeviceInfo::new`'s function-pointer resolution -- against a real
 //! loader and ICD (lavapipe is enough; nothing here needs a GPU).
 //!
 //! Run via `scripts/smoke-test.sh`, which builds the layer, writes a manifest pointing
 //! at the just-built `.so`, and sets the env vars this needs
-//! (`VK_LAYER_PATH`/`VKLayer_DLSS5`/`DLSSNR_LOG`) before running it. Running this
+//! (`VK_LAYER_PATH`/`NEURALFORGE_ENABLE`/`NEURALFORGE_LOG`) before running it. Running this
 //! directly without that setup will simply not find the layer -- which is a fine
 //! outcome too (it means the layer opted out cleanly), not a crash.
 
@@ -40,7 +40,7 @@ fn main() {
     // device (the Vulkan spec guarantees at least one queue family).
     let device =
         unsafe { instance.create_device(physical_device, &device_create_info, None) }.expect("vkCreateDevice failed");
-    println!("smoke: device created -- if the layer is enabled, DlssnrDeviceInfo::new ran without panicking");
+    println!("smoke: device created -- if the layer is enabled, NeuralForgeDeviceInfo::new ran without panicking");
 
     // SAFETY: destroying in the reverse order of creation, each handle only once.
     unsafe {

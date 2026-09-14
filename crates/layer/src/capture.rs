@@ -37,7 +37,7 @@ pub struct CaptureResources {
 // SAFETY: every field is either a plain Vulkan handle (as `Send`-safe as `ash::Device`
 // itself already assumes) or `ptr`, a `vkMapMemory` pointer into memory this struct
 // owns exclusively -- never aliased outside the `Mutex<State>` this always lives behind
-// in `DlssnrDeviceInfo`.
+// in `NeuralForgeDeviceInfo`.
 unsafe impl Send for CaptureResources {}
 
 impl CaptureResources {
@@ -349,9 +349,9 @@ pub unsafe fn run(
     // included here too -- a real bug, found 2026-09-11: `ShmHeader::neural_enabled()`
     // existed and the GUI wrote to it, but nothing in this crate ever read it back,
     // so turning "Enabled" off in the GUI had no effect on anything real at all.
-    let bytes_per_pixel = dlssnr_protocol::enums::proxy_format::bytes_per_pixel(proxy_format) as u64;
+    let bytes_per_pixel = neuralforge_protocol::enums::proxy_format::bytes_per_pixel(proxy_format) as u64;
     let frame_bytes = u64::from(width) * u64::from(height) * bytes_per_pixel;
-    if frame_bytes == 0 || frame_bytes as usize > dlssnr_protocol::MAX_FRAME {
+    if frame_bytes == 0 || frame_bytes as usize > neuralforge_protocol::MAX_FRAME {
         return None;
     }
 
@@ -425,7 +425,7 @@ pub unsafe fn run(
         }
     }
 
-    if have_answer && inflight.dims == Some((width, height, proxy_format)) && dlssnr_protocol::enums::proxy_format::is_8bit(proxy_format) {
+    if have_answer && inflight.dims == Some((width, height, proxy_format)) && neuralforge_protocol::enums::proxy_format::is_8bit(proxy_format) {
         // Retain the model's raw answer for continuous re-presentation below --
         // deliberately *not* run through `composition::gpu`/`composition::apply`'s
         // tone-map compositor. That compositor's `UpgradeToneMap` targets `original`'s
@@ -737,9 +737,9 @@ unsafe fn run_sync(
     original_scratch: &mut Vec<u8>,
     _last_answer: &mut Vec<u8>,
 ) -> Option<vk::Semaphore> {
-    let bytes_per_pixel = dlssnr_protocol::enums::proxy_format::bytes_per_pixel(proxy_format) as u64;
+    let bytes_per_pixel = neuralforge_protocol::enums::proxy_format::bytes_per_pixel(proxy_format) as u64;
     let frame_bytes = u64::from(width) * u64::from(height) * bytes_per_pixel;
-    if frame_bytes == 0 || frame_bytes as usize > dlssnr_protocol::MAX_FRAME {
+    if frame_bytes == 0 || frame_bytes as usize > neuralforge_protocol::MAX_FRAME {
         return None;
     }
     if !ensure(resources, device, instance, physical_device, queue_family, frame_bytes) {
@@ -845,7 +845,7 @@ unsafe fn run_sync(
     // answered, overwrite `r.ptr` in place with that answer -- stage 2 below copies
     // whatever is sitting in `r.ptr` back into `image`, so this is what makes the
     // helper's answer (a real NGX evaluation, or the helper's own proxy-echo fallback
-    // when the model isn't ready -- `dlssnr_helper::main`'s per-frame loop guarantees
+    // when the model isn't ready -- `neuralforge_helper::main`'s per-frame loop guarantees
     // the answer region is always the same size/format as the proxy either way)
     // actually reach the screen. A helper that never answers (not running, or the
     // round trip timed out) leaves `r.ptr` untouched -- it still holds the bytes
@@ -889,8 +889,8 @@ unsafe fn run_sync(
         shm.read_answer(answer_dst);
         // Only `RGBA8` is handled -- `RGBA16F` still passes the helper's raw answer
         // through untouched (see `composition::apply`'s own doc comment for why, and
-        // `dlssnr_protocol::enums::proxy_format` for the format codes).
-        if dlssnr_protocol::enums::proxy_format::is_8bit(proxy_format) {
+        // `neuralforge_protocol::enums::proxy_format` for the format codes).
+        if neuralforge_protocol::enums::proxy_format::is_8bit(proxy_format) {
             if let Some(settings) = shm.composition_settings() {
                 if settings.apply_model && settings.neural_enabled {
                     // GPU dispatch (`composition::gpu`) only implements the normal
@@ -1010,7 +1010,7 @@ unsafe fn run_sync(
     // (identical) matched pair rather than silently doing nothing -- `write_pair`
     // itself is the only place that would need to special-case a format it can't
     // encode, and today it always gets `RGBA8` bytes either way.
-    if shm.take_capture_request() && dlssnr_protocol::enums::proxy_format::is_8bit(proxy_format) {
+    if shm.take_capture_request() && neuralforge_protocol::enums::proxy_format::is_8bit(proxy_format) {
         // SAFETY: same reasoning as every other read of `r.ptr` in this function --
         // still a live mapping of at least `frame_bytes` bytes, and stage 2 below
         // hasn't started overwriting it yet.
@@ -1182,7 +1182,7 @@ mod tests {
     fn scratch_path(tag: &str) -> String {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-        format!("{}/dlssnr-capture-test-{}-{tag}-{n}/shm.bin", std::env::temp_dir().display(), std::process::id())
+        format!("{}/neuralforge-capture-test-{}-{tag}-{n}/shm.bin", std::env::temp_dir().display(), std::process::id())
     }
 
     /// The real point of the pipelined redesign, exercised end to end against a real
@@ -1204,7 +1204,7 @@ mod tests {
         // A live helper (matters for `poll_async_request`'s timeout budget: the long
         // "steady state" one, not the short "nobody's listening" one, since this test
         // deliberately answers slower than that short budget).
-        unsafe { &*(hdr_ptr as *mut dlssnr_protocol::ShmHeader) }.helper_state.store(dlssnr_protocol::enums::helper_state::RUNNING, AtomicOrdering::Relaxed);
+        unsafe { &*(hdr_ptr as *mut neuralforge_protocol::ShmHeader) }.helper_state.store(neuralforge_protocol::enums::helper_state::RUNNING, AtomicOrdering::Relaxed);
 
         // A fake helper that only answers `HELPER_DELAY` after it sees a new request --
         // long enough that if `run` ever blocked waiting for it, a handful of calls
@@ -1214,7 +1214,7 @@ mod tests {
         let stop_clone = Arc::clone(&stop);
         let helper = std::thread::spawn(move || {
             // SAFETY: the mapping outlives this thread (joined before the test ends).
-            let hdr = unsafe { &*(hdr_ptr as *mut dlssnr_protocol::ShmHeader) };
+            let hdr = unsafe { &*(hdr_ptr as *mut neuralforge_protocol::ShmHeader) };
             let mut last_seen = 0u32;
             while !stop_clone.load(AtomicOrdering::Relaxed) {
                 let req = hdr.seq_req.load(AtomicOrdering::Relaxed);
@@ -1228,7 +1228,7 @@ mod tests {
         });
 
         let (width, height) = (8u32, 8u32);
-        let proxy_format = dlssnr_protocol::enums::proxy_format::RGBA8;
+        let proxy_format = neuralforge_protocol::enums::proxy_format::RGBA8;
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
         let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         let pool = unsafe { device.create_command_pool(&pool_info, None) }.expect("failed to create the test's own command pool");

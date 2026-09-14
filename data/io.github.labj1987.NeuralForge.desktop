@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=dlssnr
+Name=NeuralForge
 Comment=DLSS 5 Neural Rendering settings and helper manager
-Exec=dlssnr-gui
-Icon=dlssnr
+Exec=neuralforge
+Icon=neuralforge
 Categories=Utility;
 Terminal=false
-StartupWMClass=io.github.labj1987.Dlssnr
+StartupWMClass=io.github.labj1987.NeuralForge

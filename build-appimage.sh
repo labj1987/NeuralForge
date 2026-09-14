@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# build-appimage.sh — build the dlssnr AppImage.
+# build-appimage.sh — build the neuralforge AppImage.
 # Run from the repo root on Ubuntu (matches GreenLight/KernelPop/SteamPunk's own CI
 # assumption). Run as root in CI.
 #
 # Unlike GreenLight/KernelPop, this app needs no polkit/pkexec step at all -- every
-# path it touches (~/.local/share, ~/.config, /tmp/dlssnr-$UID/) is already
+# path it touches (~/.local/share, ~/.config, /tmp/neuralforge-$UID/) is already
 # user-owned, so AppRun just execs the GUI directly.
 set -euo pipefail
 
-APP="dlssnr"
+APP="neuralforge"
 VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
 ARCH="x86_64"
 BUILD_DIR="build-appimage"
@@ -59,8 +59,8 @@ fi
 echo "==> cargo build --release (protocol/layer/gui/cli)"
 cargo build --release
 
-echo "==> $CARGO_HELPER build --release --target $WIN_TARGET -p dlssnr-helper"
-$CARGO_HELPER build --release --target "$WIN_TARGET" -p dlssnr-helper
+echo "==> $CARGO_HELPER build --release --target $WIN_TARGET -p neuralforge-helper"
+$CARGO_HELPER build --release --target "$WIN_TARGET" -p neuralforge-helper
 
 # ── AppDir layout ─────────────────────────────────────────────────────
 rm -rf "$BUILD_DIR"
@@ -71,18 +71,18 @@ mkdir -p "$APPDIR/usr/bin" \
          "$APPDIR/usr/share/metainfo" \
          "$APPDIR/usr/share/vulkan/implicit_layer.d"
 
-cp "target/release/$APP-gui"                       "$APPDIR/usr/bin/"
+cp "target/release/$APP"                       "$APPDIR/usr/bin/"
 cp "target/release/$APP-cli"                       "$APPDIR/usr/bin/"
 cp "target/release/lib${APP}_layer.so"             "$APPDIR/usr/lib/$APP/"
-cp "target/$WIN_TARGET/release/${APP}_helper.exe"  "$APPDIR/usr/lib/$APP/helper/"
-sed "s#\./lib${APP}_layer\.so#../../lib/$APP/lib${APP}_layer.so#" \
+cp "target/$WIN_TARGET/release/${APP}-helper.exe"  "$APPDIR/usr/lib/$APP/helper/"
+sed "s#\./lib${APP}_layer\.so#../../../lib/$APP/lib${APP}_layer.so#" \
     "data/VK_LAYER_${APP}_neural.json" > "$APPDIR/usr/share/vulkan/implicit_layer.d/VK_LAYER_${APP}_neural.json"
-cp data/$APP.desktop                               "$APPDIR/usr/share/applications/"
+cp data/io.github.labj1987.NeuralForge.desktop                               "$APPDIR/usr/share/applications/"
 cp data/icon.svg                                   "$APPDIR/usr/share/icons/hicolor/scalable/apps/$APP.svg"
-cp data/io.github.labj1987.Dlssnr.appdata.xml       "$APPDIR/usr/share/metainfo/"
+cp data/io.github.labj1987.NeuralForge.appdata.xml       "$APPDIR/usr/share/metainfo/"
 
 # Top-level AppImage requirements
-cp data/$APP.desktop "$APPDIR/"
+cp data/io.github.labj1987.NeuralForge.desktop "$APPDIR/"
 cp data/icon.svg "$APPDIR/$APP.svg"
 
 # ── AppRun ────────────────────────────────────────────────────────────
@@ -94,7 +94,7 @@ export PATH="$HERE/usr/bin:$PATH"
 # loader needs an explicit path to it -- there is no writable implicit_layer.d this
 # install owns to drop it into (this app needs no root/install step at all).
 export VK_ADD_LAYER_PATH="$HERE/usr/share/vulkan/implicit_layer.d${VK_ADD_LAYER_PATH:+:$VK_ADD_LAYER_PATH}"
-exec "$HERE/usr/bin/dlssnr-gui" "$@"
+exec "$HERE/usr/bin/neuralforge" "$@"
 APPRUN
 chmod 755 "$APPDIR/AppRun"
 
@@ -108,16 +108,10 @@ if [[ ! -f "$TOOL" ]]; then
 fi
 
 echo "==> Packing AppImage"
-OUT="$APP-$VERSION-$ARCH.AppImage"
+OUT="NeuralForge-$VERSION-$ARCH.AppImage"
 
-# Real repo is "dlssnr" (lowercase) -- "Dlssnr" here was a real, confirmed bug found
-# 2026-09-11: GitHub's own API/web redirects resolve a case-mismatched repo name
-# fine (confirmed via `gh api repos/labj1987/Dlssnr/...`), but Gear Lever's own
-# update-check client apparently does not -- a real user report ("no updates
-# found" despite a genuinely newer release existing) is what caught this, not
-# inspection alone. Match the real repo's exact casing, don't rely on any client
-# redirecting a mismatch correctly.
-UPDATE_INFORMATION="gh-releases-zsync|labj1987|dlssnr|latest|$APP-*-x86_64.AppImage.zsync"
+# Repository name remains dlssnr; only release asset branding changes.
+UPDATE_INFORMATION="gh-releases-zsync|labj1987|dlssnr|latest|NeuralForge-*-x86_64.AppImage.zsync"
 VERSION="$VERSION" ARCH="$ARCH" "$TOOL" --appimage-extract-and-run \
     -u "$UPDATE_INFORMATION" "$APPDIR" "$OUT"
 

@@ -9,11 +9,11 @@ fn main() {
     // GApplication ID, not prgname; on X11 it's prgname. Setting both prgname and
     // StartupWMClass (in the .desktop file) to the application ID makes the running
     // window match the desktop file on either backend.
-    glib::set_prgname(Some("io.github.labj1987.Dlssnr"));
-    glib::set_application_name("dlssnr");
+    glib::set_prgname(Some("io.github.labj1987.NeuralForge"));
+    glib::set_application_name("NeuralForge");
 
     let app = libadwaita::Application::builder()
-        .application_id("io.github.labj1987.Dlssnr")
+        .application_id("io.github.labj1987.NeuralForge")
         .flags(gio::ApplicationFlags::FLAGS_NONE)
         .build();
 
@@ -29,8 +29,8 @@ fn main() {
     // down when the GUI exits so AppImage launchers such as Gear Lever do not
     // keep reporting the application as still running.
     app.connect_shutdown(|_| {
-        if dlssnr_supervisor::is_running().is_some() {
-            let _ = dlssnr_supervisor::stop(std::time::Duration::from_secs(5));
+        if neuralforge_supervisor::is_running().is_some() {
+            let _ = neuralforge_supervisor::stop(std::time::Duration::from_secs(5));
         }
     });
 

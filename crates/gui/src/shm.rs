@@ -1,9 +1,9 @@
-//! Binds GTK widgets to `dlssnr_protocol::ShmHeader` fields — this crate's equivalent
+//! Binds GTK widgets to `neuralforge_protocol::ShmHeader` fields — this crate's equivalent
 //! of upstream's `shm_binder.h/.cpp`, written fresh against the protocol crate's Rust
 //! types (there's no logic in a per-field binder worth porting either way, just a
 //! mechanical widget<->field mapping).
 //!
-//! Also persists every [`dlssnr_protocol::ShmHeader::persisted_settings`] value to
+//! Also persists every [`neuralforge_protocol::ShmHeader::persisted_settings`] value to
 //! `config.ini` on change, and applies whatever was last persisted when this call is
 //! the one that created the mapping fresh (see `Shm::open`) -- the SHM mapping itself
 //! lives under `/tmp` and does not survive a reboot, so without this, every tuning
@@ -14,7 +14,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use dlssnr_protocol::mapping::Mapping;
+use neuralforge_protocol::mapping::Mapping;
 
 /// Wraps the open mapping so the UI module can pass one `Arc` around to every
 /// callback instead of re-opening or re-threading raw pointers everywhere.
@@ -22,10 +22,10 @@ pub struct Shm(pub Arc<Mapping>);
 
 impl Shm {
     pub fn open() -> Option<Self> {
-        let mapping = dlssnr_protocol::mapping::open()?;
+        let mapping = neuralforge_protocol::mapping::open()?;
         if mapping.freshly_created {
-            let cfg = dlssnr_supervisor::Config::load();
-            dlssnr_protocol::persist::apply(mapping.header(), &cfg.settings);
+            let cfg = neuralforge_supervisor::Config::load();
+            neuralforge_protocol::persist::apply(mapping.header(), &cfg.settings);
         }
         Some(Shm(Arc::new(mapping)))
     }
@@ -37,7 +37,7 @@ impl Shm {
 /// stale copy of some other field) matters more than avoiding a few extra syscalls on
 /// a settings change a human just triggered by hand.
 fn persist_one(name: &str, is_float: bool, bits: u32) {
-    let mut cfg = dlssnr_supervisor::Config::load();
+    let mut cfg = neuralforge_supervisor::Config::load();
     let value = if is_float { f32::from_bits(bits).to_string() } else { bits.to_string() };
     cfg.settings.insert(format!("set_{name}"), value);
     let _ = cfg.save();
@@ -52,7 +52,7 @@ fn persist_one(name: &str, is_float: bool, bits: u32) {
 pub fn bind_float(
     shm: &Arc<Mapping>,
     name: Option<&'static str>,
-    get: impl Fn(&dlssnr_protocol::ShmHeader) -> &std::sync::atomic::AtomicU32 + 'static,
+    get: impl Fn(&neuralforge_protocol::ShmHeader) -> &std::sync::atomic::AtomicU32 + 'static,
 ) -> (f32, impl Fn(f32) + 'static) {
     let initial = f32::from_bits(get(shm.header()).load(Ordering::Relaxed));
     let shm = Arc::clone(shm);
@@ -71,7 +71,7 @@ pub fn bind_float(
 pub fn bind_u32(
     shm: &Arc<Mapping>,
     name: Option<&'static str>,
-    get: impl Fn(&dlssnr_protocol::ShmHeader) -> &std::sync::atomic::AtomicU32 + 'static,
+    get: impl Fn(&neuralforge_protocol::ShmHeader) -> &std::sync::atomic::AtomicU32 + 'static,
 ) -> (u32, impl Fn(u32) + 'static) {
     let initial = get(shm.header()).load(Ordering::Relaxed);
     let shm = Arc::clone(shm);
@@ -89,7 +89,7 @@ pub fn bind_u32(
 pub fn bind_bool(
     shm: &Arc<Mapping>,
     name: Option<&'static str>,
-    get: impl Fn(&dlssnr_protocol::ShmHeader) -> &std::sync::atomic::AtomicU32 + 'static,
+    get: impl Fn(&neuralforge_protocol::ShmHeader) -> &std::sync::atomic::AtomicU32 + 'static,
 ) -> (bool, impl Fn(bool) + 'static) {
     let (initial, setter) = bind_u32(shm, name, get);
     (initial != 0, move |value: bool| setter(if value { 1 } else { 0 }))
@@ -106,15 +106,15 @@ mod tests {
     /// instead of leaving the hardcoded default.
     #[test]
     fn a_setting_changed_through_bind_float_survives_a_simulated_reboot() {
-        let scratch = std::env::temp_dir().join(format!("dlssnr-shm-persist-test-{}", std::process::id()));
+        let scratch = std::env::temp_dir().join(format!("neuralforge-shm-persist-test-{}", std::process::id()));
         let config_home = scratch.join("config");
         let shm_path = scratch.join("shm.bin");
         std::fs::create_dir_all(&config_home).unwrap();
 
         let prev_xdg_config = std::env::var("XDG_CONFIG_HOME").ok();
-        let prev_shm = std::env::var("DLSSNR_SHM").ok();
+        let prev_shm = std::env::var("NEURALFORGE_SHM").ok();
         std::env::set_var("XDG_CONFIG_HOME", &config_home);
-        std::env::set_var("DLSSNR_SHM", &shm_path);
+        std::env::set_var("NEURALFORGE_SHM", &shm_path);
 
         {
             let shm = Shm::open().expect("first open should succeed and create a fresh mapping");
@@ -123,7 +123,7 @@ mod tests {
             set_intensity(1.75);
         }
 
-        let saved = std::fs::read_to_string(config_home.join("dlssnr/config.ini")).expect("config.ini should exist");
+        let saved = std::fs::read_to_string(config_home.join("neuralforge/config.ini")).expect("config.ini should exist");
         assert!(saved.contains("set_intensity=1.75"), "config.ini should have the new value:\n{saved}");
 
         // Simulate a reboot: the SHM file is what actually goes away (/tmp), not the
@@ -138,8 +138,8 @@ mod tests {
             None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
         match prev_shm {
-            Some(v) => std::env::set_var("DLSSNR_SHM", v),
-            None => std::env::remove_var("DLSSNR_SHM"),
+            Some(v) => std::env::set_var("NEURALFORGE_SHM", v),
+            None => std::env::remove_var("NEURALFORGE_SHM"),
         }
         std::fs::remove_dir_all(&scratch).ok();
     }

@@ -102,64 +102,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dlssnr-cli"
-version = "0.1.54"
-dependencies = [
- "anyhow",
- "dlssnr-protocol",
- "dlssnr-supervisor",
-]
-
-[[package]]
-name = "dlssnr-gui"
-version = "0.1.54"
-dependencies = [
- "anyhow",
- "dlssnr-protocol",
- "dlssnr-supervisor",
- "gio",
- "glib",
- "gtk4",
- "libadwaita",
-]
-
-[[package]]
-name = "dlssnr-helper"
-version = "0.1.54"
-dependencies = [
- "ash",
- "dlssnr-protocol",
-]
-
-[[package]]
-name = "dlssnr-layer"
-version = "0.1.54"
-dependencies = [
- "ash",
- "dlssnr-protocol",
- "libc",
- "once_cell",
- "png",
- "vulkan-layer",
-]
-
-[[package]]
-name = "dlssnr-protocol"
-version = "0.1.54"
-dependencies = [
- "libc",
-]
-
-[[package]]
-name = "dlssnr-supervisor"
-version = "0.1.54"
-dependencies = [
- "dlssnr-protocol",
- "libc",
- "nix",
-]
-
-[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -609,6 +551,64 @@ checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
 dependencies = [
  "adler2",
  "simd-adler32",
+]
+
+[[package]]
+name = "neuralforge"
+version = "0.1.54"
+dependencies = [
+ "anyhow",
+ "gio",
+ "glib",
+ "gtk4",
+ "libadwaita",
+ "neuralforge-protocol",
+ "neuralforge-supervisor",
+]
+
+[[package]]
+name = "neuralforge-cli"
+version = "0.1.54"
+dependencies = [
+ "anyhow",
+ "neuralforge-protocol",
+ "neuralforge-supervisor",
+]
+
+[[package]]
+name = "neuralforge-helper"
+version = "0.1.54"
+dependencies = [
+ "ash",
+ "neuralforge-protocol",
+]
+
+[[package]]
+name = "neuralforge-layer"
+version = "0.1.54"
+dependencies = [
+ "ash",
+ "libc",
+ "neuralforge-protocol",
+ "once_cell",
+ "png",
+ "vulkan-layer",
+]
+
+[[package]]
+name = "neuralforge-protocol"
+version = "0.1.54"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "neuralforge-supervisor"
+version = "0.1.54"
+dependencies = [
+ "libc",
+ "neuralforge-protocol",
+ "nix",
 ]
 
 [[package]]
