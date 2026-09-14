@@ -283,6 +283,7 @@ impl DeviceInfo for NeuralForgeDeviceInfo {
             VulkanCommand::CmdCopyImage,
             VulkanCommand::CmdBlitImage,
             VulkanCommand::CmdPipelineBarrier,
+            VulkanCommand::CmdPipelineBarrier2,
         ]
     }
 
@@ -413,6 +414,24 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             if let Some(layout) = state.tapped_source_layouts.get_mut(&barrier.image) {
                 *layout = barrier.new_layout;
                 crate::log!("[layer] tracked GTA render source {:?}: {:?} -> {:?}",
+                    barrier.image, barrier.old_layout, barrier.new_layout);
+            }
+        }
+        LayerResult::Unhandled
+    }
+
+    fn cmd_pipeline_barrier2(
+        &self, _command_buffer: vk::CommandBuffer, info: &vk::DependencyInfo,
+    ) -> LayerResult<()> {
+        // SAFETY: the layer framework validated `info` for this application call;
+        // the count/pointer pair is valid for the hook's duration.
+        let images = unsafe { std::slice::from_raw_parts(info.p_image_memory_barriers,
+            info.image_memory_barrier_count as usize) };
+        let mut state = self.state.lock().unwrap();
+        for barrier in images {
+            if let Some(layout) = state.tapped_source_layouts.get_mut(&barrier.image) {
+                *layout = barrier.new_layout;
+                crate::log!("[layer] tracked GTA render source {:?}: {:?} -> {:?} (sync2)",
                     barrier.image, barrier.old_layout, barrier.new_layout);
             }
         }
