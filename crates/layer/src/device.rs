@@ -288,6 +288,11 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 self.surface_caps.and_then(|query| crate::surface_usage::prepare(instance, query, self.physical_device, create_info)))
         } else { None };
         let pass_through = adjusted.is_none();
+        if pass_through && eligible {
+            crate::log!("[layer] capture admission declined for {}x{} fmt={:?} usage={:?}",
+                create_info.image_extent.width, create_info.image_extent.height,
+                create_info.image_format, create_info.image_usage);
+        }
         let mut swapchain = vk::SwapchainKHR::null();
         let alloc_ptr = allocator.map_or(std::ptr::null(), std::ptr::from_ref);
         // SAFETY: only image_usage changes in a private copy with verified support.
