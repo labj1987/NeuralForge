@@ -15,6 +15,10 @@
 - Verify the target-process filter on the RTX 5070 with a real Vulkan test process:
   an `explorer.exe` name is excluded without advancing helper frames, while an
   explicitly targeted `GTA5_Enhanced.exe` name acquires the lease and advances them.
+- Add pipeline timing telemetry and record the first GTA comparison gate: the upstream
+  layer processed 4,540 frames in 61.5 seconds, while NeuralForge safely passed GTA
+  through because its surface exposes `TRANSFER_DST | COLOR_ATTACHMENT`, not the
+  `TRANSFER_SRC` usage required for legal capture. This is not a performance comparison.
 
 ## Historical releases before the NeuralForge rename
 

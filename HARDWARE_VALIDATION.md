@@ -85,6 +85,26 @@ Eleven non-fatal validation warnings remain from the pinned layer framework aski
 path and are not yet resolved. There is still no measured GTA result or Feature 18
 throughput claim. Smoke-test elapsed time is not game FPS or a performance result.
 
+## GTA comparison gate
+
+The upstream session was sampled for 61.478 seconds with the documented GTA baseline
+and `DLSSNR_DMABUF=0`. Its layer counter advanced 4,540 frames (73.85 layer frames per
+second); mean GPU utilization was 94.9%, mean VRAM allocation 5,851 MiB, mean board
+power 232.3 W, and peak temperature 75 C. These counters are useful pipeline evidence,
+but are not game FPS or a 1%-low result.
+
+For the NeuralForge-only launch, Steam was restarted with `NEURALFORGE_ENABLE=1`,
+`NEURALFORGE_TARGET_EXE=GTA5_Enhanced.exe`, `NEURALFORGE_DMABUF=0`, its isolated
+implicit-layer path, and a per-session loader disable for `VK_LAYER_NV_dlssnr`.
+NeuralForge loaded into the Rockstar processes and passed their swapchains through;
+the explicit ownership filter did not let those processes acquire the session.
+GTA itself reached 2560x1440, but reported only `TRANSFER_DST | COLOR_ATTACHMENT`
+for its swapchain image usage. NeuralForge requires `TRANSFER_SRC` to copy the image
+to its host transport. Since the surface capability query did not advertise it, the
+layer retained the original swapchain and did no capture, resize, or helper work.
+The upstream installation and configuration remain unchanged. A matched NeuralForge
+benchmark is blocked until a legal GTA capture path is designed and validated.
+
 The ownership filter was exercised with two temporary names for the same `vkcube`
 binary. A process launched as `explorer.exe` was excluded, created only pass-through
 swapchains, and left `helper_frames` unchanged. A process launched as
