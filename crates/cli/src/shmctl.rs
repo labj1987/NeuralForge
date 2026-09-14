@@ -61,6 +61,13 @@ fn cmd_status(header: &ShmHeader) {
     println!("model_up={}", header.model_up.load(Ordering::Relaxed));
     let frames = (u64::from(header.helper_frames_hi.load(Ordering::Relaxed)) << 32) | u64::from(header.helper_frames_lo.load(Ordering::Relaxed));
     println!("helper_frames={frames}");
+    println!("helper_upload_ms={}", f32::from_bits(header.helper_upload_ms_bits.load(Ordering::Relaxed)));
+    println!("helper_eval_ms={}", f32::from_bits(header.helper_eval_ms_bits.load(Ordering::Relaxed)));
+    println!("helper_readback_ms={}", f32::from_bits(header.helper_readback_ms_bits.load(Ordering::Relaxed)));
+    let layer_frames = (u64::from(header.layer_frames_hi.load(Ordering::Relaxed)) << 32) | u64::from(header.layer_frames_lo.load(Ordering::Relaxed));
+    println!("layer_frames={layer_frames}");
+    println!("layer_ms={}", f32::from_bits(header.layer_ms_bits.load(Ordering::Relaxed)));
+    println!("layer_composition_up={}", header.layer_composition_up.load(Ordering::Relaxed));
     println!("capture_request={}", header.capture_request.load(Ordering::Relaxed));
     println!("# settings (neuralforge_protocol::ShmHeader::persisted_settings)");
     for (name, is_float, bits) in header.persisted_settings() {

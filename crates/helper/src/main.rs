@@ -40,6 +40,13 @@ use std::time::Duration;
 use ash::vk;
 use neuralforge_helper::{frame, guard, ngx, shm};
 
+fn store_ms(field: &std::sync::atomic::AtomicU32, duration: Duration) {
+    field.store(
+        ((duration.as_secs_f64() * 1_000.0) as f32).to_bits(),
+        Ordering::Relaxed,
+    );
+}
+
 fn main() {
     guard::install();
 
@@ -141,9 +148,10 @@ fn main() {
             // SAFETY: this helper exclusively owns the request after observing
             // `seq_req`; proxy and answer are disjoint fixed regions in the mapping.
             let (proxy, answer) = unsafe { shm.frame_regions(n) };
-            let evaluated = ready
+            let timing = if ready
                 && neuralforge_protocol::enums::proxy_format::is_8bit(proxy_format)
-                && (|| {
+            {
+                (|| {
                     if !frame_resources.as_ref().is_some_and(|f| f.matches(0, width, height, proxy_format)) {
                         // SAFETY: any previous resources are no longer referenced by
                         // in-flight work -- `FrameResources::evaluate` always waits on
@@ -157,9 +165,17 @@ fn main() {
                     let f = frame_resources.as_ref()?;
                     let (Some(eval_fn), params) = (snippet.evaluate_feature_fn(), snippet.params()) else { return None };
                     let tuning = hdr.resolve_pass(0);
-                    f.evaluate(&device, queue, eval_fn, snippet.feature, params, proxy, &motion, motion_scale, hdr.mvec_enabled() && motion.is_empty(), tuning, answer).then_some(())
+                    f.evaluate(&device, queue, eval_fn, snippet.feature, params, proxy, &motion, motion_scale, hdr.mvec_enabled() && motion.is_empty(), tuning, answer)
                 })()
-                .is_some();
+            } else {
+                None
+            };
+            let evaluated = timing.is_some();
+            if let Some(timing) = timing {
+                store_ms(&hdr.helper_upload_ms_bits, timing.upload);
+                store_ms(&hdr.helper_eval_ms_bits, timing.evaluate);
+                store_ms(&hdr.helper_readback_ms_bits, timing.download);
+            }
             if !evaluated {
                 // Fail open: no real answer yet (feature still warming up, wrong
                 // proxy format, or a guarded `EvaluateFeature` failure) -- echo the

@@ -23,6 +23,16 @@ use ash::vk;
 
 use crate::abi::{self, NgxImageViewInfoVk, NgxResourceVk};
 
+/// Host-observed timings for one completed helper evaluation. They include the
+/// corresponding Vulkan fence waits, so they measure end-to-end stage latency rather
+/// than merely command-recording cost.
+#[derive(Clone, Copy, Debug)]
+pub struct FrameTiming {
+    pub upload: std::time::Duration,
+    pub evaluate: std::time::Duration,
+    pub download: std::time::Duration,
+}
+
 pub struct FrameResources {
     color_format: vk::Format,
     width: u32,
@@ -278,8 +288,9 @@ impl FrameResources {
     }
 
     /// Uploads `proxy` and motion, runs `EvaluateFeature`, downloads
-    /// Output into `answer_out`. Returns `false` (leaving `answer_out` untouched) on
-    /// any failure, including a guarded fault inside `EvaluateFeature` itself.
+    /// Output into `answer_out`. Returns timings for a completed evaluation, or `None`
+    /// (leaving `answer_out` untouched) on a failure, including a guarded fault inside
+    /// `EvaluateFeature` itself.
     #[allow(clippy::too_many_arguments)]
     pub fn evaluate(
         &self,
@@ -294,10 +305,10 @@ impl FrameResources {
         reset_history: bool,
         tuning: neuralforge_protocol::PassTuning,
         answer_out: &mut [u8],
-    ) -> bool {
+    ) -> Option<FrameTiming> {
         let pixel_count = (self.width as usize) * (self.height as usize);
         if proxy.len() < pixel_count * 4 || answer_out.len() < pixel_count * 4 {
-            return false;
+            return None;
         }
 
         // Stage 1: upload proxy -> Color and motion -> MVec.
@@ -311,7 +322,7 @@ impl FrameResources {
         }
         let t_upload_start = std::time::Instant::now();
         if !self.run_transfer(device, queue, TransferKind::Upload) {
-            return false;
+            return None;
         }
         let t_upload = t_upload_start.elapsed();
 
@@ -386,12 +397,12 @@ impl FrameResources {
                     abi::result::FAIL_SEH,
                 )
             }) else {
-                return false;
+                return None;
             };
             let t_eval = t_eval_start.elapsed();
             crate::log!("[ngx] EvaluateFeature -> {:#x} seh={:#x} took={:?}", result.0 as u32, result.1, t_eval);
             if !abi::succeeded(result.0) || result.1 != 0 {
-                return false;
+                return None;
             }
             t_eval
         };
@@ -399,7 +410,7 @@ impl FrameResources {
         // Stage 3: download Output -> answer_out.
         let t_download_start = std::time::Instant::now();
         if !self.run_transfer(device, queue, TransferKind::Download) {
-            return false;
+            return None;
         }
         let t_download = t_download_start.elapsed();
         crate::log!(
@@ -411,7 +422,11 @@ impl FrameResources {
         );
         // SAFETY: `staging_ptr` is a live mapping of at least `pixel_count * 4` bytes.
         unsafe { std::ptr::copy_nonoverlapping(self.staging_ptr, answer_out.as_mut_ptr(), pixel_count * 4) };
-        true
+        Some(FrameTiming {
+            upload: t_upload,
+            evaluate: t_eval,
+            download: t_download,
+        })
     }
 
     fn resource_info(&self, view: vk::ImageView, image: vk::Image, format: vk::Format) -> NgxImageViewInfoVk {

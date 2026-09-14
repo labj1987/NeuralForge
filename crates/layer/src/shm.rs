@@ -234,6 +234,18 @@ impl ShmClient {
         neuralforge_protocol::store64(&hdr.layer_frames_lo, &hdr.layer_frames_hi, frames);
     }
 
+    /// Publishes the layer's host-observed cost for a frame. This is deliberately a
+    /// single atomic snapshot rather than per-frame logging: consumers can sample it
+    /// through the GUI or CLI without adding I/O to the game's present path.
+    pub fn publish_frame_timing(&self, total: Duration, composition_up: bool) {
+        let Some(hdr) = self.header() else { return };
+        hdr.layer_ms_bits.store(
+            (total.as_secs_f64().mul_add(1_000.0, 0.0) as f32).to_bits(),
+            Ordering::Relaxed,
+        );
+        hdr.layer_composition_up.store(u32::from(composition_up), Ordering::Relaxed);
+    }
+
     /// Writes `bytes` (truncated to `MAX_FRAME`, same discipline as the free-text
     /// fields in `ShmHeader`) into the proxy region -- the frame the layer is about to
     /// hand the model. Call before bumping `seq_req` (via [`Self::try_round_trip`]):

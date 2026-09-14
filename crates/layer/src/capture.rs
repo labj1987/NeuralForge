@@ -297,6 +297,7 @@ pub unsafe fn run(
     answer_scratch: &mut Vec<u8>,
     last_answer: &mut Vec<u8>,
 ) -> Option<vk::Semaphore> {
+    let pipeline_start = std::time::Instant::now();
     // `composition_settings()` (and everything else below) only ever reads through an
     // already-open mapping -- nothing about it opens one. Every real path that DOES
     // open the mapping (`try_round_trip`/`begin_async_request`) lives later in this
@@ -484,6 +485,7 @@ pub unsafe fn run(
             bgr_order,
             image,
         ) {
+            shm.publish_frame_timing(pipeline_start.elapsed(), true);
             return Some(sem);
         }
     }
@@ -495,6 +497,7 @@ pub unsafe fn run(
     }
     let r = resources.as_ref().expect("just ensured above");
     write_bytes_to_image(device, r, queue, image, width, height, last_answer);
+    shm.publish_frame_timing(pipeline_start.elapsed(), true);
     None
 }
 
@@ -1001,6 +1004,7 @@ unsafe fn run_sync(
             t_compose_start.elapsed(),
             t_stage1_start.elapsed(),
         );
+        shm.publish_frame_timing(t_stage1_start.elapsed(), true);
         return Some(sem);
     }
 
@@ -1091,6 +1095,7 @@ unsafe fn run_sync(
         t_stage2,
         t_stage1_start.elapsed(),
     );
+    shm.publish_frame_timing(t_stage1_start.elapsed(), answered);
 
     None
 }
