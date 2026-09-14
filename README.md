@@ -14,7 +14,7 @@ see [Legal](#legal) before you use it.
 Repository: [labj1987/NeuralForge](https://github.com/labj1987/NeuralForge).
 
 See [PHASE1.md](PHASE1.md) for coexistence, installation, migration and the approved benchmark roadmap.
-Current NVIDIA presentation-validation findings are tracked in [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md); the GTA benchmark is not yet validated.
+Current NVIDIA presentation-validation findings are tracked in [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md). NeuralForge now has a guarded GTA render tap: it captures only a game-owned, tracked transfer source and writes through the swapchain's supported destination usage. The first live interval validates correctness, not comparable game FPS or 1%-low performance.
 
 ## Screenshots
 
@@ -87,6 +87,21 @@ The GUI is `neuralforge`; the CLI is `neuralforge-cli`; the Windows helper is
 data and state use their own `neuralforge` directories. Upstream DLSS5VKLayer can
 remain installed; its launch variables and files are separate. See [PHASE1.md](PHASE1.md)
 for executable targeting, migration, uninstall and the exact GTA baseline.
+
+## GTA status
+
+On the RTX 5070 target, GTA V Enhanced exposes a swapchain without transfer-source
+usage. NeuralForge therefore does not read the swapchain image. It tracks GTA's own
+render-to-swapchain blit, captures the demonstrated transfer-capable source only
+after its layout has returned to `GENERAL`, restores that layout, and presents through
+the original swapchain. Rockstar Launcher, Social Club, Wine Explorer, Xalia, and
+overlays remain pass-through. The full model and helper remain enabled; the known-good
+baseline uses `NEURALFORGE_DMABUF=0`.
+
+The current host-SHM capture is synchronous and is intentionally being profiled before
+any performance claim. See [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) for the
+recorded live results and [RENDER_TAP_DESIGN.md](RENDER_TAP_DESIGN.md) for the safety
+constraints behind this path.
 
 ## Building from source
 
