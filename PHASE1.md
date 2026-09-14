@@ -1,7 +1,7 @@
 # NeuralForge Phase 1
 
-NeuralForge is the Rust application in `labj1987/dlssnr`. The GitHub repository
-name stays unchanged. Historical handoffs are evidence, not deployment instructions.
+NeuralForge is the Rust application in `labj1987/neuralforge`. The GitHub repository
+has been renamed from `labj1987/dlssnr`. Historical handoffs are evidence, not deployment instructions.
 No installed upstream package or game setting is changed by this work.
 
 ## Namespace contract

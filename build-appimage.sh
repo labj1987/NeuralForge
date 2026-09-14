@@ -110,8 +110,8 @@ fi
 echo "==> Packing AppImage"
 OUT="NeuralForge-$VERSION-$ARCH.AppImage"
 
-# Repository name remains dlssnr; only release asset branding changes.
-UPDATE_INFORMATION="gh-releases-zsync|labj1987|dlssnr|latest|NeuralForge-*-x86_64.AppImage.zsync"
+# Use the canonical renamed repository for release updates.
+UPDATE_INFORMATION="gh-releases-zsync|labj1987|neuralforge|latest|NeuralForge-*-x86_64.AppImage.zsync"
 VERSION="$VERSION" ARCH="$ARCH" "$TOOL" --appimage-extract-and-run \
     -u "$UPDATE_INFORMATION" "$APPDIR" "$OUT"
 
@@ -129,7 +129,7 @@ ls -lh "$OUT"
 # only resolves correctly if a client does real relative-URL resolution against
 # wherever it fetched this .zsync from -- not guaranteed. Point it at this exact
 # release's real, absolute GitHub download URL instead of relying on that.
-ZSYNC_URL="https://github.com/labj1987/dlssnr/releases/download/v$VERSION/$OUT"
+ZSYNC_URL="https://github.com/labj1987/neuralforge/releases/download/v$VERSION/$OUT"
 echo "==> Generating .zsync sidecar"
 if zsyncmake -u "$ZSYNC_URL" "$OUT"; then
     echo "==> .zsync generated: $OUT.zsync"
