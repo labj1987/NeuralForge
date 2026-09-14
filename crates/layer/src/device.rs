@@ -3,7 +3,7 @@
 //! learn which queue family a queue belongs to, `vkQueuePresentKHR` is where the real
 //! capture/transport/write-back round trip (`crate::capture::run`) happens now.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::sync::{Arc, Mutex};
 
@@ -119,6 +119,9 @@ struct State {
     answer_scratch: Vec<u8>,
     last_answer: Vec<u8>,
     hotkey: crate::hotkey::Poller,
+    /// Passive transfer observations for swapchains which could not be admitted at
+    /// creation.  This is diagnostic-only: it never changes a game command buffer.
+    observed_swapchain_writes: HashSet<vk::Image>,
 }
 
 type CleanupState = (Arc<ash::Device>, Arc<Mutex<State>>);
@@ -245,6 +248,23 @@ impl NeuralForgeDeviceInfo {
         }
         images
     }
+
+    /// Records the first application transfer into each known swapchain image. A
+    /// transfer command itself proves that the source image has the relevant read
+    /// usage, making it a candidate for a later render-tap design. This hook is
+    /// intentionally observational and always forwards the application command.
+    fn observe_swapchain_write(
+        &self, kind: &str, src: vk::Image, src_layout: vk::ImageLayout,
+        dst: vk::Image, dst_layout: vk::ImageLayout, region_count: usize,
+    ) {
+        let mut state = self.state.lock().unwrap();
+        let known = state.swapchains.values().any(|swapchain| swapchain.images.contains(&dst));
+        if known && state.observed_swapchain_writes.insert(dst) {
+            crate::log!("[layer] observed game {} into swapchain: src={:?} {:?} dst={:?} {:?} regions={}",
+                kind, src, src_layout, dst, dst_layout, region_count);
+            crate::logging::flush();
+        }
+    }
 }
 
 impl DeviceInfo for NeuralForgeDeviceInfo {
@@ -258,6 +278,8 @@ impl DeviceInfo for NeuralForgeDeviceInfo {
             VulkanCommand::QueuePresentKhr,
             VulkanCommand::GetDeviceQueue,
             VulkanCommand::GetDeviceQueue2,
+            VulkanCommand::CmdCopyImage,
+            VulkanCommand::CmdBlitImage,
         ]
     }
 
@@ -302,7 +324,10 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             return LayerResult::Handled(Err(result));
         }
         let hdr_kind = swapchain::detect_hdr_kind(create_info.image_format, create_info.image_color_space);
-        let images = if pass_through { Vec::new() } else { self.fetch_swapchain_images(swapchain) };
+        // Cache even a pass-through swapchain's images. This lets the passive command
+        // diagnostics identify a legal render-to-swapchain transfer without touching
+        // the application's creation or recording path.
+        let images = self.fetch_swapchain_images(swapchain);
         let state = SwapchainState {
             format: create_info.image_format,
             width: create_info.image_extent.width,
@@ -356,6 +381,22 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         unsafe { next(self.device.handle(), queue_info, &mut queue) };
         self.state.lock().unwrap().queue_families.insert(queue, queue_info.queue_family_index);
         LayerResult::Handled(queue)
+    }
+
+    fn cmd_copy_image(
+        &self, _command_buffer: vk::CommandBuffer, src: vk::Image, src_layout: vk::ImageLayout,
+        dst: vk::Image, dst_layout: vk::ImageLayout, regions: &[vk::ImageCopy],
+    ) -> LayerResult<()> {
+        self.observe_swapchain_write("copy", src, src_layout, dst, dst_layout, regions.len());
+        LayerResult::Unhandled
+    }
+
+    fn cmd_blit_image(
+        &self, _command_buffer: vk::CommandBuffer, src: vk::Image, src_layout: vk::ImageLayout,
+        dst: vk::Image, dst_layout: vk::ImageLayout, regions: &[vk::ImageBlit], _filter: vk::Filter,
+    ) -> LayerResult<()> {
+        self.observe_swapchain_write("blit", src, src_layout, dst, dst_layout, regions.len());
+        LayerResult::Unhandled
     }
 
     fn destroy_swapchain_khr(
