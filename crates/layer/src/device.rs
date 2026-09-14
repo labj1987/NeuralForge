@@ -122,6 +122,7 @@ struct State {
     /// Passive transfer observations for swapchains which could not be admitted at
     /// creation.  This is diagnostic-only: it never changes a game command buffer.
     observed_swapchain_writes: HashSet<vk::Image>,
+    tapped_source_layouts: HashMap<vk::Image, vk::ImageLayout>,
 }
 
 type CleanupState = (Arc<ash::Device>, Arc<Mutex<State>>);
@@ -264,6 +265,7 @@ impl NeuralForgeDeviceInfo {
                 kind, src, src_layout, dst, dst_layout, region_count);
             crate::logging::flush();
         }
+        if known { state.tapped_source_layouts.insert(src, src_layout); }
     }
 }
 
@@ -280,6 +282,7 @@ impl DeviceInfo for NeuralForgeDeviceInfo {
             VulkanCommand::GetDeviceQueue2,
             VulkanCommand::CmdCopyImage,
             VulkanCommand::CmdBlitImage,
+            VulkanCommand::CmdPipelineBarrier,
         ]
     }
 
@@ -396,6 +399,23 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         dst: vk::Image, dst_layout: vk::ImageLayout, regions: &[vk::ImageBlit], _filter: vk::Filter,
     ) -> LayerResult<()> {
         self.observe_swapchain_write("blit", src, src_layout, dst, dst_layout, regions.len());
+        LayerResult::Unhandled
+    }
+
+    fn cmd_pipeline_barrier(
+        &self, _command_buffer: vk::CommandBuffer, _src_stage: vk::PipelineStageFlags,
+        _dst_stage: vk::PipelineStageFlags, _dependency: vk::DependencyFlags,
+        _memory: &[vk::MemoryBarrier], _buffers: &[vk::BufferMemoryBarrier],
+        images: &[vk::ImageMemoryBarrier],
+    ) -> LayerResult<()> {
+        let mut state = self.state.lock().unwrap();
+        for barrier in images {
+            if let Some(layout) = state.tapped_source_layouts.get_mut(&barrier.image) {
+                *layout = barrier.new_layout;
+                crate::log!("[layer] tracked GTA render source {:?}: {:?} -> {:?}",
+                    barrier.image, barrier.old_layout, barrier.new_layout);
+            }
+        }
         LayerResult::Unhandled
     }
 
