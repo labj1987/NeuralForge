@@ -1,6 +1,6 @@
 # NeuralForge Phase 1
 
-NeuralForge is the Rust application in `labj1987/neuralforge`. The GitHub repository
+NeuralForge is the Rust application in `labj1987/NeuralForge`. The GitHub repository
 has been renamed from `labj1987/dlssnr`. Historical handoffs are evidence, not deployment instructions.
 No installed upstream package or game setting is changed by this work.
 See [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) for the current RTX 5070

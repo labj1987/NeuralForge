@@ -1,6 +1,6 @@
 # NeuralForge developer guidance
 
-Repository: https://github.com/labj1987/neuralforge
+Repository: https://github.com/labj1987/NeuralForge
 
 Read [PHASE1.md](PHASE1.md) for the current namespace, installation contract and
 benchmark plan. The former app name was dlssnr; upstream DLSS5VKLayer remains a

@@ -22,6 +22,6 @@ for path in (root / 'crates').rglob('*.rs'):
     assert 'NEURALFORGE.Color' not in code, path
 assert (root / 'README.md').read_text().startswith('# NeuralForge\n')
 assert '`dlssnr` is a from-scratch' not in (root / 'ATTRIBUTION.md').read_text()
-assert '|labj1987|neuralforge|latest|' in (root / 'build-appimage.sh').read_text()
-assert 'https://github.com/labj1987/neuralforge' in (root / 'README.md').read_text()
+assert '|labj1987|NeuralForge|latest|' in (root / 'build-appimage.sh').read_text()
+assert 'https://github.com/labj1987/NeuralForge' in (root / 'README.md').read_text()
 print('Namespace contract: OK')

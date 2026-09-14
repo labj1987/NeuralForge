@@ -11,7 +11,7 @@ This is experimental, personal-use software. It works around an authorization ch
 NVIDIA's proprietary NGX DLL to run the model outside its intended integration path —
 see [Legal](#legal) before you use it.
 
-Repository: [labj1987/neuralforge](https://github.com/labj1987/neuralforge).
+Repository: [labj1987/NeuralForge](https://github.com/labj1987/NeuralForge).
 
 See [PHASE1.md](PHASE1.md) for coexistence, installation, migration and the approved benchmark roadmap.
 Current NVIDIA presentation-validation findings are tracked in [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md); the GTA benchmark is not yet validated.
@@ -68,7 +68,7 @@ or from the GUI's binaries import flow. Files are copied into
 
 ## Install
 
-Download the AppImage from [Releases](https://github.com/labj1987/neuralforge/releases):
+Download the AppImage from [Releases](https://github.com/labj1987/NeuralForge/releases):
 
 ```bash
 chmod +x NeuralForge-*-x86_64.AppImage
