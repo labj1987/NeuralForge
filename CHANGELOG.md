@@ -12,6 +12,9 @@
   are released before device destruction, and present semaphores are image-scoped.
   The longer Vulkan and synchronization-validation smoke runs completed without
   validation errors. This is a correctness gate, not a GTA performance claim.
+- Verify the target-process filter on the RTX 5070 with a real Vulkan test process:
+  an `explorer.exe` name is excluded without advancing helper frames, while an
+  explicitly targeted `GTA5_Enhanced.exe` name acquires the lease and advances them.
 
 ## Historical releases before the NeuralForge rename
 

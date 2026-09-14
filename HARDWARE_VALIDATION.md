@@ -85,6 +85,15 @@ Eleven non-fatal validation warnings remain from the pinned layer framework aski
 path and are not yet resolved. There is still no measured GTA result or Feature 18
 throughput claim. Smoke-test elapsed time is not game FPS or a performance result.
 
+The ownership filter was exercised with two temporary names for the same `vkcube`
+binary. A process launched as `explorer.exe` was excluded, created only pass-through
+swapchains, and left `helper_frames` unchanged. A process launched as
+`GTA5_Enhanced.exe` with `NEURALFORGE_TARGET_EXE=GTA5_Enhanced.exe` acquired the
+NeuralForge lease, used a non-pass-through swapchain, and advanced helper frames
+from 484 to 530. These are process-filter tests, not a GTA launch. They confirm the
+intended launcher exclusion and explicit-target path without touching Steam, GTA, or
+the upstream install.
+
 Keep the PR in draft until the review accepts these changes and the matched GTA
 benchmark in PHASE1.md has been run. The user's helper, model-resolution and
 DMA-BUF constraints remain in force; later optimization features are unimplemented.
