@@ -111,6 +111,20 @@ images. The layer merely recorded those commands and forwarded them unchanged. T
 candidate render-tap design is recorded in `RENDER_TAP_DESIGN.md`; it has not been
 enabled for rendering or benchmarked.
 
+The guarded render tap was then validated live. GTA's source images were observed
+through Synchronization2 barriers as `GENERAL -> TRANSFER_SRC_OPTIMAL -> GENERAL`.
+NeuralForge captures only after the source has returned to `GENERAL`, transitions it
+to `TRANSFER_SRC_OPTIMAL` for its private copy, and restores `GENERAL`; the swapchain
+remains a `TRANSFER_DST` output. Helper frames advanced from 219 to 336 on first use,
+with `model_up=1` and `NEURALFORGE_DMABUF=0` throughout.
+
+An initial 61.413-second NeuralForge interval advanced 475 layer frames (7.73 layer
+frames per second), with 34.9% average GPU utilization, 5,235 MiB VRAM, 77.1 W mean
+power, and 55 C maximum temperature. This cannot be compared as game FPS or against
+the earlier upstream interval because the GTA scene and GPU workload were not held
+constant. It does demonstrate that the current fully synchronous host transport is
+the next performance bottleneck to instrument and pipeline.
+
 The ownership filter was exercised with two temporary names for the same `vkcube`
 binary. A process launched as `explorer.exe` was excluded, created only pass-through
 swapchains, and left `helper_frames` unchanged. A process launched as
