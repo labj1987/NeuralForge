@@ -13,6 +13,13 @@ and remains running. Its live settings retain working_scale=1, passes=1,
 mvec_enabled=0, mvec_quality=0 and apply_model=1. The required NVIDIA DLLs were
 copied by the explicit binary importer; nothing was moved from upstream.
 
+The initial SSH-launched helper later exited while its header still reported RUNNING.
+The cause of that exit is not established; header state alone is not a liveness check.
+For continued validation it was relaunched with a transient user service,
+`neuralforge-validation-helper.service` (oneshot with RemainAfterExit), keeping its
+process tree outside the short-lived SSH session. This is not a boot-enabled service.
+Verify the actual helper process and advancing counters before any benchmark.
+
 ## Presentation test and dispatch fix
 
 A 120-frame, 1280x720 Wayland `vkcube` smoke test with Khronos validation exits 0
