@@ -29,6 +29,9 @@ mod logging;
 mod hotkey;
 mod shm;
 mod swapchain;
+mod surface_usage;
+mod entry_points;
+mod present_sync;
 
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
@@ -49,7 +52,12 @@ use device::NeuralForgeDeviceInfo;
 /// Games overwhelmingly create exactly one `VkInstance`; a plain "last one wins" slot
 /// is the same simplification `device::PRIMARY` already makes for the analogous
 /// one-swapchain-at-a-time assumption.
-static CURRENT_INSTANCE: Mutex<Option<Arc<ash::Instance>>> = Mutex::new(None);
+#[derive(Clone)]
+struct InstanceContext {
+    instance: Arc<ash::Instance>,
+    surface_caps: Option<vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>,
+}
+static CURRENT_INSTANCE: Mutex<Option<InstanceContext>> = Mutex::new(None);
 
 pub const LAYER_NAME: &str = "VK_LAYER_neuralforge_neural";
 
@@ -151,9 +159,15 @@ impl Layer for NeuralForgeLayer {
         _create_info: &vk::InstanceCreateInfo,
         _allocator: Option<&vk::AllocationCallbacks>,
         instance: Arc<ash::Instance>,
-        _next_get_instance_proc_addr: vk::PFN_vkGetInstanceProcAddr,
+        next_get_instance_proc_addr: vk::PFN_vkGetInstanceProcAddr,
     ) -> Self::InstanceInfoContainer {
-        *CURRENT_INSTANCE.lock().unwrap() = Some(instance);
+        // Resolve below this layer: the physical-device handle supplied by the
+        // framework belongs to that chain, not the loader's outer trampoline.
+        let surface_caps = unsafe {
+            next_get_instance_proc_addr(instance.handle(), c"vkGetPhysicalDeviceSurfaceCapabilitiesKHR".as_ptr())
+                .map(|p| std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(p))
+        };
+        *CURRENT_INSTANCE.lock().unwrap() = Some(InstanceContext { instance, surface_caps });
         Default::default()
     }
 
@@ -171,8 +185,8 @@ impl Layer for NeuralForgeLayer {
         // only matters for a hypothetical device created against an instance from
         // before this layer was loaded, which never happens for an implicit layer.
         let instance = CURRENT_INSTANCE.lock().unwrap().clone();
-        NeuralForgeDeviceInfo::new(instance, physical_device, device, next_get_device_proc_addr, create_info)
+        NeuralForgeDeviceInfo::new(instance.as_ref().map(|ctx| ctx.instance.clone()), instance.and_then(|ctx| ctx.surface_caps), physical_device, device, next_get_device_proc_addr, create_info)
     }
 }
 
-declare_introspection_queries!(Global::<NeuralForgeLayer>);
+declare_introspection_queries!(entry_points::EntryPoints);

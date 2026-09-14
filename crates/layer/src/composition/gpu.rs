@@ -213,7 +213,7 @@ struct Sized_ {
 /// One independent, fully self-contained resource set: its own images/staging buffer
 /// (sized on first use, rebuilt on resize), descriptor set, command buffer, and fence.
 /// The sync path uses exactly one of these; the async path uses [`ASYNC_SLOTS`] of
-/// them, alternating, plus its own semaphore each (see [`AsyncSlot`]).
+/// them, alternating (see [`AsyncSlot`]); presentation semaphores follow images.
 struct ComposeSlot {
     descriptor_set: vk::DescriptorSet,
     cmd: vk::CommandBuffer,
@@ -613,7 +613,9 @@ impl ComposeSlot {
                 image_barrier(s.original.image, current_old, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::SHADER_READ, vk::AccessFlags::TRANSFER_WRITE),
                 image_barrier(s.output.image, output_old, vk::ImageLayout::GENERAL, vk::AccessFlags::TRANSFER_READ, vk::AccessFlags::SHADER_WRITE),
             ];
-            device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &to_compute);
+            // This batch prepares both the upload destination and the compute
+            // output. SHADER_WRITE needs COMPUTE_SHADER in the destination scope.
+            device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[], &[], &to_compute);
             device.cmd_copy_buffer_to_image(self.cmd, s.current_buffer, s.original.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, 0)]);
             let original_general = image_barrier(s.original.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::GENERAL, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ);
             device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[], &[], &[original_general]);
@@ -658,12 +660,11 @@ impl ComposeSlot {
     }
 }
 
-/// One [`ComposeSlot`] plus the semaphore its own async dispatch signals. Two of these
+/// One independently fenced command/resource slot. Two of these
 /// alternate in [`GpuCompose::dispatch_into_image_async`] so a slot is never reused
 /// until its *previous* use (two dispatches ago) has genuinely finished.
 struct AsyncSlot {
     slot: ComposeSlot,
-    semaphore: vk::Semaphore,
 }
 
 /// The size-independent pipeline state (shader module, descriptor/pipeline layouts,
@@ -679,6 +680,7 @@ pub struct GpuCompose {
     sync: ComposeSlot,
     async_slots: [AsyncSlot; ASYNC_SLOTS],
     next_async_slot: usize,
+    present_semaphores: crate::present_sync::PresentSemaphores,
 }
 
 // SAFETY: every field is either a plain Vulkan handle or (inside a slot's own
@@ -834,30 +836,12 @@ impl GpuCompose {
                     for s in &async_slots {
                         let s: &AsyncSlot = s;
                         s.slot.destroy(device);
-                        device.destroy_semaphore(s.semaphore, None);
                     }
                 }
                 cleanup_partial(device);
                 return None;
             };
-            let sem_info = vk::SemaphoreCreateInfo::builder();
-            // SAFETY: `sem_info` is valid.
-            let Ok(semaphore) = (unsafe { device.create_semaphore(&sem_info, None) }) else {
-                // SAFETY: same reasoning as the branch above; `slot` itself owns no
-                // GPU work in flight yet either.
-                unsafe {
-                    sync.destroy(device);
-                    slot.destroy(device);
-                    for s in &async_slots {
-                        let s: &AsyncSlot = s;
-                        s.slot.destroy(device);
-                        device.destroy_semaphore(s.semaphore, None);
-                    }
-                }
-                cleanup_partial(device);
-                return None;
-            };
-            async_slots.push(AsyncSlot { slot, semaphore });
+            async_slots.push(AsyncSlot { slot });
         }
 
         Some(Self {
@@ -869,6 +853,7 @@ impl GpuCompose {
             sync,
             async_slots: async_slots.try_into().unwrap_or_else(|_| unreachable!("pushed exactly ASYNC_SLOTS elements above")),
             next_async_slot: 0,
+            present_semaphores: Default::default(),
         })
     }
 
@@ -1042,6 +1027,9 @@ impl GpuCompose {
         &mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, queue: vk::Queue,
         width: u32, height: u32, base: &[u8], answer: &[u8], generation: u64, bgr_order: bool, target_image: vk::Image,
     ) -> Option<vk::Semaphore> {
+        let semaphore = self.present_semaphores.get(target_image, || unsafe {
+            device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).ok()
+        })?;
         let idx = self.next_async_slot; self.next_async_slot = (self.next_async_slot + 1) % ASYNC_SLOTS;
         let slot = &mut self.async_slots[idx];
         if unsafe { device.wait_for_fences(&[slot.slot.fence], true, u64::MAX) }.is_err() { return None; }
@@ -1059,10 +1047,10 @@ impl GpuCompose {
         if unsafe { device.begin_command_buffer(slot.slot.cmd, &begin) }.is_err() { return None; }
         unsafe { slot.slot.record_temporal_delta_into_image(device, self.pipeline, self.pipeline_layout, width, height, bytes as u64, update, bgr_order, target_image); }
         if unsafe { device.end_command_buffer(slot.slot.cmd) }.is_err() || unsafe { device.reset_fences(&[slot.slot.fence]) }.is_err() { return None; }
-        let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&slot.slot.cmd)).signal_semaphores(std::slice::from_ref(&slot.semaphore)).build();
+        let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&slot.slot.cmd)).signal_semaphores(std::slice::from_ref(&semaphore)).build();
         if unsafe { device.queue_submit(queue, &[submit], slot.slot.fence) }.is_err() { return None; }
         if update { slot.slot.cached_generation = generation; }
-        Some(slot.semaphore)
+        Some(semaphore)
     }
 
     /// Presents a raw helper answer every frame while uploading it only when the
@@ -1081,6 +1069,9 @@ impl GpuCompose {
         generation: u64,
         target_image: vk::Image,
     ) -> Option<vk::Semaphore> {
+        let semaphore = self.present_semaphores.get(target_image, || unsafe {
+            device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).ok()
+        })?;
         let idx = self.next_async_slot;
         self.next_async_slot = (self.next_async_slot + 1) % ASYNC_SLOTS;
         let async_slot = &mut self.async_slots[idx];
@@ -1110,10 +1101,10 @@ impl GpuCompose {
         if unsafe { device.reset_fences(&[async_slot.slot.fence]) }.is_err() { return None; }
         let submit = vk::SubmitInfo::builder()
             .command_buffers(std::slice::from_ref(&async_slot.slot.cmd))
-            .signal_semaphores(std::slice::from_ref(&async_slot.semaphore))
+            .signal_semaphores(std::slice::from_ref(&semaphore))
             .build();
         if unsafe { device.queue_submit(queue, &[submit], async_slot.slot.fence) }.is_err() { return None; }
-        Some(async_slot.semaphore)
+        Some(semaphore)
     }
 
     /// The real per-frame fast path: same composition and same write-straight-into-
@@ -1125,7 +1116,7 @@ impl GpuCompose {
     /// is what actually waits for this frame's compute work before displaying it.
     ///
     /// Double-buffered across [`ASYNC_SLOTS`] independent [`AsyncSlot`]s (own images,
-    /// staging buffer, command buffer, fence, semaphore) specifically so that never
+    /// staging buffer, command buffer, fence) specifically so that never
     /// blocking on *this* call's own fence doesn't mean never blocking at all: the one
     /// necessary wait is on the slot's *own* fence, from its *previous* use
     /// ([`ASYNC_SLOTS`] dispatches ago) -- immediately before reusing its resources,
@@ -1136,18 +1127,9 @@ impl GpuCompose {
     /// still-in-flight prior work, not to reintroduce the per-frame block this method
     /// exists to remove.
     ///
-    /// Binary-semaphore reuse safety: a signaled-but-not-yet-waited-on binary
-    /// semaphore must never be signaled again. Each async slot's semaphore is only
-    /// ever signaled by *this* method for *that* slot, and the very next thing that
-    /// happens after this method returns `Some(sem)` is `device.rs` chaining `sem`
-    /// into the real present call -- always, unconditionally, every single frame (see
-    /// `queue_present_khr`'s own structure) -- so a wait for it is always enqueued
-    /// before this same slot, and therefore this same semaphore, could ever be
-    /// signaled again ([`ASYNC_SLOTS`] dispatches later at the earliest). `None` (no
-    /// semaphore, present immediately) on any failure -- fails open exactly like every
-    /// other stage of the capture path, at the cost of that one frame not getting a
-    /// composited result (the caller falls back to [`Self::dispatch_into_image`] or
-    /// the CPU path in that case, both fully synchronous and safe on their own).
+    /// Presentation semaphores are keyed by acquired target image, independently
+    /// of these command slots. Reacquisition orders reuse after the previous
+    /// presentation's wait. Slot fences alone do not establish that ordering.
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch_into_image_async(
         &mut self,
@@ -1165,6 +1147,9 @@ impl GpuCompose {
         bgr_order: bool,
         target_image: vk::Image,
     ) -> Option<vk::Semaphore> {
+        let semaphore = self.present_semaphores.get(target_image, || unsafe {
+            device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).ok()
+        })?;
         let idx = self.next_async_slot;
         self.next_async_slot = (self.next_async_slot + 1) % ASYNC_SLOTS;
         let async_slot = &mut self.async_slots[idx];
@@ -1219,7 +1204,7 @@ impl GpuCompose {
         }
         let submit = vk::SubmitInfo::builder()
             .command_buffers(std::slice::from_ref(&async_slot.slot.cmd))
-            .signal_semaphores(std::slice::from_ref(&async_slot.semaphore))
+            .signal_semaphores(std::slice::from_ref(&semaphore))
             .build();
         // SAFETY: `async_slot.slot.cmd` was just recorded and ended above. Not waiting
         // on `async_slot.slot.fence` here is the entire point of this method -- see
@@ -1227,7 +1212,11 @@ impl GpuCompose {
         if unsafe { device.queue_submit(queue, &[submit], async_slot.slot.fence) }.is_err() {
             return None;
         }
-        Some(async_slot.semaphore)
+        Some(semaphore)
+    }
+
+    pub fn retire_present_images(&mut self, images: &[vk::Image]) {
+        self.present_semaphores.retire(images);
     }
 
     /// # Safety
@@ -1236,10 +1225,11 @@ impl GpuCompose {
     pub unsafe fn destroy(&self, device: &ash::Device) {
         // SAFETY: forwarded from this function's own contract.
         unsafe {
+            self.present_semaphores.destroy(device);
             self.sync.destroy(device);
             for async_slot in &self.async_slots {
                 async_slot.slot.destroy(device);
-                device.destroy_semaphore(async_slot.semaphore, None);
+
             }
             device.destroy_command_pool(self.pool, None);
             device.destroy_descriptor_pool(self.descriptor_pool, None);

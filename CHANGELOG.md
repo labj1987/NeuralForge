@@ -7,6 +7,11 @@
 - Isolate process ownership and add explicit game targeting; preserve upstream installs.
 - Add safe installation/removal and identity-checked legacy manifest archival.
 - Keep the host-transport GTA baseline; document benchmarks before later optimizations.
+- Validate the host-SHM/full-model path at 2560x1440 on the RTX 5070: swapchain
+  transfer usage is admitted only after capability checks, private device resources
+  are released before device destruction, and present semaphores are image-scoped.
+  The longer Vulkan and synchronization-validation smoke runs completed without
+  validation errors. This is a correctness gate, not a GTA performance claim.
 
 ## Historical releases before the NeuralForge rename
 

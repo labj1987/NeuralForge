@@ -79,6 +79,7 @@ pub struct NeuralForgeDeviceInfo {
     /// which never happens for an implicit layer) -- capture is simply skipped
     /// (present passes through unmodified) whenever it is, rather than panicking.
     instance: Option<Arc<ash::Instance>>,
+    surface_caps: Option<vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>,
     physical_device: vk::PhysicalDevice,
     next_create_swapchain_khr: Option<vk::PFN_vkCreateSwapchainKHR>,
     next_destroy_swapchain_khr: Option<vk::PFN_vkDestroySwapchainKHR>,
@@ -86,7 +87,7 @@ pub struct NeuralForgeDeviceInfo {
     next_get_swapchain_images_khr: Option<vk::PFN_vkGetSwapchainImagesKHR>,
     next_get_device_queue: Option<vk::PFN_vkGetDeviceQueue>,
     next_get_device_queue2: Option<vk::PFN_vkGetDeviceQueue2>,
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
 }
 
 #[derive(Default)]
@@ -120,9 +121,43 @@ struct State {
     hotkey: crate::hotkey::Poller,
 }
 
+type CleanupState = (Arc<ash::Device>, Arc<Mutex<State>>);
+static CLEANUP: once_cell::sync::Lazy<Mutex<HashMap<vk::Device, CleanupState>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Called only from vkDestroyDevice, before downstream device destruction.
+/// Vulkan requires the caller to externally synchronize this device AND all its
+/// queues here. That host-side contract makes a teardown-only device wait valid;
+/// this is deliberately not done in a swapchain resize or per-frame hook.
+/// # Safety
+/// The caller must meet vkDestroyDevice's external synchronization requirements.
+pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
+    let owned = CLEANUP.lock().unwrap().remove(&handle);
+    if let Some((device, state)) = owned {
+        let mut state = state.lock().unwrap();
+        if state.capture.is_some() || state.gpu_compose.is_some() {
+            match unsafe { device.device_wait_idle() } {
+                Ok(()) | Err(vk::Result::ERROR_DEVICE_LOST) => {
+                    unsafe { capture::destroy(state.capture.take(), &device); }
+                    if let Some(compose) = state.gpu_compose.take() {
+                        unsafe { compose.destroy(&device); }
+                    }
+                }
+                Err(error) => crate::log!("[layer] teardown wait failed: {:?}; cannot safely free pending resources", error),
+            }
+        }
+        state.swapchains.clear();
+        let mut primary = PRIMARY.lock().unwrap();
+        if primary.as_ref().is_some_and(|p| p.device == handle) { *primary = None; }
+        crate::log!("[layer] private device teardown complete {:?}", handle);
+        crate::logging::flush();
+    }
+}
+
 impl NeuralForgeDeviceInfo {
     pub fn new(
         instance: Option<Arc<ash::Instance>>,
+        surface_caps: Option<vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>,
         physical_device: vk::PhysicalDevice,
         device: Arc<ash::Device>,
         next_get_device_proc_addr: vk::PFN_vkGetDeviceProcAddr,
@@ -170,11 +205,14 @@ impl NeuralForgeDeviceInfo {
         // line after this one, including real per-frame activity, purely because
         // nothing forced a flush past this first, coincidentally-flushed call).
         crate::logging::flush();
+        let state = Arc::new(Mutex::new(State::default()));
+        CLEANUP.lock().unwrap().insert(handle, (device.clone(), state.clone()));
         Self {
             // SAFETY: create_info is the loader chain for this newly created device.
             _loader_data: unsafe { crate::loader_data::register(handle, create_info) },
             device,
             instance,
+            surface_caps,
             physical_device,
             next_create_swapchain_khr: create,
             next_destroy_swapchain_khr: destroy,
@@ -182,7 +220,7 @@ impl NeuralForgeDeviceInfo {
             next_get_swapchain_images_khr: get_images,
             next_get_device_queue: get_queue,
             next_get_device_queue2: get_queue2,
-            state: Mutex::default(),
+            state,
         }
     }
 
@@ -240,23 +278,25 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         let Some(next_create) = self.next_create_swapchain_khr else {
             return LayerResult::Unhandled;
         };
+        let eligible = crate::layer_enabled() && crate::ownership::eligible()
+            && swapchain::is_supported_format(create_info.image_format)
+            && create_info.image_extent.width <= neuralforge_protocol::MAX_W
+            && create_info.image_extent.height <= neuralforge_protocol::MAX_H
+            && swapchain::is_plausible_game_size(create_info.image_extent.width, create_info.image_extent.height);
+        let adjusted = if eligible {
+            self.instance.as_deref().and_then(|instance|
+                self.surface_caps.and_then(|query| crate::surface_usage::prepare(instance, query, self.physical_device, create_info)))
+        } else { None };
+        let pass_through = adjusted.is_none();
         let mut swapchain = vk::SwapchainKHR::null();
         let alloc_ptr = allocator.map_or(std::ptr::null(), std::ptr::from_ref);
-        // SAFETY: `create_info`/`allocator` are valid for the duration of this call
-        // (handed to us by the loader for exactly this call, per the Vulkan spec);
-        // `next_create` was resolved from the next layer/driver's own proc-addr table
-        // in `new()` above.
-        let result = unsafe { next_create(self.device.handle(), create_info, alloc_ptr, &mut swapchain) };
+        // SAFETY: only image_usage changes in a private copy with verified support.
+        // Forward exactly once: failed creation also retires oldSwapchain.
+        let result = unsafe { next_create(self.device.handle(), adjusted.as_ref().unwrap_or(create_info), alloc_ptr, &mut swapchain) };
         if result != vk::Result::SUCCESS {
             return LayerResult::Handled(Err(result));
         }
-
         let hdr_kind = swapchain::detect_hdr_kind(create_info.image_format, create_info.image_color_space);
-        let pass_through = !crate::ownership::eligible()
-            || !swapchain::is_supported_format(create_info.image_format)
-            || create_info.image_extent.width > neuralforge_protocol::MAX_W
-            || create_info.image_extent.height > neuralforge_protocol::MAX_H
-            || !swapchain::is_plausible_game_size(create_info.image_extent.width, create_info.image_extent.height);
         let images = if pass_through { Vec::new() } else { self.fetch_swapchain_images(swapchain) };
         let state = SwapchainState {
             format: create_info.image_format,
@@ -322,7 +362,12 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             return LayerResult::Unhandled;
         };
         release_primary(self.device.handle(), swapchain);
-        self.state.lock().unwrap().swapchains.remove(&swapchain);
+        {
+            let mut state = self.state.lock().unwrap();
+            if let Some(old) = state.swapchains.remove(&swapchain) {
+                if let Some(gpu) = &mut state.gpu_compose { gpu.retire_present_images(&old.images); }
+            }
+        }
         let alloc_ptr = allocator.map_or(std::ptr::null(), std::ptr::from_ref);
         // SAFETY: same contract as `create_swapchain_khr` above.
         unsafe { next_destroy(self.device.handle(), swapchain, alloc_ptr) };

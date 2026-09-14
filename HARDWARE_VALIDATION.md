@@ -54,30 +54,37 @@ After this fix, the same NVIDIA `vkcube` test exits 0. Process maps confirm it l
 only `libneuralforge_layer.so`, not upstream's `libVkLayer_NV_dlssnr.so`.
 This confirms the abort is resolved; it does **not** establish valid end-to-end rendering.
 
-## Remaining measured blockers
+## Correctness follow-up
 
-The validation log reports:
+The follow-up fixes make capture opt in only when the surface explicitly supports
+both transfer-source and transfer-destination image usage. The layer queries the
+next instance dispatch chain, never retries creation, and forwards the original
+creation unchanged when a surface has an extended or unsupported configuration.
+This matters because a failed replacement creation can retire an application's old
+swapchain.
 
-- `VUID-VkImageMemoryBarrier-oldLayout-01212`: capture transitions an image to/from
-  TRANSFER_SRC_OPTIMAL although the swapchain was created with COLOR_ATTACHMENT only.
-- `VUID-vkCmdCopyImageToBuffer-srcImage-00186`: the same image lacks TRANSFER_SRC usage.
-- `VUID-vkDestroyDevice-device-05137`: NeuralForge capture command buffer, buffer,
-  memory, fence and pool remain alive at device destruction.
-- Additional `vkGetDeviceProcAddr` warnings from querying instance-level functions.
+The layer now frees private capture and composition resources immediately before
+the framework forwards `vkDestroyDevice`. This is the one teardown point where
+Vulkan requires the application to externally synchronize the device and queues;
+no per-frame or resize wait was added. Presentation semaphores are now assigned to
+the acquired swapchain image rather than a rotating command-buffer slot. Retired
+swapchain semaphores remain alive until device teardown. This follows Khronos's
+[swapchain semaphore reuse guidance](https://docs.vulkan.org/guide/latest/swapchain_semaphore_reuse.html).
 
-The helper initialized NGX successfully but reported model_up=0 and helper_frames=0
-through this short test. There is no measured Feature 18 throughput or GTA result.
-Elapsed smoke-test time must not be interpreted as game FPS or a performance win.
+On `lordnikon`, a 1,800-frame 2560x1440 Wayland `vkcube` run with NeuralForge,
+the full model, host SHM, and `NEURALFORGE_DMABUF=0` exited normally in 19.6 seconds.
+Khronos validation reported zero errors. The helper reported `model_up=1` and had
+processed 192 frames at the time of the status capture. A separate 900-frame run
+with synchronization validation enabled also exited normally with zero validation
+errors and zero synchronization hazards. Both runs loaded only
+`libneuralforge_layer.so`; upstream's NR layer was absent. The upstream config and
+both installed upstream layer manifests still match their initial SHA-256 hashes.
 
-Keep the PR in draft until the Vulkan correctness issues are addressed. First review
-supported surface usage and the swapchain interception path, including unsupported
-surfaces and creation failure. Then design cleanup at a point where GPU completion
-and object lifetime are proven; the pinned layer framework destroys the downstream
-device before dropping custom device state, so an ordinary Rust Drop implementation
-alone is too late. Do not reintroduce the historical fence changes or assume a wait
-in a teardown hook is automatically synchronized with the app's other queues.
+Eleven non-fatal validation warnings remain from the pinned layer framework asking
+`vkGetDeviceProcAddr` for instance-level commands. They do not come from the capture
+path and are not yet resolved. There is still no measured GTA result or Feature 18
+throughput claim. Smoke-test elapsed time is not game FPS or a performance result.
 
-After those correctness gates pass, exercise a longer full-model smoke run at the
-GTA baseline size, prove launcher exclusion and stable ownership, and only then run
-the matched GTA benchmark in PHASE1.md. The user's helper and model-resolution
-constraints remain in force. DMA-BUF and later optimization features remain unimplemented.
+Keep the PR in draft until the review accepts these changes and the matched GTA
+benchmark in PHASE1.md has been run. The user's helper, model-resolution and
+DMA-BUF constraints remain in force; later optimization features are unimplemented.
