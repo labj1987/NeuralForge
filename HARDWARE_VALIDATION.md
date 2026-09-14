@@ -105,6 +105,12 @@ layer retained the original swapchain and did no capture, resize, or helper work
 The upstream installation and configuration remain unchanged. A matched NeuralForge
 benchmark is blocked until a legal GTA capture path is designed and validated.
 
+A passive transfer probe subsequently found GTA's legal pre-present route: the game
+blits `TRANSFER_SRC_OPTIMAL` render images into the `TRANSFER_DST_OPTIMAL` swapchain
+images. The layer merely recorded those commands and forwarded them unchanged. The
+candidate render-tap design is recorded in `RENDER_TAP_DESIGN.md`; it has not been
+enabled for rendering or benchmarked.
+
 The ownership filter was exercised with two temporary names for the same `vkcube`
 binary. A process launched as `explorer.exe` was excluded, created only pass-through
 swapchains, and left `helper_frames` unchanged. A process launched as
