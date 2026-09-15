@@ -441,3 +441,28 @@ already exists for exactly this class of problem ("whenever this binary's stdout
 stderr isn't a real terminal... Proton/Steam has redirected it") -- use it for any
 future Wine-side diagnostic tool from the start, don't lose time to a silent process
 assuming `println!` is good enough first.
+
+## 2026-09-15 (later still) -- Phase 4 reverse direction: also blocked, different
+## reason, confirmed without Wine in the loop at all
+
+Same session, immediate follow-up. `crates/layer/examples/dmabuf_export_probe.rs`
+(native Linux) allocated a real `VK_EXT_external_memory_dma_buf` buffer, got a real fd
+via `vkGetMemoryFdKHR`, and held it open. `crates/helper/examples/dmabuf_import_probe.rs`
+(Windows, run under the same Proton-CachyOS/prefix setup as the forward-direction
+probe) took that pid+fd and called `CreateFileW` on `Z:\proc\<pid>\fd\<fd>`.
+
+Result: `CreateFileW` failed outright. Root-caused below Wine entirely -- with the
+exporter's fd confirmed still open (`ls -la /proc/<pid>/fd/<fd>` showed a live entry),
+a direct, non-Wine `cat`/Python `os.open()` on that exact path also failed, with
+`ENXIO`. `readlink` on the fd entry showed `/dmabuf:`: dma-buf fds are anon-inode-backed
+or the same reason `epoll`/`eventfd` fds are, and Linux does not support re-opening an
+anon-inode fd via `/proc/<pid>/fd/<N>` from any process -- only `dup()` or `SCM_RIGHTS`
+fd-passing over a Unix socket can hand one to another process. Confirmed this is not a
+Wine quirk (Wine's own `Z:\` -> `/` mapping is real and otherwise works, per
+`dosdevices/z: -> /`) before concluding anything about the driver or Vulkan layer at
+all -- same "isolate the failure below the layer you suspect first" discipline as the
+stale-git-clone lesson above. See `DMABUF_TRANSPORT_DESIGN.md` for the full writeup and
+what a working transport would actually need (`SCM_RIGHTS`, not `/proc/pid/fd`).
+
+Test processes/prefix wineserver cleaned up afterward; no leftover state on
+`lordnikon`.

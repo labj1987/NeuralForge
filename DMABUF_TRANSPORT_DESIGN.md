@@ -104,57 +104,94 @@ no real Linux `dma_buf` fd behind this handle at all, on this driver, for this h
 type -- not something any amount of Wine-side fd-juggling can extract, because it was
 never created that way.
 
-## Not yet tried
+## The reverse direction (tried, also a dead end -- different reason)
 
-- **The reverse direction**: have the *layer* (full, native `VK_EXT_external_memory_dma_buf`
-  access) create a real dma-buf fd, get it into the helper process's own fd table
-  (plausible mechanism: the helper opening `Z:\proc\<layer_pid>\fd\<layer_fd>` via
-  `CreateFileW` -- Wine already transparently maps Unix paths under `Z:\`, the same
-  translation `crates/helper/src/shm.rs::windows_path` already relies on for the SHM
-  file itself), then `wine_server_fd_to_handle` to wrap *that* fd as a win32 handle,
-  and see whether `vkImportMemoryWin32HandleKHR` accepts it. Judged low-probability
-  before spending the time: Vulkan's win32 import path expects a handle in the
-  *exporting driver's own private format* (the same asymmetry problem this whole
-  document is about, just approached from the other side) -- a generic wineserver
-  file handle wrapping an arbitrary fd is unlikely to satisfy that, even if
-  `wine_server_fd_to_handle` itself succeeds where `wine_server_handle_to_fd` didn't.
-  Worth a real 30-minute experiment before ruling out entirely, but not attempted this
-  session given the first result already strongly suggests the underlying resource
-  type mismatch, not just a directionality problem.
+The obvious next experiment: have the *layer* (full, native
+`VK_EXT_external_memory_dma_buf` access) create a real dma-buf fd, get it into the
+helper process's own fd table by having the helper open
+`Z:\proc\<layer_pid>\fd\<layer_fd>` via `CreateFileW` (Wine already transparently maps
+Unix paths under `Z:\`, the same translation `crates/helper/src/shm.rs::windows_path`
+already relies on for the SHM file itself), then see whether the resulting handle is
+usable at all.
+
+`crates/layer/examples/dmabuf_export_probe.rs` (native Linux) allocates a real
+`VK_EXT_external_memory_dma_buf`-exported buffer, gets a real fd via
+`vkGetMemoryFdKHR`, prints its own pid and that fd, and holds both open for 90 seconds.
+`crates/helper/examples/dmabuf_import_probe.rs` (Windows, run under Wine) takes that
+pid+fd as CLI arguments and calls `CreateFileW` on `Z:\proc\<pid>\fd\<fd>`.
+
+**Result on real hardware** (`lordnikon`, RTX 5070, driver 615.71.09, Proton-CachyOS):
+`CreateFileW` itself failed. Traced the root cause down to the plain POSIX level,
+*before* Wine is involved at all -- with the exporter process alive and its fd
+confirmed open (`ls -la /proc/<pid>/fd/<fd>` showed a real, present entry), a direct,
+non-Wine `cat /proc/<pid>/fd/<fd>` and a Python `os.open(...)` on the exact same path
+both failed with `ENXIO` ("No such device or address"). `readlink` on that fd entry
+shows `/dmabuf:` -- a dma-buf fd is backed by an `anon_inode` (like `epoll`/`eventfd`
+fds), and the kernel does not implement `open()` on `/proc/<pid>/fd/<N>` for
+anon-inode-backed files; only `dup()`-family syscalls (or fd-passing over a Unix
+socket via `SCM_RIGHTS`) can hand another process a working reference to one. Wine's
+own `Z:\proc\...` path mapping is real and otherwise works fine (confirmed via
+`dosdevices/z: -> /`) -- it's simply asking the kernel to do something no `open()`
+call, from any process, Wine-hosted or not, can do for this class of fd.
+
+This makes the reverse direction's blocker a *different, more fundamental* one than
+the forward direction's: the forward direction failed because of what the win32 handle
+*was* (an NVIDIA-private token, not backed by a real `dma_buf` at all, per
+`wine_server_handle_to_fd`'s `STATUS_OBJECT_TYPE_MISMATCH`). The reverse direction
+fails because `/proc/pid/fd` re-opening -- the specific mechanism this document, and
+the protocol header's reserved `proxy_pid`/`proxy_fd` fields, assumed would work for
+*any* fd type -- cannot carry an anon-inode fd across a process boundary at all,
+independent of Wine or NVIDIA specifics. A real dma-buf fd would need to cross via
+`SCM_RIGHTS` over a Unix domain socket (the actual standard mechanism for this), which
+means at minimum a wineserver-mediated Unix socket the helper can receive on --
+something this project's current SHM-only IPC does not have, and a materially bigger
+undertaking than the "just add a CreateFileW call" version tried here.
+
 - Asking NVIDIA driver internals more directly (`nvidia-settings`/proc/sysfs, or the
   proprietary driver's own debug/query interfaces) whether `OPAQUE_WIN32` memory under
   Wine is ever `dma_buf`-backed on this driver version -- no obvious entry point found
   in a quick look; would need real NVIDIA documentation or source this project doesn't
-  have access to.
+  have access to. Moot for the reverse direction regardless, now that the fd-transfer
+  mechanism itself is confirmed broken independent of what backs the memory.
 
 ## What this means for the project
 
 Phase 4, as specified (share GPU memory via `dma_buf` between the native Linux layer
-and *this* Wine-hosted Windows helper), is blocked by a real driver/Wine architecture
-constraint this session found concrete, reproducible evidence for -- not a gap in this
-project's own code that more engineering effort closes. The header's already-reserved
-`proxy_pid`/`proxy_fd`/etc. fields describe a mechanism (publish an owning pid+fd,
-importer opens `/proc/<pid>/fd/<fd>`) that would work fine *if* a real, importable fd
-existed on the helper side to publish -- the missing piece is producing that fd at
-all, which this session's evidence says the current architecture cannot do for
-NVIDIA's `OPAQUE_WIN32` handles.
+and *this* Wine-hosted Windows helper), is blocked by two independent, real,
+confirmed-on-hardware constraints, not a gap in this project's own code that more
+engineering effort closes:
+
+1. The forward direction (Wine handle -> Linux fd): NVIDIA's `OPAQUE_WIN32` external
+   memory under Wine is very likely not `dma_buf`-backed at all on this driver.
+2. The reverse direction (Linux fd -> Wine handle via `/proc/pid/fd`): dma-buf fds are
+   anon-inode-backed and cannot be re-opened via `/proc/<pid>/fd/<N>` by *any* process,
+   Wine-hosted or not -- this is a plain Linux kernel limitation, confirmed without
+   Wine in the loop at all.
+
+The header's already-reserved `proxy_pid`/`proxy_fd`/etc. fields describe a mechanism
+that this session's evidence says cannot work as designed for a real dma-buf fd,
+regardless of which side initiates it. A working design would need real `SCM_RIGHTS`
+fd-passing over a Unix domain socket instead -- a materially different and bigger
+transport than anything this project's IPC currently has.
 
 This doesn't necessarily mean DMA-BUF is permanently out of reach for this project --
 `ATTRIBUTION.md`/earlier design docs already note a **future native Linux NGX helper**
 (no Wine at all) as this project's own longer-term architecture goal, and *that*
-helper would have full, native `VK_EXT_external_memory_dma_buf` access with none of
-this asymmetry, making Phase 4 straightforward the same way Phase 3 was. Under the
-*current*, Wine-hosted interim helper, though, this needs either the untried reverse
-direction above to actually pan out (genuinely uncertain), or a different transport
-idea entirely.
+helper would have full, native `VK_EXT_external_memory_dma_buf` access with no
+cross-process fd-transfer problem at all (same process, or at worst a same-OS
+`SCM_RIGHTS` handoff with no Wine/NVIDIA-win32-handle asymmetry layered on top),
+making Phase 4 straightforward the same way Phase 3 was. Under the *current*,
+Wine-hosted interim helper, DMA-BUF now has no untried variant left that this
+session's own reasoning judged worth pursuing further.
 
-**Recommendation, not yet acted on pending Alex's own call**: leave Phase 4 blocked
-here rather than spend further session time on low-probability variants of the same
-Wine-fd-bridging idea. Phase 3's host-memory path (`EXTERNAL_MEMORY_HOST_DESIGN.md`)
-already removed the CPU-copy overhead this phase would have further reduced by
-avoiding a virtual-memory round trip; what DMA-BUF would additionally save is real,
-but its actual size relative to the *model's own eval time* is unknown until the GTA
-fps gate itself is measured (Phase 1's still-open benchmark, Phase 5's own gate).
-Worth reassessing DMA-BUF specifically once that real measurement exists and shows
-transport cost, rather than model eval time or something else entirely, is still the
-dominant cost left to cut.
+**Recommendation**: leave Phase 4 blocked here. Both directions this document
+considered are now empirically closed, not merely judged unlikely. Phase 3's
+host-memory path (`EXTERNAL_MEMORY_HOST_DESIGN.md`) already removed the CPU-copy
+overhead this phase would have further reduced by avoiding a virtual-memory round
+trip; what DMA-BUF would have additionally saved is real, but its actual size relative
+to the *model's own eval time* is unknown until the GTA fps gate itself is measured
+(Phase 1's still-open benchmark, Phase 5's own gate). If that measurement later shows
+transport cost is still the dominant remaining cost, the real next step is either an
+`SCM_RIGHTS`-based transport (a genuinely new IPC mechanism, not a variant of what was
+tried here) or the native Linux NGX helper noted above -- not another Wine-fd-bridging
+attempt.

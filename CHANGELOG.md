@@ -152,6 +152,16 @@
   real Wine/NVIDIA-driver constraint, not a gap in this project's own code. No
   production code changed; `crates/helper/examples/dmabuf_probe.rs` (the diagnostic
   that found this) is kept for whatever's tried next.
+- Investigated the reverse direction too (layer exports a dma-buf fd, helper opens it
+  via `Z:\proc\<pid>\fd\<fd>`): also blocked, but for a different, more fundamental
+  reason confirmed independent of Wine -- dma-buf fds are anon-inode-backed and Linux
+  does not support re-opening one via `/proc/<pid>/fd/<N>` from any process (`ENXIO`),
+  confirmed with a plain, non-Wine `cat`/`os.open()` before Wine was ever blamed. Both
+  directions this document considered are now empirically closed, not just judged
+  unlikely; a working transport would need real `SCM_RIGHTS` fd-passing over a Unix
+  socket instead. No production code changed; `crates/layer/examples/dmabuf_export_probe.rs`
+  and `crates/helper/examples/dmabuf_import_probe.rs` (the diagnostics that found this)
+  are kept alongside `dmabuf_probe.rs`.
 
 ## Historical releases before the NeuralForge rename
 
