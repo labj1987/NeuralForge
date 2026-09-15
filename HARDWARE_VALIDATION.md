@@ -125,6 +125,11 @@ the earlier upstream interval because the GTA scene and GPU workload were not he
 constant. It does demonstrate that the current fully synchronous host transport is
 the next performance bottleneck to instrument and pipeline.
 
+A second, steady-state 61.379-second interval advanced 474 layer frames (7.72 layer
+frames per second), with 35.6% average GPU utilization, 5,210 MiB VRAM, 76.9 W mean
+power, and 53 C maximum temperature. The repeat confirms the synchronous pipeline
+limit is reproducible rather than startup warm-up behavior.
+
 The ownership filter was exercised with two temporary names for the same `vkcube`
 binary. A process launched as `explorer.exe` was excluded, created only pass-through
 swapchains, and left `helper_frames` unchanged. A process launched as
