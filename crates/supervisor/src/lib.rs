@@ -9,6 +9,7 @@ pub mod install_dir;
 pub mod paths;
 pub mod profiles;
 mod process;
+pub mod runners;
 
 pub use config::Config;
 

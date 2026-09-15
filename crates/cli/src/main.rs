@@ -5,7 +5,6 @@
 //! through `neuralforge_protocol` instead of duplicating it in shell.
 
 mod gpu;
-mod runners;
 mod shmctl;
 
 use std::process::ExitCode;
@@ -141,10 +140,10 @@ fn cmd_profile(args: &[String]) -> ExitCode {
 
 fn default_config() -> Config {
     let mut cfg = Config::default();
-    if let Some(proton) = runners::best_proton() {
+    if let Some(proton) = neuralforge_supervisor::runners::best_proton() {
         cfg.runner_type = "proton".to_string();
         cfg.runner_path = proton.path.to_string_lossy().into_owned();
-    } else if let Some(wine) = runners::find_wine() {
+    } else if let Some(wine) = neuralforge_supervisor::runners::find_wine() {
         cfg.runner_type = "wine".to_string();
         cfg.runner_path = wine.to_string_lossy().into_owned();
     } else {
@@ -199,9 +198,9 @@ fn cmd_config() -> ExitCode {
 }
 
 fn cmd_runners() -> ExitCode {
-    let found = runners::discover_proton();
+    let found = neuralforge_supervisor::runners::discover_proton();
     if found.is_empty() {
-        if let Some(wine) = runners::find_wine() {
+        if let Some(wine) = neuralforge_supervisor::runners::find_wine() {
             println!("wine\t{}", wine.display());
             return ExitCode::SUCCESS;
         }
@@ -261,9 +260,9 @@ fn cmd_doctor() -> ExitCode {
 
     let (runner_type, runner_path) = if !cfg.runner_path.is_empty() {
         (cfg.runner_type.clone(), cfg.runner_path.clone())
-    } else if let Some(proton) = runners::best_proton() {
+    } else if let Some(proton) = neuralforge_supervisor::runners::best_proton() {
         ("proton".to_string(), proton.path.display().to_string())
-    } else if let Some(wine) = runners::find_wine() {
+    } else if let Some(wine) = neuralforge_supervisor::runners::find_wine() {
         ("wine".to_string(), wine.display().to_string())
     } else {
         ("none".to_string(), String::new())
