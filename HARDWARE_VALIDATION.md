@@ -142,3 +142,49 @@ the upstream install.
 Keep the PR in draft until the review accepts these changes and the matched GTA
 benchmark in PHASE1.md has been run. The user's helper, model-resolution and
 DMA-BUF constraints remain in force; later optimization features are unimplemented.
+
+## 2026-09-15 — eleven validation warnings: not reproduced; root cause identified
+
+Repository renamed to `labj1987/NeuralForge` on GitHub; local checkout's remote and
+directory were updated to match, confirmed against the renamed repository. The Phase 1
+PR above is merged.
+
+Attempted to reproduce and fix the eleven non-fatal validation warnings from Phase 1
+item 4 before continuing. A freshly built `libneuralforge_layer.so` was deployed
+alongside the already-installed one (`~/nf-validate` via `VK_ADD_LAYER_PATH`, not
+`VK_LAYER_PATH` -- the latter replaces rather than extends the default search path
+and hides the system's own `VK_LAYER_KHRONOS_validation` manifest, which is why an
+earlier attempt in this same session saw zero output and turned out not to have
+validation loaded at all). With `VK_LAYER_KHRONOS_validation:VK_LAYER_neuralforge_neural`
+confirmed active (`VK_LOADER_DEBUG=layer`), a 1280x720 Wayland `vkcube` run against the
+currently-installed NeuralForge build produced **zero validation warnings or errors**,
+with and without `VK_VALIDATION_FEATURE_ENABLE_BEST_PRACTICES_EXT`, and `VK_LOADER_DEBUG=all`
+showed nothing related to `vkGetDeviceProcAddr` beyond expected platform-surface-name
+misses (Win32/Android/iOS/etc., irrelevant on this platform).
+
+The likely source, found by reading the pinned `vulkan-layer` framework
+(`google/vk-layer-for-rust` at `102d87cd`, `vulkan-layer/src/lib.rs` around its
+`create_device` trampoline): it builds this layer's device dispatch table via
+`ash::Device::load`, called with the *instance's* `get_instance_proc_addr` slot
+replaced by `vkGetDeviceProcAddr` -- a deliberate trick to resolve the whole
+`ash::Device` function table generically. The framework's own comment acknowledges
+this can make the loader "complain about internal vkGetDeviceProcAddr called for
+<function name>" for instance-level commands and calls it benign. This project's own
+code (`crates/layer/src/device.rs`) only resolves six clearly device-level commands
+itself and is not the source.
+
+This was not reproduced live today, so it is not fixed. Either the specific
+validation-layer version here (`1.4.341`) does not flag this pattern, or it only
+surfaces under conditions this `vkcube` run did not match (GTA's actual Xwayland
+surface path through Proton/winevulkan, rather than native Wayland). Re-verify against
+a real GTA session, or against `vkcube` run through Xwayland specifically, before
+concluding this needs a fork of the pinned framework -- patching a third-party git
+dependency is a real undertaking and should not be started on an unreproduced report.
+
+Also added `scripts/bench.sh` for Phase 1 item 1 (the repeatable native/upstream/
+neuralforge benchmark script). It restarts Steam under each mode's environment (an
+already-running Steam client does not pick up a new shell's exported vars -- confirmed
+the hard way in the 2026-09-14 session above), waits for `GTA5_Enhanced.exe`, and then
+**stops and waits for a human to confirm the saved route/scene has been reached**
+before starting the timed sample -- it cannot drive the car itself. The matched 3x
+benchmark this phase's exit gate requires has still not been run.
