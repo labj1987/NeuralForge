@@ -535,6 +535,34 @@ impl ShmHeader {
         self.magic.load(Ordering::Relaxed) == SHM_MAGIC && self.version.load(Ordering::Relaxed) == SHM_VERSION
     }
 
+    /// v3's two request/response slots (`PROTOCOL_V3_DESIGN.md`) share every field
+    /// name and type; these are the one place that picks slot 0's or slot 1's field
+    /// by an actual `usize` index, so the layer and the helper -- both of which poll
+    /// both slots -- never have to hand-write their own `if slot == 0 { .. } else { .. }`
+    /// per field. `slot` is always 0 or 1 in this workspace; anything else is treated
+    /// as 1 rather than panicking (`debug_assert!` catches a real bug in a debug
+    /// build without turning a wrong index into a production abort).
+    pub fn seq_req_slot(&self, slot: usize) -> &AtomicU32 {
+        debug_assert!(slot < 2, "protocol v3 has exactly two slots");
+        if slot == 0 { &self.seq_req } else { &self.seq_req_b }
+    }
+    pub fn seq_resp_slot(&self, slot: usize) -> &AtomicU32 {
+        debug_assert!(slot < 2, "protocol v3 has exactly two slots");
+        if slot == 0 { &self.seq_resp } else { &self.seq_resp_b }
+    }
+    pub fn width_slot(&self, slot: usize) -> &AtomicU32 {
+        debug_assert!(slot < 2, "protocol v3 has exactly two slots");
+        if slot == 0 { &self.width } else { &self.width_b }
+    }
+    pub fn height_slot(&self, slot: usize) -> &AtomicU32 {
+        debug_assert!(slot < 2, "protocol v3 has exactly two slots");
+        if slot == 0 { &self.height } else { &self.height_b }
+    }
+    pub fn proxy_format_slot(&self, slot: usize) -> &AtomicU32 {
+        debug_assert!(slot < 2, "protocol v3 has exactly two slots");
+        if slot == 0 { &self.proxy_format } else { &self.proxy_format_b }
+    }
+
     /// Every setting a user can change from the GUI, as `("name", current bits)`
     /// pairs -- what [`crate::persist::snapshot`]/[`crate::persist::apply`] round-trip
     /// through `config.ini` so tuning survives a reboot (the SHM mapping itself lives
@@ -796,6 +824,30 @@ mod tests {
         assert_eq!(h.magic.load(Ordering::Relaxed), 0);
         assert_eq!(h.enabled.load(Ordering::Relaxed), 0);
         assert_eq!(h.helper_reason(), "");
+    }
+
+    #[test]
+    fn slot_accessors_pick_the_matching_field() {
+        let h = ShmHeader::default();
+        h.seq_req_slot(0).store(11, Ordering::Relaxed);
+        h.seq_req_slot(1).store(22, Ordering::Relaxed);
+        assert_eq!(h.seq_req.load(Ordering::Relaxed), 11);
+        assert_eq!(h.seq_req_b.load(Ordering::Relaxed), 22);
+        assert_eq!(h.seq_req_slot(0).load(Ordering::Relaxed), 11);
+        assert_eq!(h.seq_req_slot(1).load(Ordering::Relaxed), 22);
+
+        h.width_slot(0).store(2560, Ordering::Relaxed);
+        h.height_slot(0).store(1440, Ordering::Relaxed);
+        h.width_slot(1).store(1920, Ordering::Relaxed);
+        h.height_slot(1).store(1080, Ordering::Relaxed);
+        assert_eq!(h.width.load(Ordering::Relaxed), 2560);
+        assert_eq!(h.height.load(Ordering::Relaxed), 1440);
+        assert_eq!(h.width_b.load(Ordering::Relaxed), 1920);
+        assert_eq!(h.height_b.load(Ordering::Relaxed), 1080);
+
+        h.proxy_format_slot(1).store(crate::enums::proxy_format::BGRA8, Ordering::Relaxed);
+        assert_eq!(h.proxy_format_b.load(Ordering::Relaxed), crate::enums::proxy_format::BGRA8);
+        assert_eq!(h.proxy_format.load(Ordering::Relaxed), 0, "slot 0 must be untouched by a slot-1 write");
     }
 
     #[test]

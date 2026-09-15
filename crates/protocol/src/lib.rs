@@ -111,9 +111,30 @@ pub const fn proxy_b_offset() -> usize { HEADER_BYTES + MAX_FRAME * 3 }
 /// Byte offset of slot 1's answer region.
 pub const fn answer_b_offset() -> usize { HEADER_BYTES + MAX_FRAME * 4 }
 
+/// `proxy_offset()`/`proxy_b_offset()` picked by an actual slot index, the same
+/// `slot: usize` the layer and helper already use for `ShmHeader::seq_req_slot` and
+/// friends -- one place to keep in sync instead of a `match` at every call site.
+pub const fn proxy_offset_slot(slot: usize) -> usize {
+    if slot == 0 { proxy_offset() } else { proxy_b_offset() }
+}
+
+/// `answer_offset()`/`answer_b_offset()` picked by slot index. See
+/// [`proxy_offset_slot`].
+pub const fn answer_offset_slot(slot: usize) -> usize {
+    if slot == 0 { answer_offset() } else { answer_b_offset() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offset_slot_helpers_match_the_named_functions() {
+        assert_eq!(proxy_offset_slot(0), proxy_offset());
+        assert_eq!(proxy_offset_slot(1), proxy_b_offset());
+        assert_eq!(answer_offset_slot(0), answer_offset());
+        assert_eq!(answer_offset_slot(1), answer_b_offset());
+    }
 
     #[test]
     fn every_region_is_disjoint_and_fits_the_mapping() {
