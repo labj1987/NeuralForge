@@ -56,6 +56,155 @@ impl CaptureResources {
     }
 }
 
+/// One command pool/buffer + fence + host-coherent staging buffer -- the resource
+/// bundle both [`CaptureResources`] (a single one) and [`CapturePipeline`] (two, see
+/// its own doc comment) are built from. Pulled out so there is exactly one place that
+/// builds/unwinds this specific allocation sequence, not two copies that could drift.
+struct CaptureBuffer {
+    pool: vk::CommandPool,
+    cmd: vk::CommandBuffer,
+    fence: vk::Fence,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    ptr: *mut u8,
+    capacity: vk::DeviceSize,
+}
+
+// SAFETY: same reasoning as `CaptureResources`'s own impl below -- plain Vulkan
+// handles plus a `vkMapMemory` pointer into memory this struct owns exclusively.
+unsafe impl Send for CaptureBuffer {}
+
+impl CaptureBuffer {
+    /// # Safety
+    /// Must not be called while any submitted work referencing these handles might
+    /// still be in flight -- see every caller's own safety comment for how each
+    /// upholds that.
+    unsafe fn destroy(&self, device: &ash::Device) {
+        // SAFETY: forwarded from this function's own contract.
+        unsafe {
+            device.destroy_fence(self.fence, None);
+            device.destroy_buffer(self.buffer, None);
+            device.free_memory(self.memory, None);
+            device.destroy_command_pool(self.pool, None);
+        }
+    }
+}
+
+fn build_capture_buffer(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, queue_family: u32, bytes: vk::DeviceSize) -> Option<CaptureBuffer> {
+    let pool_info =
+        vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+    // SAFETY: `device` is the live device this capture serves; `pool_info` is valid.
+    let Ok(pool) = (unsafe { device.create_command_pool(&pool_info, None) }) else { return None };
+
+    let alloc_info = vk::CommandBufferAllocateInfo::builder()
+        .command_pool(pool)
+        .level(vk::CommandBufferLevel::PRIMARY)
+        .command_buffer_count(1);
+    // SAFETY: `pool` was just created above.
+    let cmd = match unsafe { crate::loader_data::allocate_commands(device, &alloc_info) } {
+        Ok(bufs) => bufs[0],
+        Err(_) => {
+            // SAFETY: `pool` owns no other resources yet.
+            unsafe { device.destroy_command_pool(pool, None) };
+            return None;
+        }
+    };
+
+    let fence_info = vk::FenceCreateInfo::builder().flags(vk::FenceCreateFlags::SIGNALED);
+    // SAFETY: starting signaled means the first use's own wait/poll never blocks (or
+    // reports pending) on a fence nothing has submitted work against yet.
+    let fence = match unsafe { device.create_fence(&fence_info, None) } {
+        Ok(f) => f,
+        Err(_) => {
+            // SAFETY: `pool` owns no other resources yet; freeing it also frees `cmd`.
+            unsafe { device.destroy_command_pool(pool, None) };
+            return None;
+        }
+    };
+
+    let buf_info = vk::BufferCreateInfo::builder()
+        .size(bytes)
+        .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    // SAFETY: `buf_info` is valid.
+    let buffer = match unsafe { device.create_buffer(&buf_info, None) } {
+        Ok(b) => b,
+        Err(_) => {
+            // SAFETY: neither `fence` nor `pool` owns `buffer` (it doesn't exist).
+            unsafe {
+                device.destroy_fence(fence, None);
+                device.destroy_command_pool(pool, None);
+            }
+            return None;
+        }
+    };
+    // SAFETY: `buffer` was just created and is not yet bound to memory.
+    let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
+    // SAFETY: `physical_device` is the device this capture serves; `instance` is its
+    // owning instance (stored once at `vkCreateInstance`, see `crate::CURRENT_INSTANCE`).
+    let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+    let wanted = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+    // The Vulkan spec guarantees at least one memory type with both bits set, so this
+    // failing would mean a spec-non-compliant driver, not a real device limitation --
+    // still handled as a plain "skip capture" rather than assumed impossible.
+    let Some(type_index) = (0..mem_props.memory_type_count)
+        .find(|&i| (reqs.memory_type_bits & (1 << i)) != 0 && mem_props.memory_types[i as usize].property_flags.contains(wanted))
+    else {
+        // SAFETY: `buffer` has no memory bound yet; nothing else owns `fence`/`pool`.
+        unsafe {
+            device.destroy_buffer(buffer, None);
+            device.destroy_fence(fence, None);
+            device.destroy_command_pool(pool, None);
+        }
+        return None;
+    };
+
+    let alloc = vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(type_index);
+    // SAFETY: `alloc` is valid; `type_index` was just confirmed to satisfy `reqs`.
+    let memory = match unsafe { device.allocate_memory(&alloc, None) } {
+        Ok(m) => m,
+        Err(_) => {
+            // SAFETY: same reasoning as the branch above.
+            unsafe {
+                device.destroy_buffer(buffer, None);
+                device.destroy_fence(fence, None);
+                device.destroy_command_pool(pool, None);
+            }
+            return None;
+        }
+    };
+    // SAFETY: `buffer`/`memory` were each just created above, sized/typed to satisfy
+    // each other by construction.
+    if unsafe { device.bind_buffer_memory(buffer, memory, 0) }.is_err() {
+        // SAFETY: `memory` is not yet bound to anything that would make freeing it
+        // unsound; `buffer` has no memory bound.
+        unsafe {
+            device.free_memory(memory, None);
+            device.destroy_buffer(buffer, None);
+            device.destroy_fence(fence, None);
+            device.destroy_command_pool(pool, None);
+        }
+        return None;
+    }
+    // SAFETY: `memory` is `HOST_VISIBLE` by the type selection above; mapping the
+    // whole allocation is always in bounds.
+    let ptr = match unsafe { device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) } {
+        Ok(p) => p.cast::<u8>(),
+        Err(_) => {
+            // SAFETY: same reasoning as the bind-failure branch above.
+            unsafe {
+                device.free_memory(memory, None);
+                device.destroy_buffer(buffer, None);
+                device.destroy_fence(fence, None);
+                device.destroy_command_pool(pool, None);
+            }
+            return None;
+        }
+    };
+
+    Some(CaptureBuffer { pool, cmd, fence, buffer, memory, ptr, capacity: reqs.size })
+}
+
 /// Builds (or rebuilds, if the queue family changed or `bytes` grew past what's
 /// already allocated) the resources capture needs. `existing` is left `None` on any
 /// failure -- every caller treats that as "skip capture this frame, present
@@ -78,119 +227,8 @@ fn ensure(
         unsafe { r.destroy(device) };
         *existing = None;
     }
-
-    let pool_info =
-        vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-    // SAFETY: `device` is the live device this capture serves; `pool_info` is valid.
-    let Ok(pool) = (unsafe { device.create_command_pool(&pool_info, None) }) else { return false };
-
-    let alloc_info = vk::CommandBufferAllocateInfo::builder()
-        .command_pool(pool)
-        .level(vk::CommandBufferLevel::PRIMARY)
-        .command_buffer_count(1);
-    // SAFETY: `pool` was just created above.
-    let cmd = match unsafe { crate::loader_data::allocate_commands(device, &alloc_info) } {
-        Ok(bufs) => bufs[0],
-        Err(_) => {
-            // SAFETY: `pool` owns no other resources yet.
-            unsafe { device.destroy_command_pool(pool, None) };
-            return false;
-        }
-    };
-
-    let fence_info = vk::FenceCreateInfo::builder().flags(vk::FenceCreateFlags::SIGNALED);
-    // SAFETY: starting signaled means the first frame's own wait (see `run` below)
-    // never blocks on a fence nothing has submitted work against yet.
-    let fence = match unsafe { device.create_fence(&fence_info, None) } {
-        Ok(f) => f,
-        Err(_) => {
-            // SAFETY: `pool` owns no other resources yet; freeing it also frees `cmd`.
-            unsafe { device.destroy_command_pool(pool, None) };
-            return false;
-        }
-    };
-
-    let buf_info = vk::BufferCreateInfo::builder()
-        .size(bytes)
-        .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
-    // SAFETY: `buf_info` is valid.
-    let buffer = match unsafe { device.create_buffer(&buf_info, None) } {
-        Ok(b) => b,
-        Err(_) => {
-            // SAFETY: neither `fence` nor `pool` owns `buffer` (it doesn't exist).
-            unsafe {
-                device.destroy_fence(fence, None);
-                device.destroy_command_pool(pool, None);
-            }
-            return false;
-        }
-    };
-    // SAFETY: `buffer` was just created and is not yet bound to memory.
-    let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
-    // SAFETY: `physical_device` is the device this capture serves; `instance` is its
-    // owning instance (stored once at `vkCreateInstance`, see `crate::CURRENT_INSTANCE`).
-    let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-    let wanted = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-    // The Vulkan spec guarantees at least one memory type with both bits set, so this
-    // failing would mean a spec-non-compliant driver, not a real device limitation --
-    // still handled as a plain "skip capture" rather than assumed impossible.
-    let Some(type_index) = (0..mem_props.memory_type_count)
-        .find(|&i| (reqs.memory_type_bits & (1 << i)) != 0 && mem_props.memory_types[i as usize].property_flags.contains(wanted))
-    else {
-        // SAFETY: `buffer` has no memory bound yet; nothing else owns `fence`/`pool`.
-        unsafe {
-            device.destroy_buffer(buffer, None);
-            device.destroy_fence(fence, None);
-            device.destroy_command_pool(pool, None);
-        }
-        return false;
-    };
-
-    let alloc = vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(type_index);
-    // SAFETY: `alloc` is valid; `type_index` was just confirmed to satisfy `reqs`.
-    let memory = match unsafe { device.allocate_memory(&alloc, None) } {
-        Ok(m) => m,
-        Err(_) => {
-            // SAFETY: same reasoning as the branch above.
-            unsafe {
-                device.destroy_buffer(buffer, None);
-                device.destroy_fence(fence, None);
-                device.destroy_command_pool(pool, None);
-            }
-            return false;
-        }
-    };
-    // SAFETY: `buffer`/`memory` were each just created above, sized/typed to satisfy
-    // each other by construction.
-    if unsafe { device.bind_buffer_memory(buffer, memory, 0) }.is_err() {
-        // SAFETY: `memory` is not yet bound to anything that would make freeing it
-        // unsound; `buffer` has no memory bound.
-        unsafe {
-            device.free_memory(memory, None);
-            device.destroy_buffer(buffer, None);
-            device.destroy_fence(fence, None);
-            device.destroy_command_pool(pool, None);
-        }
-        return false;
-    }
-    // SAFETY: `memory` is `HOST_VISIBLE` by the type selection above; mapping the
-    // whole allocation is always in bounds.
-    let ptr = match unsafe { device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) } {
-        Ok(p) => p.cast::<u8>(),
-        Err(_) => {
-            // SAFETY: same reasoning as the bind-failure branch above.
-            unsafe {
-                device.free_memory(memory, None);
-                device.destroy_buffer(buffer, None);
-                device.destroy_fence(fence, None);
-                device.destroy_command_pool(pool, None);
-            }
-            return false;
-        }
-    };
-
-    *existing = Some(CaptureResources { queue_family, pool, cmd, fence, buffer, memory, ptr, capacity: reqs.size });
+    let Some(b) = build_capture_buffer(device, instance, physical_device, queue_family, bytes) else { return false };
+    *existing = Some(CaptureResources { queue_family, pool: b.pool, cmd: b.cmd, fence: b.fence, buffer: b.buffer, memory: b.memory, ptr: b.ptr, capacity: b.capacity });
     true
 }
 
@@ -292,6 +330,7 @@ pub unsafe fn run(
     proxy_format: u32,
     bgr_order: bool,
     resources: &mut Option<CaptureResources>,
+    pipeline: &mut Option<CapturePipeline>,
     gpu_compose: &mut Option<crate::composition::gpu::GpuCompose>,
     shm: &mut ShmClient,
     original_scratch: &mut Vec<u8>,
@@ -376,16 +415,22 @@ pub unsafe fn run(
             }
             return None;
         }
-        if !ensure(resources, device, instance, physical_device, queue_family, frame_bytes) {
-            return None;
-        }
-        let r = resources.as_ref().expect("just ensured above");
-        if capture_pristine(device, r, queue, capture_image, capture_layout, width, height, frame_bytes, original_scratch) {
-            shm.set_frame_info(width, height, proxy_format);
-            shm.write_proxy(original_scratch);
-            shm.prepare_motion(instance, physical_device, width, height, proxy_format, original_scratch);
-            if shm.begin_async_request() {
-                inflight.dims = Some((width, height, proxy_format));
+        // Same non-blocking two-slot pipeline as the enabled path below, used here
+        // too so this one-shot warm-up capture never costs a blocking fence wait
+        // either -- it just takes a call or two longer to land (irrelevant for a
+        // once-per-process bootstrap) instead of stalling the present it happens on.
+        if ensure_pipeline(pipeline, device, instance, physical_device, queue_family, frame_bytes) {
+            if let Some(p) = pipeline {
+                if poll_pipeline_capture(p, device, original_scratch).is_some() {
+                    shm.set_frame_info(width, height, proxy_format);
+                    shm.write_proxy(original_scratch);
+                    shm.prepare_motion(instance, physical_device, width, height, proxy_format, original_scratch);
+                    if shm.begin_async_request() {
+                        inflight.dims = Some((width, height, proxy_format));
+                    }
+                } else {
+                    submit_pipeline_capture(p, device, queue, capture_image, capture_layout, width, height, proxy_format);
+                }
             }
         }
         return None;
@@ -408,23 +453,34 @@ pub unsafe fn run(
         }
     }
 
-    // Capture and send a new frame if (and only if) nothing is currently in flight --
-    // the wire protocol has only ever supported one outstanding request at a time.
-    // Deliberately *before* compositing below: compositing overwrites `image`, and
-    // this capture needs the game's real, unmodified rendering for this frame, not
-    // whatever this same call is about to paint over it.
-    if !shm.has_pending_request() {
-        if !ensure(resources, device, instance, physical_device, queue_family, frame_bytes) {
-            return None;
-        }
-        let r = resources.as_ref().expect("just ensured above");
-        if capture_pristine(device, r, queue, capture_image, capture_layout, width, height, frame_bytes, original_scratch) {
-            shm.set_frame_info(width, height, proxy_format);
-            shm.write_proxy(original_scratch);
-            shm.prepare_motion(instance, physical_device, width, height, proxy_format, original_scratch);
-            if shm.begin_async_request() {
-                std::mem::swap(&mut inflight.original, original_scratch);
-                inflight.dims = Some((width, height, proxy_format));
+    // Non-blocking two-slot capture pipeline (`ASYNC_CAPTURE_DESIGN.md`): poll
+    // whatever capture is already in flight -- never a queue/fence wait -- before
+    // deciding whether to submit a new one. `ensure_pipeline` itself only blocks on
+    // a resize/queue-family change, never on this per-present path.
+    if ensure_pipeline(pipeline, device, instance, physical_device, queue_family, frame_bytes) {
+        if let Some(p) = pipeline {
+            // Same wire-protocol constraint as before: only start a new round trip
+            // (and only bother keeping a just-finished capture's bytes at all) when
+            // nothing is already outstanding. A capture that finishes while a
+            // request is *already* in flight is still polled here (freeing its
+            // slot for reuse) but its bytes are simply not consumed -- the same
+            // bounded temporal-staleness tradeoff `run`'s own doc comment already
+            // accepts, not a new one.
+            if !shm.has_pending_request() && poll_pipeline_capture(p, device, original_scratch).is_some() {
+                shm.set_frame_info(width, height, proxy_format);
+                shm.write_proxy(original_scratch);
+                shm.prepare_motion(instance, physical_device, width, height, proxy_format, original_scratch);
+                if shm.begin_async_request() {
+                    std::mem::swap(&mut inflight.original, original_scratch);
+                    inflight.dims = Some((width, height, proxy_format));
+                }
+            }
+            // Deliberately checked again (rather than `else`): the poll above may
+            // have just started a new round trip, which makes this correctly skip
+            // submitting a redundant capture this same call -- `has_pending_request`
+            // reflects that state change immediately, no separate flag needed.
+            if !shm.has_pending_request() {
+                submit_pipeline_capture(p, device, queue, capture_image, capture_layout, width, height, proxy_format);
             }
         }
     }
@@ -504,43 +560,21 @@ pub unsafe fn run(
     None
 }
 
-/// Reads `image` (assumed `PRESENT_SRC_KHR`, exactly what any image
-/// `vkQueuePresentKHR`'s own contract hasn't already been violated on satisfies) into
-/// `out`, restoring `image` to `PRESENT_SRC_KHR` before returning -- a self-contained
-/// "read pixels, leave everything as I found it" operation, deliberately not sharing
-/// [`run_sync`]'s stage-1 barrier sequence (which ends in `TRANSFER_DST_OPTIMAL`,
-/// correct only when a stage 2 write-back on the very same image immediately
-/// follows). [`run`] calls this for a capture that will send its bytes off for
-/// evaluation and not touch `image` again until (if ever) a composited answer for a
-/// *different*, later frame arrives.
-///
-/// Fully synchronous (submits and waits) -- real, measured cost on `lordnikon`
-/// (2026-09-10) is only a few milliseconds, and it now runs once per round-trip
-/// cycle rather than once per frame, not on the hot path this exists to unblock.
-///
-/// `false` on any failure, leaving `out` unchanged and `image` in whatever layout the
-/// failure happened in -- callers already fail open on this exactly like every other
-/// stage in this module.
-#[allow(clippy::too_many_arguments)]
-fn capture_pristine(
-    device: &ash::Device,
-    r: &CaptureResources,
-    queue: vk::Queue,
-    image: vk::Image,
-    initial_layout: vk::ImageLayout,
-    width: u32,
-    height: u32,
-    frame_bytes: u64,
-    out: &mut Vec<u8>,
-) -> bool {
-    // SAFETY: `r.cmd` was allocated from `r.pool`, created with
-    // `RESET_COMMAND_BUFFER`.
-    if unsafe { device.reset_command_buffer(r.cmd, vk::CommandBufferResetFlags::empty()) }.is_err() {
+/// Records "copy `image` (in `initial_layout`) into `buffer`, restore `initial_layout`"
+/// into `cmd` -- reset, begin, both barriers, the copy, end. Does not submit or wait;
+/// [`submit_pipeline_capture`] (the only caller now that the old fully-synchronous
+/// single-shot capture path is gone -- see `ASYNC_CAPTURE_DESIGN.md`) does that
+/// itself, deliberately without waiting. Pulled out on its own so a future second
+/// caller shares the exact same recorded commands rather than a copy that could
+/// drift apart -- not, today, because there already is one.
+fn record_capture_commands(device: &ash::Device, cmd: vk::CommandBuffer, image: vk::Image, initial_layout: vk::ImageLayout, buffer: vk::Buffer, width: u32, height: u32) -> bool {
+    // SAFETY: `cmd` was allocated from a pool created with `RESET_COMMAND_BUFFER`.
+    if unsafe { device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()) }.is_err() {
         return false;
     }
     let begin_info = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-    // SAFETY: `r.cmd` was just reset above.
-    if unsafe { device.begin_command_buffer(r.cmd, &begin_info) }.is_err() {
+    // SAFETY: `cmd` was just reset above.
+    if unsafe { device.begin_command_buffer(cmd, &begin_info) }.is_err() {
         return false;
     }
     let to_transfer_src = barrier(
@@ -550,11 +584,11 @@ fn capture_pristine(
         vk::AccessFlags::empty(),
         vk::AccessFlags::TRANSFER_READ,
     );
-    // SAFETY: `r.cmd` is in the recording state; `image` is the caller's own,
-    // currently-`PRESENT_SRC_KHR` swapchain image per `vkQueuePresentKHR`'s contract.
+    // SAFETY: `cmd` is in the recording state; `image` is the caller's own, currently
+    // `initial_layout` per every caller's own contract on the image it passes in.
     unsafe {
         device.cmd_pipeline_barrier(
-            r.cmd,
+            cmd,
             vk::PipelineStageFlags::ALL_COMMANDS,
             vk::PipelineStageFlags::TRANSFER,
             vk::DependencyFlags::empty(),
@@ -578,16 +612,16 @@ fn capture_pristine(
         .image_offset(vk::Offset3D::default())
         .image_extent(vk::Extent3D { width, height, depth: 1 })
         .build();
-    // SAFETY: `image` was just transitioned to `TRANSFER_SRC_OPTIMAL` above; `r.buffer`
-    // was sized to at least `frame_bytes` by `ensure`.
+    // SAFETY: `image` was just transitioned to `TRANSFER_SRC_OPTIMAL` above; `buffer`
+    // is sized to at least `width*height*bytes_per_pixel` by whichever caller built it.
     unsafe {
-        device.cmd_copy_image_to_buffer(r.cmd, image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, r.buffer, &[region]);
+        device.cmd_copy_image_to_buffer(cmd, image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, buffer, &[region]);
     }
-    // Restore `image` to exactly the layout this function found it in -- unlike
-    // `run_sync`'s stage 1, nothing is guaranteed to touch `image` again this same
-    // frame, so leaving it in `TRANSFER_DST_OPTIMAL` (a layout only valid mid-way
-    // through an image<->buffer round trip) would be a real bug the moment the real
-    // present call ran against it instead.
+    // Restore `image` to exactly the layout this function found it in -- nothing is
+    // guaranteed to touch `image` again this same frame, so leaving it in
+    // `TRANSFER_DST_OPTIMAL` (a layout only valid mid-way through an image<->buffer
+    // round trip) would be a real bug the moment the real present call, or the game's
+    // own next use of a render-tap source, ran against it instead.
     let to_present = barrier(
         image,
         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
@@ -597,7 +631,7 @@ fn capture_pristine(
     );
     unsafe {
         device.cmd_pipeline_barrier(
-            r.cmd,
+            cmd,
             vk::PipelineStageFlags::TRANSFER,
             vk::PipelineStageFlags::ALL_COMMANDS,
             vk::DependencyFlags::empty(),
@@ -606,45 +640,206 @@ fn capture_pristine(
             &[to_present],
         );
     }
-    if unsafe { device.end_command_buffer(r.cmd) }.is_err() {
-        return false;
+    unsafe { device.end_command_buffer(cmd) }.is_ok()
+}
+
+/// Phase 2 (`ASYNC_CAPTURE_DESIGN.md`): two [`CaptureBuffer`] slots so a new capture
+/// submission never has to wait on the previous one's fence first. `run` only ever
+/// calls [`poll_pipeline_capture`] (non-blocking: did an earlier submission finish?)
+/// and [`submit_pipeline_capture`] (non-blocking: start a new one if a slot is free)
+/// against this -- no queue wait, no fence wait, on the per-present path. The one
+/// place this module *does* block on a pipeline fence is [`ensure_pipeline`]'s resize
+/// path, which is not on that path.
+pub struct CapturePipeline {
+    queue_family: u32,
+    slots: [PipelineSlot; 2],
+}
+
+struct PipelineSlot {
+    buf: CaptureBuffer,
+    /// `Some((width, height, proxy_format))` for a submission whose fence has not yet
+    /// been confirmed signaled by [`poll_pipeline_capture`]. Nothing may reset or
+    /// reuse `buf.cmd`/`buf.buffer`/`buf.memory` while this is `Some` -- the exact
+    /// invariant whose violation caused the 2026-09-12 UB regression documented in
+    /// this project's history (`docs/history/development-before-neuralforge.md`).
+    pending: Option<(u32, u32, u32)>,
+}
+
+/// Builds both slots if `existing` is `None`; rebuilds both (same capacity/queue-
+/// family-change trigger as [`ensure`]) if either is undersized or the queue family
+/// changed. Unlike [`ensure`], a slot reaching this function may legitimately still
+/// be `pending` -- draining it is this function's job, not a precondition callers
+/// have to uphold, since the entire point of the pipeline is that callers never wait
+/// on a pending slot themselves.
+fn ensure_pipeline(
+    existing: &mut Option<CapturePipeline>,
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    queue_family: u32,
+    bytes: vk::DeviceSize,
+) -> bool {
+    if let Some(p) = existing.as_ref() {
+        if p.queue_family == queue_family && p.slots.iter().all(|s| s.buf.capacity >= bytes) {
+            return true;
+        }
+    } else {
+        return build_pipeline(existing, device, instance, physical_device, queue_family, bytes);
     }
-    // SAFETY: `r.fence` starts signaled (see `ensure`) or was reset+waited-on by
-    // whichever of `capture_pristine`/`run_sync` last used it.
-    if unsafe { device.reset_fences(&[r.fence]) }.is_err() {
-        return false;
+    // A rebuild is needed (capacity grew or the queue family changed -- the same two
+    // triggers `ensure` already has). Resize/teardown is rare and not latency
+    // sensitive, so this is the one place in the pipeline that takes a real, blocking
+    // (unbounded, like every other fence wait this project keeps unbounded rather
+    // than guessing a safe timeout) wait -- never on the steady-state per-frame path.
+    let p = existing.as_ref().expect("checked above");
+    for slot in &p.slots {
+        if slot.pending.is_some() {
+            // SAFETY: `slot.buf.fence` is this slot's own fence; waiting for it here,
+            // before any destroy below touches the resources it guards, is exactly
+            // what makes that destroy sound -- the "drain before rebuilding on a live
+            // device" this pipeline's own design doc calls for.
+            if unsafe { device.wait_for_fences(&[slot.buf.fence], true, u64::MAX) }.is_err() {
+                // A real device error, not a timeout (there is no timeout above).
+                // Leave the existing pipeline exactly as it was rather than guess it's
+                // safe to destroy -- next frame's `ensure_pipeline` call tries again.
+                return false;
+            }
+        }
     }
-    let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&r.cmd)).build();
-    // SAFETY: `r.cmd` was just recorded and ended above.
-    if unsafe { device.queue_submit(queue, &[submit], r.fence) }.is_err() {
-        return false;
+    let p = existing.take().expect("checked above");
+    for slot in &p.slots {
+        // SAFETY: every slot's fence was just confirmed signaled above.
+        unsafe { slot.buf.destroy(device) };
     }
-    // SAFETY: `r.fence` was just submitted against above.
-    if unsafe { device.wait_for_fences(&[r.fence], true, u64::MAX) }.is_err() {
+    build_pipeline(existing, device, instance, physical_device, queue_family, bytes)
+}
+
+fn build_pipeline(
+    existing: &mut Option<CapturePipeline>,
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    queue_family: u32,
+    bytes: vk::DeviceSize,
+) -> bool {
+    let Some(a) = build_capture_buffer(device, instance, physical_device, queue_family, bytes) else { return false };
+    let Some(b) = build_capture_buffer(device, instance, physical_device, queue_family, bytes) else {
+        // SAFETY: `a` was just built above; nothing has submitted work against it yet.
+        unsafe { a.destroy(device) };
         return false;
-    }
-    // SAFETY: `r.ptr` is a live mapping of at least `frame_bytes` bytes (the memory
-    // type/size `ensure` just built or confirmed already satisfies this call's own
-    // `frame_bytes`).
-    let captured = unsafe { std::slice::from_raw_parts(r.ptr, frame_bytes as usize) };
-    out.clear();
-    out.extend_from_slice(captured);
+    };
+    *existing = Some(CapturePipeline {
+        queue_family,
+        slots: [PipelineSlot { buf: a, pending: None }, PipelineSlot { buf: b, pending: None }],
+    });
     true
+}
+
+/// Non-blocking: checks every slot for a submission whose fence has actually signaled
+/// (`vkGetFenceStatus`, never `vkWaitForFences`) and, for the first one found, copies
+/// its bytes into `out` and frees the slot. Returns that submission's own
+/// `(width, height, proxy_format)` -- the caller needs it to detect a resolution
+/// change against whatever it was expecting, same as every other dims check in this
+/// module. `None` (leaving `out` untouched) if nothing is signaled yet, or if a slot's
+/// fence reported a real error (left `pending` forever rather than guessed safe to
+/// reuse -- fail-closed on that one slot, not a reason to stop trying the other).
+fn poll_pipeline_capture(pipeline: &mut CapturePipeline, device: &ash::Device, out: &mut Vec<u8>) -> Option<(u32, u32, u32)> {
+    for slot in &mut pipeline.slots {
+        let dims = slot.pending?;
+        // SAFETY: `slot.buf.fence` belongs to this slot; a status query never touches
+        // command-buffer/buffer/memory state, so it's sound to call regardless of
+        // whether the submission this fence guards has actually completed yet.
+        match unsafe { device.get_fence_status(slot.buf.fence) } {
+            Ok(true) => {
+                let (width, height, proxy_format) = dims;
+                let bytes_per_pixel = neuralforge_protocol::enums::proxy_format::bytes_per_pixel(proxy_format) as u64;
+                let frame_bytes = (u64::from(width) * u64::from(height) * bytes_per_pixel) as usize;
+                // SAFETY: `slot.buf.ptr` is a live host-coherent mapping of at least
+                // `frame_bytes` bytes (`submit_pipeline_capture` only ever submits
+                // into a slot `build_capture_buffer` already sized for this exact
+                // `frame_bytes`); the fence just confirmed signaled means the GPU's
+                // writes are visible to the CPU with no explicit flush/invalidate
+                // needed (host-coherent memory, same as every other read of a
+                // `CaptureBuffer::ptr` in this module).
+                let captured = unsafe { std::slice::from_raw_parts(slot.buf.ptr, frame_bytes) };
+                out.clear();
+                out.extend_from_slice(captured);
+                slot.pending = None;
+                return Some(dims);
+            }
+            Ok(false) => {} // still in flight -- leave `pending`, check again next call
+            Err(_) => {}     // real device error -- leave `pending`; never guess reuse is safe
+        }
+    }
+    None
+}
+
+/// Non-blocking: records and submits a new capture into whichever slot is free
+/// (`pending: None`), if any. `false` (no new capture this frame) if both slots are
+/// still pending or recording/submission itself failed -- the caller already treats
+/// that as "skip capture this frame", the same fail-open discipline as every other
+/// path in this module. Never waits, never touches a slot that is still `pending`.
+#[allow(clippy::too_many_arguments)]
+fn submit_pipeline_capture(
+    pipeline: &mut CapturePipeline,
+    device: &ash::Device,
+    queue: vk::Queue,
+    image: vk::Image,
+    initial_layout: vk::ImageLayout,
+    width: u32,
+    height: u32,
+    proxy_format: u32,
+) -> bool {
+    let Some(slot) = pipeline.slots.iter_mut().find(|s| s.pending.is_none()) else { return false };
+    if !record_capture_commands(device, slot.buf.cmd, image, initial_layout, slot.buf.buffer, width, height) {
+        return false;
+    }
+    // SAFETY: `slot.buf.fence` is `pending: None` here -- either never used yet
+    // (starts signaled, see `build_capture_buffer`) or its previous signal was
+    // already confirmed and consumed by `poll_pipeline_capture` -- so resetting it
+    // now cannot race an in-flight wait on it.
+    if unsafe { device.reset_fences(&[slot.buf.fence]) }.is_err() {
+        return false;
+    }
+    let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&slot.buf.cmd)).build();
+    // SAFETY: `slot.buf.cmd` was just recorded and ended by `record_capture_commands`
+    // above. Deliberately not waited on here -- the entire point of this function:
+    // the caller's present call returns immediately, and a later
+    // `poll_pipeline_capture` call picks up the result once this fence actually
+    // signals, exactly like `vkQueuePresentKHR` itself never waits on the work it
+    // submits either.
+    if unsafe { device.queue_submit(queue, &[submit], slot.buf.fence) }.is_err() {
+        return false;
+    }
+    slot.pending = Some((width, height, proxy_format));
+    true
+}
+
+/// # Safety
+/// Must only be called at device-destruction time, with no submitted work referencing
+/// these handles still in flight -- same contract as [`destroy`].
+pub unsafe fn destroy_pipeline(pipeline: Option<CapturePipeline>, device: &ash::Device) {
+    if let Some(p) = pipeline {
+        for slot in &p.slots {
+            // SAFETY: forwarded from this function's own contract.
+            unsafe { slot.buf.destroy(device) };
+        }
+    }
 }
 
 /// Writes `bytes` (exactly `width*height*4` `RGBA8` bytes) into `image` via
 /// `r`'s own staging buffer -- the CPU-composited last resort when no GPU compose
-/// path is available at all. Fully synchronous; `image` assumed/left `PRESENT_SRC_KHR`
-/// exactly like [`capture_pristine`]. Best-effort: does nothing observable on failure
-/// beyond leaving `image` unpresented-to this frame, same fail-open discipline as
-/// every other stage in this module.
+/// path is available at all. Fully synchronous; `image` assumed/left `PRESENT_SRC_KHR`,
+/// same contract [`run_sync`]'s own stage 2 relies on. Best-effort: does nothing
+/// observable on failure beyond leaving `image` unpresented-to this frame, same
+/// fail-open discipline as every other stage in this module.
 fn write_bytes_to_image(device: &ash::Device, r: &CaptureResources, queue: vk::Queue, image: vk::Image, width: u32, height: u32, bytes: &[u8]) {
     let frame_bytes = u64::from(width) * u64::from(height) * 4;
     if bytes.len() as u64 != frame_bytes {
         return;
     }
     // SAFETY: `r.ptr` is a live mapping of at least `frame_bytes` bytes -- the same
-    // invariant `capture_pristine`/`run_sync` already rely on.
+    // invariant `run_sync`'s own stage 1/2 already rely on.
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), r.ptr, bytes.len()) };
     // SAFETY: `r.cmd` was allocated with `RESET_COMMAND_BUFFER`.
     if unsafe { device.reset_command_buffer(r.cmd, vk::CommandBufferResetFlags::empty()) }.is_err() {
@@ -1244,6 +1439,7 @@ mod tests {
         let (image, image_memory) = make_present_src_image(&device, &mem_props, queue, pool, width, height);
 
         let mut resources: Option<CaptureResources> = None;
+        let mut pipeline: Option<CapturePipeline> = None;
         let mut gpu_compose: Option<crate::composition::gpu::GpuCompose> = None;
         let mut original_scratch = Vec::new();
         let mut answer_scratch = Vec::new();
@@ -1277,6 +1473,7 @@ mod tests {
                     proxy_format,
                     false,
                     &mut resources,
+                    &mut pipeline,
                     &mut gpu_compose,
                     &mut shm,
                     &mut original_scratch,
@@ -1316,13 +1513,23 @@ mod tests {
         stop.store(true, AtomicOrdering::Relaxed);
         helper.join().unwrap();
 
+        // A capture pipeline slot can legitimately still be `pending` here (the test
+        // loop can exit as soon as `last_answer` is non-empty, with no guarantee the
+        // *next* speculative capture submission already resolved) -- wait for the
+        // whole device idle first, the same real teardown precondition
+        // `destroy_private_resources` relies on in production, before either
+        // `destroy` call below touches anything.
+        unsafe { device.device_wait_idle() }.unwrap();
         // SAFETY: every semaphore this test waited on has a completed, waited-for
-        // fence behind it (the explicit wait above); nothing else touched `image`.
+        // fence behind it (the explicit wait above); the idle wait just above
+        // confirms every capture-pipeline slot's own fence too; nothing else touched
+        // `image`.
         unsafe {
             device.destroy_image(image, None);
             device.free_memory(image_memory, None);
             device.destroy_command_pool(pool, None);
             destroy(resources, &device);
+            destroy_pipeline(pipeline, &device);
             if let Some(gpu) = gpu_compose {
                 gpu.destroy(&device);
             }

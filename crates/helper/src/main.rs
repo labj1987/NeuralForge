@@ -50,6 +50,20 @@ fn store_ms(field: &std::sync::atomic::AtomicU32, duration: Duration) {
 fn main() {
     guard::install();
 
+    // Test-only: artificially delays every response by this many milliseconds,
+    // simulating a helper that genuinely takes far longer than one frame to answer.
+    // Read once at startup (this never needs to change mid-run) so the per-frame loop
+    // below pays nothing but a single `Duration` comparison when it's unset -- the
+    // default, real, deployed case. See `ASYNC_CAPTURE_DESIGN.md`'s own validation
+    // section and PHASE1.md's Phase 2 item 6 for why this exists: proving the layer's
+    // present hook never blocks needs a helper slow enough that blocking would be
+    // obvious, not just "usually fast".
+    let helper_delay: Duration = std::env::var("NEURALFORGE_HELPER_DELAY_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or_default();
+
     let Some(shm) = shm::open() else {
         neuralforge_helper::log!("[helper] failed to open the shared-memory mapping");
         return;
@@ -184,6 +198,9 @@ fn main() {
                 answer.copy_from_slice(proxy);
             }
             hdr.seq_ok.store(seq_req, Ordering::Relaxed);
+            if !helper_delay.is_zero() {
+                std::thread::sleep(helper_delay);
+            }
             hdr.seq_resp.store(seq_req, Ordering::Release);
             frames += 1;
             neuralforge_protocol::store64(&hdr.helper_frames_lo, &hdr.helper_frames_hi, frames);

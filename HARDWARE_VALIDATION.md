@@ -188,3 +188,68 @@ the hard way in the 2026-09-14 session above), waits for `GTA5_Enhanced.exe`, an
 **stops and waits for a human to confirm the saved route/scene has been reached**
 before starting the timed sample -- it cannot drive the car itself. The matched 3x
 benchmark this phase's exit gate requires has still not been run.
+
+## 2026-09-15 (later) -- Phase 2: non-blocking capture pipeline implemented and
+## validated without real gameplay; the GTA measurement itself is not done
+
+Implemented `ASYNC_CAPTURE_DESIGN.md`'s two-slot pipeline: `crates/layer/src/capture.rs`
+gained `CapturePipeline` (two independent `CaptureBuffer` slots, each tracking its own
+`pending: Option<(width, height, proxy_format)>`), `poll_pipeline_capture` (non-blocking
+`vkGetFenceStatus`, never `vkWaitForFences`), and `submit_pipeline_capture` (record +
+submit, never waits). `run`'s hot path now polls before deciding whether to submit,
+gated on the same "only one outstanding wire request" rule the transport already had.
+The one place this adds a real blocking wait is `ensure_pipeline`'s resize/queue-family-
+change path -- draining whichever slot is still `pending` before destroying it, not on
+the steady-state per-frame path. The old single-resource `CaptureResources`/`ensure`/
+`capture_pristine` path is unchanged in behavior and still serves `run_sync` (the
+`debug_view`/`capture_request` same-frame-correctness cases) and `run`'s CPU-only
+write-back fallback -- deliberately kept as a separate resource from the new pipeline
+rather than sharing one slot type across two different contracts. `capture_pristine`
+itself (now dead once `run`'s two call sites moved to the pipeline) was removed; its
+command-recording sequence was factored into `record_capture_commands`, shared with
+the new pipeline's submit path.
+
+Also added `NEURALFORGE_HELPER_DELAY_MS` (test-only) to `neuralforge-helper`: an
+artificial per-response delay, read once at startup, applied right before
+`seq_resp` is published -- the real-hardware equivalent of the existing Rust
+integration test's fake in-process helper thread.
+
+**Validated on `lordnikon`:**
+- `cargo test -p neuralforge-layer` (all 45 native tests, 1 ignored) passes unchanged
+  on the dev machine.
+- The layer crate's release test binary was copied to `lordnikon` and run directly
+  against the real NVIDIA driver with `VK_LAYER_KHRONOS_validation` and
+  `VK_LAYER_VALIDATE_SYNC=1` (the current, non-deprecated sync-validation setting --
+  `VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT` is deprecated and
+  silently loses to it if both are set). All 45 tests passed, including
+  `run_never_blocks_on_a_slow_helper_and_eventually_composites` (the test that
+  specifically asserts a single `capture::run` call never takes anywhere near a slow
+  helper's own delay). The only validation output was
+  `VUID-VkImageMemoryBarrier-{old,new}Layout-parameter` on `PRESENT_SRC_KHR`, a known
+  artifact of this test's own minimal device (created without `VK_KHR_swapchain`) --
+  confirmed pre-existing and unrelated to this phase's change, not a synchronization
+  hazard: no `SYNC-HAZARD-*` message appeared anywhere in either run.
+- `neuralforge-helper.exe` with `NEURALFORGE_HELPER_DELAY_MS=250` set was run alone
+  against `lordnikon`'s real Proton/Wine runner for 20+ seconds with no crash.
+  A separate attempt earlier the same session, run immediately after starting a
+  *second* helper instance against the same Wine prefix while the first was still
+  live, did die silently within seconds -- reproduced once, and explained by
+  concurrent processes sharing one Wine prefix (a known hazard, unrelated to this
+  change) rather than the delay code itself once isolated. Recorded here in case it
+  recurs: if so, it needs its own investigation, not an assumption this note already
+  covers it.
+- `vkcube` itself -- both before and after this phase's change, confirmed against the
+  unmodified Phase 1 binaries as a control -- never advances `layer_frames` at all
+  (`shmctl status` stays at 0) under `NEURALFORGE_ENABLE=1` regardless of which code is
+  installed. This matches `RENDER_TAP_DESIGN.md`: `vkcube` never performs the
+  `TRANSFER_SRC_OPTIMAL` -> swapchain blit the render tap looks for, so capture never
+  engages for it, old pipeline or new. `vkcube` is therefore only useful here for
+  confirming the pipeline doesn't corrupt or hang an *inactive* capture path, not for
+  observing the async decoupling with a real captured frame and a real delayed
+  answer end to end -- that needs the render tap actually active, which needs GTA.
+
+**Not done, and not claimed**: no GTA session was run this phase (out of scope for
+this session -- see PHASE1.md's own unmet benchmark gate above, still open). Phase 2
+item 6 calls for "then on GTA. Report layer frames/sec and GTA fps against the Phase 1
+table" -- that comparison, and confirmation that GTA fps recovers to within ~10% of
+native with neural on, is still outstanding and needs a live session.

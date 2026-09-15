@@ -100,6 +100,13 @@ struct State {
     /// to build a command pool for whatever queue `queue_present_khr` hands us.
     queue_families: HashMap<vk::Queue, u32>,
     capture: Option<capture::CaptureResources>,
+    /// The Phase 2 non-blocking capture pipeline (`ASYNC_CAPTURE_DESIGN.md`) `capture::run`
+    /// uses for its own hot-path captures. Kept separate from `capture` above (which
+    /// stays the single synchronous resource `run_sync` and `run`'s CPU-only
+    /// write-back fallback still use) rather than sharing one resource type across
+    /// both purposes -- a slot mid-flight for one would otherwise have to be safe to
+    /// borrow for the other's completely different, fully-synchronous contract.
+    capture_pipeline: Option<capture::CapturePipeline>,
     gpu_compose: Option<crate::composition::gpu::GpuCompose>,
     /// Reused across frames by `capture::run` for its own pre-edit frame snapshot,
     /// instead of a fresh `frame_bytes`-sized heap allocation every single present
@@ -140,10 +147,11 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
     let owned = CLEANUP.lock().unwrap().remove(&handle);
     if let Some((device, state)) = owned {
         let mut state = state.lock().unwrap();
-        if state.capture.is_some() || state.gpu_compose.is_some() {
+        if state.capture.is_some() || state.capture_pipeline.is_some() || state.gpu_compose.is_some() {
             match unsafe { device.device_wait_idle() } {
                 Ok(()) | Err(vk::Result::ERROR_DEVICE_LOST) => {
                     unsafe { capture::destroy(state.capture.take(), &device); }
+                    unsafe { capture::destroy_pipeline(state.capture_pipeline.take(), &device); }
                     if let Some(compose) = state.gpu_compose.take() {
                         unsafe { compose.destroy(&device); }
                     }
@@ -513,7 +521,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 let proxy_format = swapchain::proxy_format_for(sw.format);
                 let bgr_order = swapchain::is_bgr_order(sw.format);
                 let (capture_image, capture_layout) = tap.unwrap_or((image, vk::ImageLayout::PRESENT_SRC_KHR));
-                let State { shm, capture, gpu_compose, original_scratch, inflight, answer_scratch, last_answer, hotkey, .. } = &mut *state;
+                let State { shm, capture, capture_pipeline, gpu_compose, original_scratch, inflight, answer_scratch, last_answer, hotkey, .. } = &mut *state;
                 shm.poll_toggle_hotkey(hotkey);
                 if shm.model_known_unavailable() {
                     // The helper has permanently disabled itself for this session
@@ -548,6 +556,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                             proxy_format,
                             bgr_order,
                             capture,
+                            capture_pipeline,
                             gpu_compose,
                             shm,
                             original_scratch,

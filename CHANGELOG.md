@@ -19,6 +19,25 @@
   layer processed 4,540 frames in 61.5 seconds, while NeuralForge safely passed GTA
   through because its surface exposes `TRANSFER_DST | COLOR_ATTACHMENT`, not the
   `TRANSFER_SRC` usage required for legal capture. This is not a performance comparison.
+- Add `scripts/bench.sh`, the repeatable native/upstream/neuralforge benchmark
+  driver Phase 1 still needs run for real; it restarts Steam per mode and waits for a
+  human to confirm the saved route before timing. Investigated the eleven Vulkan
+  validation warnings Phase 1 flagged as outstanding; could not reproduce them on this
+  machine's current validation-layer version under `vkcube`, so left unresolved rather
+  than guessed at.
+
+## Unreleased — NeuralForge Phase 2
+
+- Implement the non-blocking two-slot capture pipeline (`ASYNC_CAPTURE_DESIGN.md`):
+  `run`'s present-hook capture submission no longer blocks on its own GPU fence --
+  only a resize/queue-family change still takes a real (bounded to that rare event)
+  wait. Validated on the RTX 5070 by running the layer crate's own test suite
+  directly against the real driver with Khronos validation and synchronization
+  validation active: 45/45 tests pass, zero synchronization hazards. Add
+  `NEURALFORGE_HELPER_DELAY_MS` (test-only) to simulate a slow helper for this kind
+  of validation. GTA fps has not yet been measured against this change -- `vkcube`
+  cannot exercise the render tap at all (see `HARDWARE_VALIDATION.md`), so this still
+  needs a real session before Phase 2 can be called done.
 
 ## Historical releases before the NeuralForge rename
 
