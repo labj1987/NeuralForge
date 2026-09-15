@@ -13,8 +13,10 @@ see [Legal](#legal) before you use it.
 
 Repository: [labj1987/NeuralForge](https://github.com/labj1987/NeuralForge).
 
-See [PHASE1.md](PHASE1.md) for coexistence, installation, migration and the approved benchmark roadmap.
-Current NVIDIA presentation-validation findings are tracked in [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md). NeuralForge now has a guarded GTA render tap: it captures only a game-owned, tracked transfer source and writes through the swapchain's supported destination usage. The first live interval validates correctness, not comparable game FPS or 1%-low performance.
+See [PHASE1.md](PHASE1.md) for coexistence, installation, migration and the benchmark roadmap.
+Current target-machine findings are tracked in [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md).
+NeuralForge's guarded GTA render tap has been validated with the full helper and model;
+its current synchronous host transport is a correctness baseline, not a performance result.
 
 ## Screenshots
 
@@ -24,15 +26,16 @@ Current NVIDIA presentation-validation findings are tracked in [HARDWARE_VALIDAT
 
 ## What it does
 
-- A Vulkan implicit layer hooks swapchain presentation for native Linux and Proton
-  games and round-trips each frame to a helper process over shared memory.
+- A Vulkan implicit layer hooks presentation for native Linux and Proton games. It
+  sends bounded captured frames to a Windows helper over private shared memory and
+  presents untouched frames whenever an answer is not ready.
 - Fail-open: if the helper isn't running or the model fails to initialize, the layer
   just presents the original frame — nothing about the game's rendering depends on it.
 - The Windows-side helper runs NVIDIA's `nvngx_dlssnr.dll` (Feature 18) under Wine or a
   Proton build. The experimental `VK_NV_optical_flow` motion path is disabled in
   the known-good baseline.
-- HDR-aware capture: on an HDR swapchain the model sees a float16 proxy of the frame's
-  real light (PQ-decoded first), not a tone-mapped 8-bit copy.
+- HDR-aware capture and composition support float16/PQ paths when a compatible
+  swapchain exposes them; the validated GTA baseline is SDR B8G8R8A8.
 - A composition pass blends the model's output back into the frame — tone/structure/
   skin/sharpness controls, a reversible neutral-axis proxy mode, and a choice of
   resampling filters (Lanczos, Catmull-Rom, Mitchell-Netravali, Kaiser-windowed sinc)
@@ -84,9 +87,11 @@ python3 scripts/install.py install --appdir build-appimage/AppDir
 
 The GUI is `neuralforge`; the CLI is `neuralforge-cli`; the Windows helper is
 `neuralforge-helper.exe`. Use `NEURALFORGE_ENABLE=1` to activate the layer. Config,
-data and state use their own `neuralforge` directories. Upstream DLSS5VKLayer can
-remain installed; its launch variables and files are separate. See [PHASE1.md](PHASE1.md)
-for executable targeting, migration, uninstall and the exact GTA baseline.
+data, state, runtime, control mapping and helper prefix use their own `neuralforge`
+locations. Upstream DLSS5VKLayer can remain installed; NeuralForge neither migrates
+ambiguous upstream state nor changes its files, configuration, launch options, helper,
+or runtime. See [PHASE1.md](PHASE1.md) for executable targeting, migration, uninstall
+and the exact GTA baseline.
 
 ## GTA status
 
@@ -98,11 +103,24 @@ the original swapchain. Rockstar Launcher, Social Club, Wine Explorer, Xalia, an
 overlays remain pass-through. The full model and helper remain enabled; the known-good
 baseline uses `NEURALFORGE_DMABUF=0`.
 
-The current host-SHM capture is synchronous and is intentionally being profiled before
-any performance claim. See [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) for the
-recorded live results and [RENDER_TAP_DESIGN.md](RENDER_TAP_DESIGN.md) for the safety
-constraints behind this path. The next bounded asynchronous capture design is recorded
-in [ASYNC_CAPTURE_DESIGN.md](ASYNC_CAPTURE_DESIGN.md); it is not enabled yet.
+Use this Steam launch option for the isolated GTA session:
+
+```text
+NEURALFORGE_ENABLE=1 NEURALFORGE_DMABUF=0 NEURALFORGE_TARGET_EXE=GTA5_Enhanced.exe %command%
+```
+
+The target validation uses GTA V Enhanced Steam AppID `3240220`, an RTX 5070 with
+driver `615.71.09`, 2560×1440 at 288 Hz, GNOME scale 100%, passes=1, model
+resolution=1, and motion disabled. The render tap keeps Rockstar Launcher, Social
+Club, Wine Explorer, Xalia, Steam overlay, and other non-target processes pass-through.
+
+The synchronous host-SHM baseline processed 475 and 474 layer frames in two separate
+61-second GTA intervals: 7.73 and 7.72 layer frames/sec. Those intervals confirm the
+tap works and identify the capture fence wait as the bottleneck. They are not game FPS,
+1%-low metrics, or an upstream comparison because the scene was not controlled. See
+[HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) for the measurements,
+[RENDER_TAP_DESIGN.md](RENDER_TAP_DESIGN.md) for the capture constraints, and
+[ASYNC_CAPTURE_DESIGN.md](ASYNC_CAPTURE_DESIGN.md) for the next bounded pipeline.
 
 ## Building from source
 
