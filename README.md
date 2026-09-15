@@ -15,9 +15,9 @@ Repository: [labj1987/NeuralForge](https://github.com/labj1987/NeuralForge).
 
 ## Screenshots
 
-| Settings |
-|---|
-| ![NeuralForge settings window with Model, Motion, Composition, Debug, and Status tabs](screenshots/settings.png) |
+| Settings | Setup |
+|---|---|
+| ![NeuralForge settings window with Model, Motion, Composition, Debug, Status, and Setup tabs](screenshots/settings.png) | ![Setup tab: NGX binaries status, compatibility tool picker, Steam install and launch-option generator](screenshots/setup.png) |
 
 ## What it does
 

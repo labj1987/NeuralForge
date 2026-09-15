@@ -21,10 +21,16 @@
   </provides>
   <screenshots>
     <screenshot type="default">
+      <caption>Settings window with Model, Motion, Composition, Debug, Status, and Setup tabs</caption>
       <image>https://raw.githubusercontent.com/labj1987/NeuralForge/main/screenshots/settings.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Setup tab: NGX binaries status, compatibility tool picker, Steam install and launch-option generator</caption>
+      <image>https://raw.githubusercontent.com/labj1987/NeuralForge/main/screenshots/setup.png</image>
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.1.56" date="2026-09-15"/>
     <release version="0.1.55" date="2026-09-15"/>
     <release version="0.1.5" date="2026-09-10"/>
     <release version="0.1.4" date="2026-09-10"/>
