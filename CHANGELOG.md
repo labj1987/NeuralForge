@@ -82,6 +82,11 @@
   "Install for Steam games" button (sourced from `$APPDIR` when running as an
   AppImage), and a Steam launch-option generator (target exe + DMA-BUF toggle -> the
   exact `NEURALFORGE_ENABLE=1 ... %command%` string, with a copy button).
+- First-run flow: with `nvngx_dlssnr.dll` missing, the window now opens directly on
+  Setup (instead of Model) with a dismissible banner explaining why, rather than a
+  silently fail-open app that never says why neural rendering isn't doing anything.
+- Refresh `screenshots/` for the new Setup tab and update the README screenshot table
+  and AppStream metainfo to match.
 
 ## Unreleased — NeuralForge Phase 3
 
