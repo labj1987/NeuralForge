@@ -162,6 +162,23 @@
   socket instead. No production code changed; `crates/layer/examples/dmabuf_export_probe.rs`
   and `crates/helper/examples/dmabuf_import_probe.rs` (the diagnostics that found this)
   are kept alongside `dmabuf_probe.rs`.
+- Investigated the "skip Wine with a native Linux NGX helper" idea named as this
+  project's longer-term direction (see `NATIVE_NGX_HELPER_DESIGN.md`): NVIDIA does ship
+  a genuine native Linux NGX runtime (`libnvidia-ngx.so.1`) that boots cleanly on real
+  hardware with no caller-identity workaround needed, but no native Linux
+  implementation of this project's target feature (DLSS 5 Neural Rendering,
+  `NVSDK_NGX_Feature_Reserved18`) exists anywhere -- confirmed reserved/unallocated in
+  NVIDIA's own current public SDK header, and the identical, well-known
+  `FAIL_UNABLE_TO_INITIALIZE_FEATURE` result this project already recognized from the
+  Windows side came back from the real native library too. A control experiment against
+  a genuinely public feature (Super Resolution) confirmed this machine has no NGX
+  snippet installed for anything, and a follow-up attempt to point Core at NVIDIA's own
+  official redistributable Super Resolution `.so` via the documented `__NGX_CONF_FILE`
+  mechanism didn't change the result either -- Core needs more than a file in the right
+  directory to load a feature, not fully reverse-engineered this session. No production
+  code changed; `crates/layer/examples/native_ngx_probe.rs` (the diagnostic that found
+  this, including a small native `sigsetjmp`/`siglongjmp` signal guard, this project's
+  Linux-native counterpart to the Windows helper's VEH-based one) is kept in the repo.
 
 ## Historical releases before the NeuralForge rename
 

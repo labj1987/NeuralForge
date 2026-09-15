@@ -29,8 +29,12 @@ passes=1, model_resolution=1, motion disabled/quality 0, host SHM transport.
 DMA-BUF remains experimental, and both transport directions tried so far are blocked
 on real, confirmed-on-hardware constraints (a Wine/NVIDIA-driver handle-type mismatch
 one way, a plain Linux anon-inode-fd limitation the other), not just unimplemented --
-see `DMABUF_TRANSPORT_DESIGN.md` before touching it again. Do not lower model
-resolution or disable the helper without explicit user authorization.
+see `DMABUF_TRANSPORT_DESIGN.md` before touching it again. The "skip Wine with a native
+Linux NGX helper" idea that would have sidestepped both is also closed, for an
+unrelated reason (no native Linux implementation of this project's target NGX feature
+exists anywhere, confirmed on real hardware) -- see `NATIVE_NGX_HELPER_DESIGN.md`
+before touching that either. Do not lower model resolution or disable the helper
+without explicit user authorization.
 
 Do not reapply the reverted capture/composition fence changes. Validate actual GPU
 operations and establish matched upstream/NeuralForge measurements before performance

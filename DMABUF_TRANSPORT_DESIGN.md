@@ -174,24 +174,30 @@ regardless of which side initiates it. A working design would need real `SCM_RIG
 fd-passing over a Unix domain socket instead -- a materially different and bigger
 transport than anything this project's IPC currently has.
 
-This doesn't necessarily mean DMA-BUF is permanently out of reach for this project --
-`ATTRIBUTION.md`/earlier design docs already note a **future native Linux NGX helper**
-(no Wine at all) as this project's own longer-term architecture goal, and *that*
-helper would have full, native `VK_EXT_external_memory_dma_buf` access with no
-cross-process fd-transfer problem at all (same process, or at worst a same-OS
-`SCM_RIGHTS` handoff with no Wine/NVIDIA-win32-handle asymmetry layered on top),
-making Phase 4 straightforward the same way Phase 3 was. Under the *current*,
-Wine-hosted interim helper, DMA-BUF now has no untried variant left that this
-session's own reasoning judged worth pursuing further.
+A same-process or same-OS native Linux NGX helper (no Wine at all) would sidestep this
+whole asymmetry -- full, native `VK_EXT_external_memory_dma_buf` access with no
+cross-process win32-handle problem layered on top at all. **Investigated as its own
+question in `NATIVE_NGX_HELPER_DESIGN.md` (this correction: that idea was not actually
+an established prior decision recorded in `ATTRIBUTION.md`, contrary to what an earlier
+draft of this section claimed -- it was this project's own speculative aside, now
+checked for real).** Real hardware evidence there: NVIDIA does ship a genuine native
+Linux NGX runtime (`libnvidia-ngx.so.1`) that boots cleanly with no caller-identity
+workaround needed, but no native Linux implementation of this project's actual target
+feature (DLSS 5 Neural Rendering, `NVSDK_NGX_Feature_Reserved18`) exists anywhere --
+it's an explicitly reserved, unallocated feature ID in NVIDIA's own current public SDK,
+never published in any form except the Windows-only `nvngx_dlssnr.dll` this project
+already depends on. That route is closed for a missing-artifact reason, not an
+architecture one, and isn't something more Wine-side engineering effort here can fix.
 
-**Recommendation**: leave Phase 4 blocked here. Both directions this document
-considered are now empirically closed, not merely judged unlikely. Phase 3's
-host-memory path (`EXTERNAL_MEMORY_HOST_DESIGN.md`) already removed the CPU-copy
-overhead this phase would have further reduced by avoiding a virtual-memory round
-trip; what DMA-BUF would have additionally saved is real, but its actual size relative
-to the *model's own eval time* is unknown until the GTA fps gate itself is measured
-(Phase 1's still-open benchmark, Phase 5's own gate). If that measurement later shows
-transport cost is still the dominant remaining cost, the real next step is either an
-`SCM_RIGHTS`-based transport (a genuinely new IPC mechanism, not a variant of what was
-tried here) or the native Linux NGX helper noted above -- not another Wine-fd-bridging
-attempt.
+**Recommendation**: leave Phase 4 blocked here. Both DMA-BUF transport directions this
+document considered are now empirically closed, not merely judged unlikely, and the
+native-helper detour that would have sidestepped the whole problem is also closed, for
+an unrelated and unfixable-by-this-project reason. Phase 3's host-memory path
+(`EXTERNAL_MEMORY_HOST_DESIGN.md`) already removed the CPU-copy overhead this phase
+would have further reduced by avoiding a virtual-memory round trip; what DMA-BUF would
+have additionally saved is real, but its actual size relative to the *model's own eval
+time* is unknown until the GTA fps gate itself is measured (Phase 1's still-open
+benchmark, Phase 5's own gate). If that measurement later shows transport cost is still
+the dominant remaining cost, the real next step is `SCM_RIGHTS`-based fd-passing over a
+Unix socket -- a genuinely new IPC mechanism, not a variant of anything tried here, and
+still Wine-hosted-helper-compatible unlike the native-helper idea.
