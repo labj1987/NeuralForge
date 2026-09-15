@@ -29,8 +29,114 @@ fn usage() {
          \x20 detect-gpu           print detected NVIDIA PCI vendor/device\n\
          \x20 import-binaries DIR  copy NVIDIA NGX DLLs into user data dir\n\
          \x20 shmctl <sub>         raw status/set/toggle/capture against a running\n\
-         \x20                     instance's live SHM header (see `shmctl help`)"
+         \x20                     instance's live SHM header (see `shmctl help`)\n\
+         \x20 profile <sub>        save/load/list/delete named settings profiles\n\
+         \x20                     (see `profile help`)"
     );
+}
+
+fn profile_usage() {
+    eprintln!(
+        "usage: neuralforge-cli profile <list|save|load|delete>\n\n\
+         \x20 list          print every saved profile name\n\
+         \x20 save <name>   snapshot the running instance's current settings as <name>\n\
+         \x20 load <name>   apply <name>'s settings to the running instance and persist\n\
+         \x20               them to config.ini\n\
+         \x20 delete <name> remove a saved profile\n\n\
+         Profiles live in $XDG_CONFIG_HOME/neuralforge/profiles.ini. `save`/`load`\n\
+         attach to the live SHM mapping the same way `shmctl` does (see\n\
+         $NEURALFORGE_SHM/$NEURALFORGE_UID)."
+    );
+}
+
+fn cmd_profile_list() -> ExitCode {
+    let profiles = neuralforge_supervisor::profiles::load_all();
+    if profiles.is_empty() {
+        println!("no saved profiles ({})", neuralforge_supervisor::profiles::profiles_file());
+        return ExitCode::SUCCESS;
+    }
+    for name in profiles.keys() {
+        println!("{name}");
+    }
+    ExitCode::SUCCESS
+}
+
+fn cmd_profile_save(name: &str) -> ExitCode {
+    let Some(mapping) = neuralforge_protocol::mapping::open() else {
+        eprintln!("profile save: failed to open the SHM mapping (see $NEURALFORGE_SHM/$NEURALFORGE_UID)");
+        return ExitCode::FAILURE;
+    };
+    let settings = neuralforge_protocol::persist::snapshot(mapping.header());
+    match neuralforge_supervisor::profiles::save_profile(name, settings) {
+        Ok(()) => {
+            println!("saved profile {name:?} to {}", neuralforge_supervisor::profiles::profiles_file());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("profile save: failed to write {}: {e}", neuralforge_supervisor::profiles::profiles_file());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_profile_load(name: &str) -> ExitCode {
+    let profiles = neuralforge_supervisor::profiles::load_all();
+    let Some(settings) = profiles.get(name) else {
+        eprintln!("profile load: no such profile {name:?} (see `profile list`)");
+        return ExitCode::FAILURE;
+    };
+    let Some(mapping) = neuralforge_protocol::mapping::open() else {
+        eprintln!("profile load: failed to open the SHM mapping (see $NEURALFORGE_SHM/$NEURALFORGE_UID)");
+        return ExitCode::FAILURE;
+    };
+    let header = mapping.header();
+    neuralforge_protocol::persist::apply(header, settings);
+    // Matches the GUI's own reset-settings flow: applying to the live header alone
+    // only affects the running session, so also fold the new values into config.ini
+    // via a fresh snapshot (picks up every persisted setting, not just what this
+    // profile happened to list) so the change survives a reboot too.
+    let mut cfg = Config::load();
+    cfg.settings = neuralforge_protocol::persist::snapshot(header);
+    if let Err(e) = cfg.save() {
+        eprintln!("profile load: applied to the running instance, but saving config.ini failed: {e}");
+        return ExitCode::FAILURE;
+    }
+    println!("loaded profile {name:?}");
+    ExitCode::SUCCESS
+}
+
+fn cmd_profile_delete(name: &str) -> ExitCode {
+    match neuralforge_supervisor::profiles::delete_profile(name) {
+        Ok(true) => {
+            println!("deleted profile {name:?}");
+            ExitCode::SUCCESS
+        }
+        Ok(false) => {
+            eprintln!("profile delete: no such profile {name:?} (see `profile list`)");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("profile delete: failed to write {}: {e}", neuralforge_supervisor::profiles::profiles_file());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_profile(args: &[String]) -> ExitCode {
+    match (args.first().map(String::as_str), args.get(1)) {
+        (Some("list"), _) => cmd_profile_list(),
+        (Some("save"), Some(name)) => cmd_profile_save(name),
+        (Some("load"), Some(name)) => cmd_profile_load(name),
+        (Some("delete"), Some(name)) => cmd_profile_delete(name),
+        (Some("help"), _) | (None, _) => {
+            profile_usage();
+            ExitCode::SUCCESS
+        }
+        _ => {
+            profile_usage();
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn default_config() -> Config {
@@ -294,6 +400,7 @@ fn main() -> ExitCode {
         "detect-gpu" => cmd_detect_gpu(),
         "import-binaries" => cmd_import_binaries(args.get(2)),
         "shmctl" => shmctl::run(&args[2..]),
+        "profile" => cmd_profile(&args[2..]),
         "help" | "--help" | "-h" => {
             usage();
             ExitCode::SUCCESS

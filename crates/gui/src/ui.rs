@@ -357,6 +357,27 @@ pub fn build_ui(app: &adw::Application) {
 /// else here, it's an action, not a live readout, because it's the only place besides
 /// `neuralforge-cli import-binaries` to get NVIDIA's DLLs into `binaries_dir()` -- there's
 /// no separate menu for it.
+fn profile_names() -> Vec<String> {
+    let mut names: Vec<String> = neuralforge_supervisor::profiles::load_all().into_keys().collect();
+    names.sort();
+    names
+}
+
+/// Rebuilds the combo's model from disk -- called on init and after every
+/// save/delete, since the set of saved profiles can only change through this same
+/// window (single-user, single-process local GUI).
+fn refresh_profile_combo(combo: &adw::ComboRow) {
+    let names = profile_names();
+    if names.is_empty() {
+        combo.set_model(Some(&gtk4::StringList::new(&["No saved profiles"])));
+        combo.set_sensitive(false);
+    } else {
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        combo.set_model(Some(&gtk4::StringList::new(&refs)));
+        combo.set_sensitive(true);
+    }
+}
+
 fn build_status_group(shm: &std::sync::Arc<neuralforge_protocol::mapping::Mapping>, toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
     group.set_title("Status");
@@ -490,6 +511,95 @@ fn build_status_group(shm: &std::sync::Arc<neuralforge_protocol::mapping::Mappin
                     Err(e) => toasts.add_toast(adw::Toast::new(&format!("Reset the live session, but saving config.ini failed: {e}"))),
                 }
             });
+        });
+    }
+
+    let save_profile_row = adw::EntryRow::new();
+    save_profile_row.set_title("Save current as");
+    let save_profile_button = gtk4::Button::with_label("Save");
+    save_profile_button.set_valign(gtk4::Align::Center);
+    save_profile_button.add_css_class("suggested-action");
+    save_profile_row.add_suffix(&save_profile_button);
+    group.add(&save_profile_row);
+
+    let profile_combo = adw::ComboRow::new();
+    profile_combo.set_title("Load profile");
+    refresh_profile_combo(&profile_combo);
+    let load_profile_button = gtk4::Button::with_label("Load");
+    load_profile_button.set_valign(gtk4::Align::Center);
+    profile_combo.add_suffix(&load_profile_button);
+    let delete_profile_button = gtk4::Button::with_label("Delete");
+    delete_profile_button.add_css_class("destructive-action");
+    delete_profile_button.set_valign(gtk4::Align::Center);
+    profile_combo.add_suffix(&delete_profile_button);
+    group.add(&profile_combo);
+
+    {
+        let shm = std::sync::Arc::clone(shm);
+        let toasts = toasts.clone();
+        let profile_combo = profile_combo.clone();
+        let save_profile_row = save_profile_row.clone();
+        save_profile_button.connect_clicked(move |_| {
+            let name = save_profile_row.text().trim().to_string();
+            if name.is_empty() {
+                toasts.add_toast(adw::Toast::new("Enter a name before saving"));
+                return;
+            }
+            let settings = neuralforge_protocol::persist::snapshot(shm.header());
+            match neuralforge_supervisor::profiles::save_profile(&name, settings) {
+                Ok(()) => {
+                    toasts.add_toast(adw::Toast::new(&format!("Saved profile \"{name}\"")));
+                    save_profile_row.set_text("");
+                    refresh_profile_combo(&profile_combo);
+                }
+                Err(e) => toasts.add_toast(adw::Toast::new(&format!("Save failed: {e}"))),
+            }
+        });
+    }
+
+    {
+        let shm = std::sync::Arc::clone(shm);
+        let toasts = toasts.clone();
+        let profile_combo = profile_combo.clone();
+        load_profile_button.connect_clicked(move |_| {
+            let names = profile_names();
+            let Some(name) = names.get(profile_combo.selected() as usize) else {
+                toasts.add_toast(adw::Toast::new("No profile selected"));
+                return;
+            };
+            let profiles = neuralforge_supervisor::profiles::load_all();
+            let Some(settings) = profiles.get(name) else { return };
+            neuralforge_protocol::persist::apply(shm.header(), settings);
+            // Same reasoning as the reset button above: applying to the live header
+            // only affects the running session, so also fold the result into
+            // config.ini via a fresh snapshot so it survives a reboot too.
+            let mut cfg = neuralforge_supervisor::Config::load();
+            cfg.settings = neuralforge_protocol::persist::snapshot(shm.header());
+            let message = match cfg.save() {
+                Ok(()) => format!("Loaded profile \"{name}\" -- restart NeuralForge to see it reflected here"),
+                Err(e) => format!("Applied to the running session, but saving config.ini failed: {e}"),
+            };
+            toasts.add_toast(adw::Toast::new(&message));
+        });
+    }
+
+    {
+        let toasts = toasts.clone();
+        let profile_combo = profile_combo.clone();
+        delete_profile_button.connect_clicked(move |_| {
+            let names = profile_names();
+            let Some(name) = names.get(profile_combo.selected() as usize).cloned() else {
+                toasts.add_toast(adw::Toast::new("No profile selected"));
+                return;
+            };
+            match neuralforge_supervisor::profiles::delete_profile(&name) {
+                Ok(true) => {
+                    toasts.add_toast(adw::Toast::new(&format!("Deleted profile \"{name}\"")));
+                    refresh_profile_combo(&profile_combo);
+                }
+                Ok(false) => toasts.add_toast(adw::Toast::new("Profile already gone")),
+                Err(e) => toasts.add_toast(adw::Toast::new(&format!("Delete failed: {e}"))),
+            }
         });
     }
 

@@ -52,6 +52,17 @@
   live session out from under a running process on every settings reset; a test
   (`reset_persisted_settings_changes_settings_but_preserves_the_live_session`) guards
   against reintroducing it.
+- Add named settings profiles: `neuralforge-cli profile <list|save|load|delete>` and a
+  "Save current as" / "Load profile" pair on the GUI's Status tab. Profiles are
+  `[name]` sections of the same `set_<field>=<value>` lines `config.ini` itself
+  stores, kept in their own `profiles.ini` so the flat, upstream-compatible
+  `config.ini` format is untouched. `load` applies to the live session and re-snapshots
+  the full setting set into `config.ini` so it survives a reboot too, the same pattern
+  `reset_persisted_settings` already established.
+- Move `HANDOFF_2026-09-12.md` into `docs/history/` alongside the other pre-rename
+  archival record; trim `README.md` to what it does, requirements, install, usage,
+  status, building and legal -- raw measurement evidence stays in
+  `HARDWARE_VALIDATION.md`.
 
 ## Unreleased — NeuralForge Phase 3
 
