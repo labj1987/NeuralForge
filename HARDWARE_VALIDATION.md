@@ -359,3 +359,50 @@ two real bugs, because neither Rust panics from a third-party crate's own intern
 or `cargo test` check for. Re-run `scripts/smoke-test.sh` specifically after touching
 device-creation-adjacent code, not just a validated `vkcube` session -- it is the one
 check in this project that catches this exact class of bug.
+
+## 2026-09-15 (later still) -- Phase 3 step 4: protocol v3, a second independent
+## request/response slot -- validated end to end on real hardware
+
+See `PROTOCOL_V3_DESIGN.md` for the design; this entry is the real-hardware evidence.
+`lordnikon`, RTX 5070, driver 615.71.09, a fresh `git clone` of each commit (not just
+this dev machine's own software ICD):
+
+- `cargo test -p neuralforge-layer` (48 tests): clean and deterministic across several
+  repeated runs.
+- `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation VK_LAYER_VALIDATE_SYNC=1` against
+  `capture::` tests: the same pre-existing cosmetic `VUID-VkImageMemoryBarrier-*`
+  warning as the pre-v3 commit (confirmed identical via a second `git worktree` at the
+  parent commit) -- not a regression, zero new validation errors or sync hazards.
+- `scripts/smoke-test.sh`: clean, `external_memory_host: true`, no abort.
+- `crates/protocol/examples/trigger_helper_roundtrip.rs` (extended with a slot
+  argument) against a real running helper (Proton-CachyOS, the real
+  `nvngx_dlssnr.dll`): both slots answered correctly when triggered *concurrently* --
+  two processes launched at once, one per slot -- completing in well under a second
+  total, repeated six times at two resolutions with no failures. The one informational
+  mismatch seen (`seq_ok`, on one of six runs) is the expected, harmless consequence
+  of that one field being deliberately shared rather than duplicated per slot (see
+  `PROTOCOL_V3_DESIGN.md`) -- nothing reads it back, so it isn't a correctness gate.
+
+**A discrepancy from the 2026-09-15 (later still) Phase 3 step 2 entry above, worth
+recording rather than quietly overwriting**: that entry states `vkcube`'s own
+swapchain *is* admitted for this layer's plain capture path (`pass_through=false`).
+A `vkcube` run this session, same layer, same machine, under Wayland/Xwayland with
+`VK_LAYER_VALIDATE_SYNC=1`, showed `pass_through=true` for both of its swapchains --
+capture never engaged. Not re-investigated (out of scope for what this entry
+validates -- the *wire protocol*, exercised directly via `trigger_helper_roundtrip.rs`
+instead, deliberately bypassing the capture path entirely). Whether this is a real
+regression, a Wayland-vs-whatever-surface-the-earlier-session-used difference, or a
+driver/environment change since that entry was written is genuinely unknown -- flagged
+here so a future session doesn't treat the older entry's `pass_through=false` claim as
+still-current without checking again first.
+
+**A real process lesson from this session, not a code bug**: the first two attempts
+at the concurrent-slot test above looked like a serious cross-slot race (both
+processes reporting the identical sequence number, one request left permanently
+unanswered) until traced back to a stale deployed clone on `lordnikon` -- the
+diagnostic tool's own slot-argument support had been pushed but not yet `git pull`ed
+into the scratch clone used to build it, so both invocations silently raced for slot 0
+alone. Re-confirmed clean immediately after pulling. Worth remembering the next time a
+real-hardware result looks like a race: diff the deployed *source* against what was
+actually pushed, not just re-run the same (possibly stale) deployed binary, before
+concluding anything about the code itself.

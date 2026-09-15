@@ -127,6 +127,19 @@
   instead of failing open when a function doesn't resolve. Neither was caught by
   Vulkan validation layers or `cargo test` -- only `scripts/smoke-test.sh`'s
   debug-mode UB checker and a live `vkcube` crash surfaced them.
+- Add protocol v3 (see `PROTOCOL_V3_DESIGN.md`): a second, fully independent
+  request/response wire slot, so the layer can have a captured frame already sent to
+  the helper instead of idling a single wire slot while the previous answer is still
+  pending. `CapturePipeline`/`DirectCapture` on the layer side and `FrameResources` on
+  the helper side both become slot-indexed (one dedicated GPU resource set per wire
+  slot); the single NGX feature/model stays deliberately serialized across both slots
+  rather than betting on undocumented concurrent-evaluate safety for a
+  reverse-engineered feature. Validated on `lordnikon`: `cargo test` (48/48, including
+  a new test proving the two slots are fully independent), Khronos validation +
+  synchronization validation (no new warnings versus the pre-v3 commit),
+  `scripts/smoke-test.sh`, and a real running helper answering both slots correctly
+  when triggered concurrently, repeatedly, in well under a second total. GTA fps
+  against this change is not measured as part of this work.
 
 ## Historical releases before the NeuralForge rename
 

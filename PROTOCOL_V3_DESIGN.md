@@ -86,15 +86,42 @@ still fully sequentially (see "What stays serialized" above) -- never both at on
 just never idle-waiting on a wire slot that a captured frame could already be
 occupying.
 
-## Validation plan
+## Validation
 
-Same discipline as every other Vulkan-touching change in this project's history:
-`cargo test` first (protocol layer is fully testable without any Vulkan device),
-`scripts/smoke-test.sh` next (catches the class of bug validation layers can't --
-see `EXTERNAL_MEMORY_HOST_DESIGN.md`'s own "third and fourth bug" section for why
-that step is never optional), then real hardware on `lordnikon`: `vkcube` under
-`VK_LAYER_KHRONOS_validation` with `VK_LAYER_VALIDATE_SYNC=1`, and
-`crates/protocol/examples/trigger_helper_roundtrip.rs` (extended to drive both slots)
-against a real running helper. GTA fps against this change is not measured as part of
-this work -- that needs the user's own live session, same gate as everything else in
-Phase 3/4.
+Real hardware, `lordnikon`, RTX 5070, driver 615.71.09 -- a fresh clone at each
+commit, not just this dev machine's own software ICD:
+
+- `cargo test -p neuralforge-layer` (48 tests, including the new
+  `the_two_slots_are_fully_independent`): clean, deterministic, ~0.5s, run several
+  times in a row with no flakes.
+- `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation VK_LAYER_VALIDATE_SYNC=1 cargo
+  test capture::`: the same pre-existing cosmetic validation warning both before and
+  after this change (the tests' own device never enables `VK_KHR_swapchain`, so
+  `PRESENT_SRC_KHR` barrier layouts trip `VUID-VkImageMemoryBarrier-*-parameter` --
+  confirmed identical on the pre-v3 commit via a second worktree, so this is not a
+  regression). Zero new validation errors or sync hazards.
+- `scripts/smoke-test.sh` (the debug-mode UB checker that has caught real bugs this
+  project's own validation layers couldn't -- see `EXTERNAL_MEMORY_HOST_DESIGN.md`):
+  clean, `external_memory_host: true`, no abort, clean teardown.
+- `crates/protocol/examples/trigger_helper_roundtrip.rs`, extended with the slot
+  argument this design called for, against a real running helper
+  (`neuralforge-cli start`, Proton-CachyOS, the real `nvngx_dlssnr.dll`): both slots
+  answered correctly when triggered *concurrently* (two processes launched at once,
+  slot 0 and slot 1), completing in well under a second total across six separate
+  concurrent runs at two resolutions. `seq_resp`/`seq_resp_b` always resolved
+  correctly; the one informational mismatch observed (`seq_ok` disagreeing with the
+  requested number on one run) is the expected, harmless consequence of `seq_ok`
+  being deliberately shared rather than duplicated (see "What's duplicated" above) --
+  not a wire-protocol correctness issue, since nothing anywhere reads `seq_ok` back.
+- One real process lesson, not a code bug: the first two "concurrent" test attempts
+  looked like a serious cross-slot race (both processes reporting the same sequence
+  number, one request going permanently unanswered) until re-checked against a
+  freshly `git pull`ed clone on `lordnikon` -- the diagnostic tool's own slot
+  argument hadn't been pulled yet, so both invocations were silently racing for slot
+  0 alone. Confirmed by comparing `git log` on the remote clone before concluding
+  anything about the actual code. Worth remembering next time a real-hardware result
+  looks like a race: check the deployed *source*, not just the deployed binary,
+  before trusting it as a finding.
+
+GTA fps against this change is not measured as part of this work -- that needs the
+user's own live session, same gate as everything else in Phase 3/4.
