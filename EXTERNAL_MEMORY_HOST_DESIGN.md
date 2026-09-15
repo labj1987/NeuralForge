@@ -88,36 +88,135 @@ validation layers here):
    code, but only visible once real hardware reported the real alignment (4096 on this
    NVIDIA driver) instead of the local software ICD's more forgiving behavior.
 
+## The helper side: the same import, for upload/download
+
+`crates/helper/src/frame.rs`'s `FrameResources` mirrors `DirectCapture` for the two
+directions the helper itself owns: `imported_proxy` (Color's upload source) and
+`imported_answer` (Output's download destination), built by `build_imported_buffer`
+(the same query/buffer/import sequence as the layer's `build_imported_capture_buffer`,
+duplicated rather than shared -- these are two separate crates for two separate
+platforms). Unlike the layer side, the helper needed no extension-injection hack at
+all: it creates its own `VkDevice` directly (`main.rs::create_vulkan_context`), and
+`VK_EXT_external_memory_host` was already in `WANTED_DEVICE_EXTENSIONS` (added in an
+earlier session, for reasons unrelated to this feature) and already being requested
+whenever the driver advertises it. `crates/helper/src/shm.rs`'s own `open()` had
+similarly already been try­ing to land the mapping at a 64 KiB-aligned address for
+exactly this eventual use, falling back to an OS-chosen address otherwise -- both
+pieces of groundwork just needed connecting to `FrameResources`, not building fresh.
+
+`evaluate()` skips its `proxy -> staging_ptr` copy when `imported_proxy` is set (the
+GPU reads Color directly from the live SHM proxy region) and its
+`staging_ptr -> answer_out` copy when `imported_answer` is set (the GPU writes Output
+directly into the live SHM answer region) -- the same one-copy-instead-of-two
+reduction as the layer side, for the opposite direction.
+
+The single-writer safety argument mirrors `DirectCapture`'s: the wire protocol's "one
+outstanding request at a time" rule already guarantees nothing else writes to the
+proxy region while the helper is reading it, and nothing else writes to the answer
+region except this same download copy -- so importing both, even without a
+double-buffered protocol, is sound today.
+
+## Two real bugs, found via real-hardware validation
+
+Neither was caught by this project's local software Vulkan ICD, which is more
+permissive than NVIDIA's real driver + validation layers on `lordnikon`:
+
+1. `VkBufferCreateInfo` for a buffer that will be bound to imported memory must chain
+   `VkExternalMemoryBufferCreateInfo` with the same handle type used at import time
+   (`VUID-vkBindBufferMemory-memory-02985`) -- missing entirely in the first version of
+   both `build_imported_capture_buffer` (layer) and `build_imported_buffer` (helper).
+2. The import's `allocationSize` must be a multiple of `minImportedHostPointerAlignment`
+   (`VUID-VkMemoryAllocateInfo-allocationSize-01745`) -- a *test* bug (passing the raw
+   pixel byte count instead of the alignment-rounded region size) in the layer-side
+   test, not production code, but only visible once real hardware reported the real
+   alignment (4096 on this NVIDIA driver) instead of the local software ICD's more
+   forgiving behavior.
+
+## A third bug, and a fourth: found only after those two were already fixed and "everything passed"
+
+Both survived a clean `cargo test` and multiple validated `vkcube` runs on `lordnikon`
+-- neither is a Vulkan validation-layer finding, which is exactly why they're recorded
+separately here as their own lesson, not folded into the list above.
+
+**Real, live undefined behavior in `NeuralForgeInstanceHooks::create_device`**, present
+in every run (including every "successful" one) until `scripts/smoke-test.sh` happened
+to be run again after the two bugs above: `std::slice::from_raw_parts(create_info.pp_enabled_extension_names,
+create_info.enabled_extension_count as usize)` when `enabled_extension_count == 0` --
+`vkcube` on this exact machine legitimately leaves `pp_enabled_extension_names` null in
+that case (a valid, spec-permitted pattern; Vulkan's own C convention treats
+null-plus-zero as "no extensions", same as an empty array), but `slice::from_raw_parts`
+requires a non-null, aligned pointer *even for a zero-length slice* -- a real, if
+narrow, gap between C and Rust's aliasing/pointer conventions. Debug builds' optional
+UB checker caught it as a hard abort; every earlier *release*-mode `vkcube` run on
+`lordnikon` this session had the identical UB and simply didn't visibly crash, which is
+worse, not better -- undefined behavior having no visible symptom yet is not the same
+as it being safe. Fixed by checking `enabled_extension_count == 0` and using `&[]`
+before ever dereferencing the pointer, rather than trusting it's non-null because the
+length says zero.
+
+**`vk::ExtExternalMemoryHostFn::load(...)` panics if the function it's asked to
+resolve doesn't load** -- found live on `lordnikon`: a real `vkcube` run where
+`external_memory_host: true` at device creation (the extension genuinely enabled) still
+hit `Unable to load get_memory_host_pointer_properties_ext` and aborted the whole
+process, inside `build_imported_capture_buffer`. The extension being enabled at device
+creation does not guarantee every one of its functions resolves via
+`vkGetDeviceProcAddr` in every context -- this project doesn't know the exact reason
+(plausibly something about this layer's own loader-dispatch machinery, plausibly a
+driver quirk; not investigated further since the fix doesn't depend on knowing), but a
+resolution failure has to be a normal, fail-open "don't import" outcome for a module
+whose entire design philosophy is exactly that, not an abort. Both the layer's and the
+helper's `build_imported_*` functions now resolve `vkGetMemoryHostPointerPropertiesEXT`
+by hand via `get_device_proc_addr` (returns `Option`, checked explicitly) instead of
+the panicking `::load()` helper. `crates/layer/src/optical_flow.rs`'s own
+`NvOpticalFlowFn::load(...)` uses the identical panicking pattern and was not touched --
+worth the same fix if `VK_NV_optical_flow` is ever seen behaving the same way live.
+
+**The lesson, not just the fixes**: "passed every test, validated clean on real
+hardware multiple times" was true and still missed two bugs that only a *different*
+kind of exercise (a debug-mode UB check; a code path validation layers don't cover at
+all, since neither VUID nor SYNC-HAZARD checking has anything to say about a Rust
+panic) caught. Re-run `scripts/smoke-test.sh` specifically (not just `cargo test` or a
+validated `vkcube` run) after touching anything in this file going forward.
+
 ## Validation
 
-Real hardware, `lordnikon`, RTX 5070, driver 615.71.09, both via `vkcube` and via a
-dedicated test copied to and run directly against the real driver:
+Real hardware, `lordnikon`, RTX 5070, driver 615.71.09, both via `vkcube` and via
+dedicated tests copied to and run directly against the real driver -- all of the
+following are *after* the two real-hardware VUID fixes and the two crash fixes above,
+not before:
 
+- `scripts/smoke-test.sh` (the one that caught the null-pointer UB) and the full
+  `cargo test` workspace suite: clean.
 - `vkcube` at 1280x720 and 2560x1440 (GTA's real render resolution) under
   `VK_LAYER_KHRONOS_validation:VK_LAYER_neuralforge_neural` with `VK_LAYER_VALIDATE_SYNC=1`:
-  both logged `external_memory_host: true`, zero validation errors or hazards, capture
-  pipeline throughput unregressed (474 layer frames in 20s at 2560x1440). This only
-  exercises device creation, not `DirectCapture` itself -- `vkcube` never triggers the
-  render tap (see `HARDWARE_VALIDATION.md`), same limitation as Phase 2.
-- `capture::tests::direct_capture_writes_straight_into_imported_host_memory` (new):
+  `external_memory_host: true`, `pass_through=false` (this layer's own capture *is*
+  admitted for `vkcube`'s own swapchain -- earlier sessions' "capture never engages for
+  `vkcube`" was about the render tap specifically, GTA's own capture route, not a
+  blanket statement; `vkcube`'s surface does expose what plain swapchain capture
+  needs), zero validation errors or hazards, no crash across multiple runs including
+  one with a real helper attached.
+- `capture::tests::direct_capture_writes_straight_into_imported_host_memory` (layer):
   builds a device with the extension actually enabled, fills a source image with a
   known, checkable color, captures it through `DirectCapture` into a real `mmap`'d
   host region, and asserts every captured byte matches the source exactly. Passes
-  locally (this dev machine's software ICD also supports the extension, useful bonus
-  coverage) and on `lordnikon` under full synchronization validation -- the two real
-  bugs above were found and fixed via this exact test, on this exact hardware.
+  locally (this dev machine's software ICD also supports the extension) and on
+  `lordnikon` under full synchronization validation.
+- `scripts/protocol/examples/trigger_helper_roundtrip.rs` (new -- see its own doc
+  comment) drove real request/response round trips against a real, running helper on
+  `lordnikon` outside of any game: `[frame] 64x64 resources: imported_proxy=true
+  imported_answer=true` confirmed the helper-side import succeeds on real Wine +
+  Proton-CachyOS + the real NVIDIA driver, no crash across dozens of repeated round
+  trips. `EvaluateFeature` itself did not produce a real answer for this synthetic
+  garbage-pixel input (the round trip fails open and echoes the proxy through,
+  confirmed via `helper_eval_ms` staying `0`) -- checked against the pre-Phase-3
+  helper build too, which fails identically on the same synthetic input, so this is a
+  pre-existing characteristic of feeding `EvaluateFeature` synthetic data, not
+  something this phase's transport changes caused. Real pixel data (a real game frame)
+  was not tested this way.
 
-**Not yet validated**: a device where the extension genuinely isn't available (both
-tested drivers have it, so the `Unhandled`/fallback branches are reviewed, not
-exercised live); GTA itself, which needs a real session and is the only way to measure
-whether this actually moves layer fps toward upstream's ~74/s on `lordnikon`.
-
-## Not done yet
-
-This commit only adds the *mechanism* for getting the extension enabled. The capture
-pipeline (`CapturePipeline`/`CaptureBuffer` in `capture.rs`) still always allocates its
-own staging memory and copies through it -- `State::external_memory_host` is threaded
-through but not yet read anywhere. Actually importing the SHM proxy/answer regions as
-device memory (querying `minImportedHostPointerAlignment`, aligning the mapping layout
-to it, building `CaptureBuffer` from an imported host pointer when available, falling
-back to the current allocation when not) is the next step.
+**Not yet validated**: a device where the extension genuinely isn't available (every
+driver tested this session has it, so the `Unhandled`/fallback branches are reviewed,
+not exercised live); a real answer from `EvaluateFeature` actually using the imported
+buffers (blocked on the synthetic-input limitation above, needs a real game frame);
+GTA itself, which needs a real session and is the only way to measure whether this
+actually moves layer fps toward upstream's ~74/s on `lordnikon`.

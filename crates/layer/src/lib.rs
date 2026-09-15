@@ -175,11 +175,21 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
         let Some(instance) = CURRENT_INSTANCE.lock().unwrap().clone() else {
             return LayerResult::Unhandled;
         };
-        // SAFETY: `create_info` is the framework's own, valid for this call;
-        // `pp_enabled_extension_names` is a valid array of `enabled_extension_count`
-        // C strings per its own contract as a `VkDeviceCreateInfo`.
-        let requested = unsafe {
-            std::slice::from_raw_parts(create_info.pp_enabled_extension_names, create_info.enabled_extension_count as usize)
+        // A `VkDeviceCreateInfo` requesting zero extensions may legitimately leave
+        // `pp_enabled_extension_names` null (confirmed live: `vkcube` does exactly
+        // this) -- `slice::from_raw_parts` requires a non-null pointer even for a
+        // zero-length slice, unlike C's own more permissive "null + 0 means empty"
+        // convention, so this has to be checked before it's ever dereferenced. Found
+        // via `scripts/smoke-test.sh`'s debug-mode UB check aborting the process --
+        // real, live UB in every release-mode run before this fix too, just silent.
+        let requested: &[*const std::ffi::c_char] = if create_info.enabled_extension_count == 0 {
+            &[]
+        } else {
+            // SAFETY: `create_info` is the framework's own, valid for this call;
+            // `pp_enabled_extension_names` is a valid, non-null array of
+            // `enabled_extension_count` C strings per its own contract as a
+            // `VkDeviceCreateInfo`, `enabled_extension_count` just confirmed > 0.
+            unsafe { std::slice::from_raw_parts(create_info.pp_enabled_extension_names, create_info.enabled_extension_count as usize) }
         };
         // SAFETY: every element of `requested` is a valid, NUL-terminated C string for
         // the same reason as the slice itself.

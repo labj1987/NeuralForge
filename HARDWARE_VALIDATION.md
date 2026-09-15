@@ -311,3 +311,51 @@ ignored) stayed green on `lordnikon` throughout.
 toward upstream's ~74/s on `lordnikon` -- is still unmeasured; `DirectCapture` itself
 has never run against a real game, only a synthetic single-frame test and (indirectly,
 for device creation only) `vkcube`.
+
+## 2026-09-15 (later still) -- Phase 3 step 3: helper-side import, and two real crashes
+## found only after everything above had already validated clean
+
+See `EXTERNAL_MEMORY_HOST_DESIGN.md` for the full account. Summary:
+
+- Added the helper-side half of the zero-copy import (`FrameResources::imported_proxy`/
+  `imported_answer` in `crates/helper/src/frame.rs`) -- confirmed live on `lordnikon`
+  via a new tool (`crates/protocol/examples/trigger_helper_roundtrip.rs`) that drives a
+  real request/response round trip against a real, running helper with no game
+  involved: `imported_proxy=true imported_answer=true`, no crash across dozens of
+  round trips. `EvaluateFeature` itself did not produce a real (non-echoed) answer for
+  synthetic garbage pixel input -- confirmed as pre-existing by testing the identical
+  input against the pre-Phase-3 helper build, which fails the same way.
+- **Found two real, live bugs after the above already looked done** -- both survived a
+  clean `cargo test` and multiple already-validated `vkcube` runs:
+  1. Real undefined behavior in `NeuralForgeInstanceHooks::create_device`: calling
+     `slice::from_raw_parts` on `pp_enabled_extension_names` without checking
+     `enabled_extension_count == 0` first, which `vkcube` on this exact machine hits
+     live (a null pointer is a legal C convention for "zero extensions" that Rust's
+     `from_raw_parts` does not tolerate even at length zero). Caught by
+     `scripts/smoke-test.sh`'s debug-mode UB checker aborting the process -- every
+     earlier *release*-mode `vkcube` validation run this whole session had the
+     identical UB and simply never visibly crashed, which is a worse outcome than a
+     visible one, not a better one.
+  2. `vk::ExtExternalMemoryHostFn::load(...)` panics (not gracefully fails) if the one
+     function it's asked to resolve doesn't load -- hit live on `lordnikon`, inside
+     `build_imported_capture_buffer`, on a device that had `external_memory_host: true`
+     at creation. Fixed in both the layer and the helper by resolving
+     `vkGetMemoryHostPointerPropertiesEXT` by hand via `get_device_proc_addr` (a real
+     `Option`, checked explicitly) instead of the panicking `::load()` helper.
+- Re-validated everything after both fixes: `scripts/smoke-test.sh`, the full
+  `cargo test` workspace suite, and `vkcube` at 1280x720/2560x1440 under
+  `VK_LAYER_KHRONOS_validation` + `VK_LAYER_VALIDATE_SYNC=1` (including one run with a
+  real helper attached) -- all clean, no crash, zero validation errors or hazards.
+  Also confirmed, while re-validating: `vkcube`'s own swapchain *is* admitted for this
+  layer's plain (non-render-tap) capture path (`pass_through=false`) -- the earlier
+  "capture never engages for `vkcube`" notes in this file were specifically about the
+  render tap (GTA's own route), not a blanket statement; worth remembering next time a
+  session reaches for that assumption.
+
+**The lesson worth carrying forward, not just the two fixes**: "passed every test,
+validated clean on real hardware multiple times" was true at the time and still missed
+two real bugs, because neither Rust panics from a third-party crate's own internal
+`::load()` helper nor a plain null-pointer UB gap are things Vulkan validation layers
+or `cargo test` check for. Re-run `scripts/smoke-test.sh` specifically after touching
+device-creation-adjacent code, not just a validated `vkcube` session -- it is the one
+check in this project that catches this exact class of bug.

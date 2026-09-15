@@ -1114,16 +1114,34 @@ unsafe fn build_imported_capture_buffer(
 
     // Imported host memory has its own compatibility query -- separate from (and not
     // necessarily the same memory-type set as) `build_capture_buffer`'s own
-    // HOST_VISIBLE|HOST_COHERENT search for a fresh allocation.
-    // SAFETY: `instance`/`device` are live for the duration of this call.
-    let ext_fn = unsafe {
-        vk::ExtExternalMemoryHostFn::load(|name| std::mem::transmute(instance.get_device_proc_addr(device.handle(), name.as_ptr())))
+    // HOST_VISIBLE|HOST_COHERENT search for a fresh allocation. Resolved by hand
+    // (never `vk::ExtExternalMemoryHostFn::load`, which *panics* if the function
+    // doesn't resolve -- found live, on real hardware: `vkEnumerateDeviceExtensionProperties`
+    // and device creation both reporting the extension present does not guarantee
+    // `vkGetDeviceProcAddr` resolves every one of its functions in this layered
+    // context, and this whole module's fail-open discipline requires that to be a
+    // normal "don't import" outcome, not an abort).
+    // SAFETY: `device` is live; `name` is a valid, NUL-terminated C string.
+    let get_memory_host_pointer_properties_ext = unsafe {
+        instance.get_device_proc_addr(device.handle(), c"vkGetMemoryHostPointerPropertiesEXT".as_ptr())
     };
+    let Some(get_memory_host_pointer_properties_ext) = get_memory_host_pointer_properties_ext else {
+        // SAFETY: neither `fence` nor `pool` owns any other resource yet.
+        unsafe {
+            device.destroy_fence(fence, None);
+            device.destroy_command_pool(pool, None);
+        }
+        return None;
+    };
+    // SAFETY: a non-null `vkGetDeviceProcAddr(device, "vkGetMemoryHostPointerPropertiesEXT")`
+    // result is guaranteed by the Vulkan spec to have this exact signature.
+    let get_memory_host_pointer_properties_ext: vk::PFN_vkGetMemoryHostPointerPropertiesEXT =
+        unsafe { std::mem::transmute(get_memory_host_pointer_properties_ext) };
     let mut host_props = vk::MemoryHostPointerPropertiesEXT::default();
     // SAFETY: `device` is live; `host_ptr` is valid for `bytes` bytes per this
     // function's own contract.
     let query_result = unsafe {
-        (ext_fn.get_memory_host_pointer_properties_ext)(
+        get_memory_host_pointer_properties_ext(
             device.handle(),
             vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT,
             host_ptr.cast(),

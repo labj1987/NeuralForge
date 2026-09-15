@@ -125,6 +125,10 @@ fn main() {
                 shm.read_motion(&mut motion);
             }
             let motion_scale = neuralforge_protocol::motion::scales(hdr.frame_mvec_scale_mode.load(Ordering::Relaxed),width,height);
+            // Fixed addresses/capacity regardless of this frame's own width/height --
+            // `FrameResources::new` decides for itself (per its own doc comment)
+            // whether they're actually importable.
+            let (proxy_region, answer_region) = shm.proxy_and_answer_regions();
 
             let model_requested = hdr.neural_enabled()
                 && hdr.apply_model.load(Ordering::Relaxed) != 0;
@@ -143,6 +147,7 @@ fn main() {
                 }
                 frame_resources = frame::FrameResources::new(
                     &device, &instance, physical_device, 0, width, height, proxy_format,
+                    proxy_region, answer_region,
                 );
                 neuralforge_helper::log!(
                     "[helper] prewarmed {}x{} frame resources: {}",
@@ -174,7 +179,7 @@ fn main() {
                         if let Some(old) = frame_resources.take() {
                             unsafe { old.destroy(&device) };
                         }
-                        frame_resources = frame::FrameResources::new(&device, &instance, physical_device, 0, width, height, proxy_format);
+                        frame_resources = frame::FrameResources::new(&device, &instance, physical_device, 0, width, height, proxy_format, proxy_region, answer_region);
                     }
                     let f = frame_resources.as_ref()?;
                     let (Some(eval_fn), params) = (snippet.evaluate_feature_fn(), snippet.params()) else { return None };

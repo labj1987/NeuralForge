@@ -57,10 +57,23 @@ pub struct FrameResources {
 
     /// Host-visible staging, sized to the larger of upload (Color/MVec) or download
     /// (Output) -- one buffer, reused sequentially, same simplification
-    /// `neuralforge_layer::capture` makes for its own single staging buffer.
+    /// `neuralforge_layer::capture` makes for its own single staging buffer. Still used
+    /// for MVec/Depth always, and for Color/Output too whenever `imported_proxy`/
+    /// `imported_answer` below aren't available.
     staging_buffer: vk::Buffer,
     staging_memory: vk::DeviceMemory,
     staging_ptr: *mut u8,
+
+    /// `VK_EXT_external_memory_host` imports of the SHM proxy/answer regions
+    /// (`EXTERNAL_MEMORY_HOST_DESIGN.md`'s helper-side half) -- when present,
+    /// `run_transfer` copies Color directly from `imported_proxy`'s buffer and Output
+    /// directly into `imported_answer`'s, skipping the staging-buffer CPU copies
+    /// `evaluate` would otherwise do for those two. `None` (the common fallback, e.g.
+    /// the mapping didn't land aligned, or the device lacks the extension) just means
+    /// this instance uses the staging path for every resource, same as before this
+    /// existed.
+    imported_proxy: Option<(vk::Buffer, vk::DeviceMemory)>,
+    imported_answer: Option<(vk::Buffer, vk::DeviceMemory)>,
 
     /// Whether `evaluate` has run at least once yet -- see `DLSSNR.Reset`'s own
     /// handling in `evaluate` for why this matters. `Cell`, not a plain `bool`:
@@ -98,6 +111,101 @@ const DEPTH_FORMAT: vk::Format = vk::Format::R32_SFLOAT;
 
 fn find_memory_type(props: &vk::PhysicalDeviceMemoryProperties, type_bits: u32, wanted: vk::MemoryPropertyFlags) -> Option<u32> {
     (0..props.memory_type_count).find(|&i| (type_bits & (1 << i)) != 0 && props.memory_types[i as usize].property_flags.contains(wanted))
+}
+
+/// Mirrors `neuralforge_layer::capture`'s own function of the same name -- see
+/// `EXTERNAL_MEMORY_HOST_DESIGN.md` for why this needs checking on *this* device too,
+/// not assumed from the Linux side's own query.
+fn min_imported_host_pointer_alignment(instance: &ash::Instance, physical_device: vk::PhysicalDevice) -> Option<vk::DeviceSize> {
+    let mut ext_props = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
+    let mut props2 = vk::PhysicalDeviceProperties2::builder().push_next(&mut ext_props);
+    // SAFETY: `physical_device` belongs to `instance`; `props2` is a freshly built,
+    // valid out-parameter with the EXT struct chained into its `pNext`.
+    unsafe { instance.get_physical_device_properties2(physical_device, &mut props2) };
+    (ext_props.min_imported_host_pointer_alignment > 0).then_some(ext_props.min_imported_host_pointer_alignment)
+}
+
+/// Imports `host_ptr`/`bytes` (the live SHM proxy or answer region) as a
+/// `TRANSFER_SRC | TRANSFER_DST` buffer -- `None` on any failure, including the
+/// device simply not exporting a compatible memory type for this exact pointer.
+/// Callers already treat `None` as "keep using the staging path for this resource",
+/// the same fail-open discipline `neuralforge_layer::capture`'s own import helper uses.
+///
+/// # Safety
+/// `host_ptr` must be valid for `bytes` bytes, already aligned/sized to whatever
+/// `min_imported_host_pointer_alignment` the caller queried, and must remain valid and
+/// exclusively accessed by this buffer's own commands for as long as the returned
+/// handles exist.
+unsafe fn build_imported_buffer(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, host_ptr: *mut u8, bytes: vk::DeviceSize) -> Option<(vk::Buffer, vk::DeviceMemory)> {
+    // Imported host memory has its own compatibility query, separate from (and not
+    // necessarily the same memory-type set as) the plain HOST_VISIBLE|HOST_COHERENT
+    // search `FrameResources::new`'s own staging buffer already does. Resolved by
+    // hand (never `vk::ExtExternalMemoryHostFn::load`, which *panics* if the function
+    // doesn't resolve -- see `neuralforge_layer::capture::build_imported_capture_buffer`'s
+    // identical fix, found the same way, live on real hardware).
+    // SAFETY: `device` is live; the name is a valid, NUL-terminated C string.
+    let get_memory_host_pointer_properties_ext = unsafe { instance.get_device_proc_addr(device.handle(), c"vkGetMemoryHostPointerPropertiesEXT".as_ptr()) }?;
+    // SAFETY: a non-null `vkGetDeviceProcAddr(device, "vkGetMemoryHostPointerPropertiesEXT")`
+    // result is guaranteed by the Vulkan spec to have this exact signature.
+    let get_memory_host_pointer_properties_ext: vk::PFN_vkGetMemoryHostPointerPropertiesEXT = unsafe { std::mem::transmute(get_memory_host_pointer_properties_ext) };
+    let mut host_props = vk::MemoryHostPointerPropertiesEXT::default();
+    // SAFETY: `device` is live; `host_ptr` is valid for `bytes` bytes per this
+    // function's own contract.
+    let query_result = unsafe {
+        get_memory_host_pointer_properties_ext(device.handle(), vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT, host_ptr.cast(), &mut host_props)
+    };
+    if query_result != vk::Result::SUCCESS {
+        return None;
+    }
+
+    // A buffer that will be bound to imported memory must declare that handle type up
+    // front (VUID-vkBindBufferMemory-memory-02985) -- see
+    // EXTERNAL_MEMORY_HOST_DESIGN.md for where this was first found missing, on the
+    // Linux side, via real-hardware validation.
+    let mut external_info = vk::ExternalMemoryBufferCreateInfo::builder().handle_types(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
+    let buf_info = vk::BufferCreateInfo::builder()
+        .size(bytes)
+        .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .push_next(&mut external_info);
+    // SAFETY: `buf_info` is valid.
+    let buffer = unsafe { device.create_buffer(&buf_info, None) }.ok()?;
+    // SAFETY: `buffer` was just created and is not yet bound to memory.
+    let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
+    // SAFETY: `physical_device` is the device this buffer serves; `instance` is its
+    // owning instance.
+    let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+    let wanted = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+    let compatible = reqs.memory_type_bits & host_props.memory_type_bits;
+    let Some(type_index) = find_memory_type(&mem_props, compatible, wanted) else {
+        // SAFETY: `buffer` has no memory bound yet.
+        unsafe { device.destroy_buffer(buffer, None) };
+        return None;
+    };
+
+    let mut import_info = vk::ImportMemoryHostPointerInfoEXT::builder().handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT).host_pointer(host_ptr.cast());
+    let alloc = vk::MemoryAllocateInfo::builder().allocation_size(bytes).memory_type_index(type_index).push_next(&mut import_info);
+    // SAFETY: `alloc` is valid; `type_index` was just confirmed to satisfy both `reqs`
+    // and `host_props`; `host_ptr`/`bytes` satisfy this function's own safety contract.
+    let memory = match unsafe { device.allocate_memory(&alloc, None) } {
+        Ok(m) => m,
+        Err(_) => {
+            // SAFETY: `buffer` has no memory bound yet.
+            unsafe { device.destroy_buffer(buffer, None) };
+            return None;
+        }
+    };
+    // SAFETY: `buffer`/`memory` were each just created above, sized/typed to satisfy
+    // each other by construction.
+    if unsafe { device.bind_buffer_memory(buffer, memory, 0) }.is_err() {
+        // SAFETY: neither is aliased anywhere else yet.
+        unsafe {
+            device.free_memory(memory, None);
+            device.destroy_buffer(buffer, None);
+        }
+        return None;
+    }
+    Some((buffer, memory))
 }
 
 fn create_image(
@@ -173,6 +281,7 @@ impl FrameResources {
     /// Builds every resource `EvaluateFeature` needs for a `width`x`height` frame.
     /// `None` on any failure -- callers treat that as "skip evaluate this frame",
     /// mirroring `neuralforge_layer::capture`'s own fail-open discipline.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &ash::Device,
         instance: &ash::Instance,
@@ -181,6 +290,8 @@ impl FrameResources {
         width: u32,
         height: u32,
         proxy_format: u32,
+        proxy_region: (*mut u8, usize),
+        answer_region: (*mut u8, usize),
     ) -> Option<Self> {
         let color_format = color_format(proxy_format)?;
         // SAFETY: `physical_device` is the device everything below is built against.
@@ -256,6 +367,37 @@ impl FrameResources {
         // always in bounds.
         let staging_ptr = unsafe { device.map_memory(staging_memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }.ok()?.cast::<u8>();
 
+        // Try importing the live SHM proxy/answer regions as device memory
+        // (`VK_EXT_external_memory_host`) -- `run_transfer` uses these directly
+        // instead of the staging buffer above when available. Checked against the
+        // *actual* runtime pointer, not just assumed: `shm::open`'s own aligned-mapping
+        // attempt can fall back to an unaligned view, and this device might lack the
+        // extension `WANTED_DEVICE_EXTENSIONS` only *requests*, never guarantees.
+        let alignment = min_imported_host_pointer_alignment(instance, physical_device);
+        let try_import = |region: (*mut u8, usize)| {
+            let (ptr, capacity) = region;
+            let alignment = alignment?;
+            if ptr.is_null() || capacity == 0 || (ptr as usize) % alignment as usize != 0 || capacity as u64 % alignment != 0 {
+                return None;
+            }
+            // SAFETY: `ptr`/`capacity` describe a live SHM region for as long as this
+            // process's own mapping stays open (the life of the process); nothing else
+            // writes to the proxy region while a request is outstanding, and nothing
+            // else writes to the answer region except this same buffer's own download
+            // copy -- the single-reader/single-writer discipline the wire protocol's
+            // "one outstanding request at a time" rule already guarantees, the same
+            // reasoning `neuralforge_layer::capture::DirectCapture` relies on for its own
+            // single slot.
+            unsafe { build_imported_buffer(device, instance, physical_device, ptr, capacity as vk::DeviceSize) }
+        };
+        let imported_proxy = try_import(proxy_region);
+        let imported_answer = try_import(answer_region);
+        crate::log!(
+            "[frame] {width}x{height} resources: imported_proxy={} imported_answer={}",
+            imported_proxy.is_some(),
+            imported_answer.is_some()
+        );
+
         Some(Self {
             color_format,
             width,
@@ -279,6 +421,8 @@ impl FrameResources {
             staging_buffer,
             staging_memory,
             staging_ptr,
+            imported_proxy,
+            imported_answer,
             reset_done: std::cell::Cell::new(false),
         })
     }
@@ -311,10 +455,15 @@ impl FrameResources {
             return None;
         }
 
-        // Stage 1: upload proxy -> Color and motion -> MVec.
-        // SAFETY: `staging_ptr` is a live mapping of at least `pixel_count * 4` bytes
-        // (this type's own construction sized it to exactly that).
-        unsafe { std::ptr::copy_nonoverlapping(proxy.as_ptr(), self.staging_ptr, pixel_count * 4) };
+        // Stage 1: upload proxy -> Color and motion -> MVec. Skipped for proxy when
+        // `imported_proxy` is set: `proxy` is already a view into the exact memory
+        // that buffer is imported from (`ShmMapping::frame_regions`/`proxy_and_answer_regions`
+        // share the same base), so `run_transfer` below reads directly from it instead.
+        if self.imported_proxy.is_none() {
+            // SAFETY: `staging_ptr` is a live mapping of at least `pixel_count * 4`
+            // bytes (this type's own construction sized it to exactly that).
+            unsafe { std::ptr::copy_nonoverlapping(proxy.as_ptr(), self.staging_ptr, pixel_count * 4) };
+        }
         unsafe {
             let dst = self.staging_ptr.add(pixel_count * 4);
             if motion.len() == pixel_count * 4 { std::ptr::copy_nonoverlapping(motion.as_ptr(),dst,motion.len()); }
@@ -420,8 +569,12 @@ impl FrameResources {
             t_download,
             t_upload + t_eval + t_download
         );
-        // SAFETY: `staging_ptr` is a live mapping of at least `pixel_count * 4` bytes.
-        unsafe { std::ptr::copy_nonoverlapping(self.staging_ptr, answer_out.as_mut_ptr(), pixel_count * 4) };
+        // Skipped when `imported_answer` is set: `run_transfer`'s download copy just
+        // wrote Output directly into the exact memory `answer_out` is a view of.
+        if self.imported_answer.is_none() {
+            // SAFETY: `staging_ptr` is a live mapping of at least `pixel_count * 4` bytes.
+            unsafe { std::ptr::copy_nonoverlapping(self.staging_ptr, answer_out.as_mut_ptr(), pixel_count * 4) };
+        }
         Some(FrameTiming {
             upload: t_upload,
             evaluate: t_eval,
@@ -554,9 +707,14 @@ impl FrameResources {
                         &[],
                         &[to_dst_color, to_dst_mvec, to_dst_depth],
                     );
+                    // `imported_proxy`, when set, is the live SHM proxy region itself
+                    // (see `FrameResources::new`) -- reading Color straight from it
+                    // instead of `staging_buffer` is exactly what skipping `evaluate`'s
+                    // own `proxy -> staging_ptr` copy above requires.
+                    let color_src = self.imported_proxy.map_or(self.staging_buffer, |(buffer, _)| buffer);
                     device.cmd_copy_buffer_to_image(
                         self.cmd,
-                        self.staging_buffer,
+                        color_src,
                         self.color_image,
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                         &[region(self.width, self.height)],
@@ -637,11 +795,16 @@ impl FrameResources {
                         &[],
                         &[to_src],
                     );
+                    // `imported_answer`, when set, is the live SHM answer region itself
+                    // -- writing Output straight into it is exactly what skipping
+                    // `evaluate`'s own `staging_ptr -> answer_out` copy afterward
+                    // requires.
+                    let answer_dst = self.imported_answer.map_or(self.staging_buffer, |(buffer, _)| buffer);
                     device.cmd_copy_image_to_buffer(
                         self.cmd,
                         self.output_image,
                         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                        self.staging_buffer,
+                        answer_dst,
                         &[region(self.width, self.height)],
                     );
                 }
@@ -673,6 +836,14 @@ impl FrameResources {
             device.destroy_fence(self.fence, None);
             device.destroy_buffer(self.staging_buffer, None);
             device.free_memory(self.staging_memory, None);
+            if let Some((buffer, memory)) = self.imported_proxy {
+                device.destroy_buffer(buffer, None);
+                device.free_memory(memory, None);
+            }
+            if let Some((buffer, memory)) = self.imported_answer {
+                device.destroy_buffer(buffer, None);
+                device.free_memory(memory, None);
+            }
             device.destroy_image_view(self.color_view, None);
             device.destroy_image(self.color_image, None);
             device.free_memory(self.color_memory, None);
@@ -708,7 +879,10 @@ enum TransferKind {
         let q = [vk::DeviceQueueCreateInfo::builder().queue_family_index(0).queue_priorities(&[1.0]).build()];
         let device = unsafe {instance.create_device(pd,&vk::DeviceCreateInfo::builder().queue_create_infos(&q),None)}.unwrap();
         for format in [proxy_format::RGBA8,proxy_format::BGRA8] {
-            let f = FrameResources::new(&device,&instance,pd,0,512,512,format).expect("real Color/Output/MVec resources");
+            // No real SHM mapping in this manual test -- null/zero-length regions,
+            // which `try_import` inside `new` safely declines (falling back to the
+            // staging path) rather than dereferencing.
+            let f = FrameResources::new(&device,&instance,pd,0,512,512,format,(std::ptr::null_mut(),0),(std::ptr::null_mut(),0)).expect("real Color/Output/MVec resources");
             assert!(f.matches(0,512,512,format));
             assert!(!f.matches(0,512,512,if format == proxy_format::RGBA8 {proxy_format::BGRA8} else {proxy_format::RGBA8}));
             assert!(!f.matches(0,256,512,format));

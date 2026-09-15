@@ -74,6 +74,21 @@
   neither caught by this project's local software Vulkan ICD. Both fixed; the test now
   passes on both, on `lordnikon` under full synchronization validation. GTA fps still
   unmeasured -- the real payoff of this phase needs a live session.
+- Add the helper-side half of the zero-copy import (`FrameResources::imported_proxy`/
+  `imported_answer`, see `EXTERNAL_MEMORY_HOST_DESIGN.md`): `EvaluateFeature`'s
+  Color/Output now read from and write to the live SHM regions directly when the
+  device extension is available, no staging-buffer copy either direction. Confirmed
+  live on `lordnikon` via a new `trigger_helper_roundtrip` tool that drives a real
+  request/response round trip with no game involved.
+- **Fixed two real, live bugs found only after everything above had already validated
+  clean** (see `HARDWARE_VALIDATION.md`'s own account): real undefined behavior in the
+  device-extension-injection hook (`slice::from_raw_parts` on a pointer that's
+  legitimately null when zero extensions are requested -- every earlier release-mode
+  `vkcube` validation run this session had this same UB and simply never visibly
+  crashed), and a real crash from `vk::ExtExternalMemoryHostFn::load(...)` panicking
+  instead of failing open when a function doesn't resolve. Neither was caught by
+  Vulkan validation layers or `cargo test` -- only `scripts/smoke-test.sh`'s
+  debug-mode UB checker and a live `vkcube` crash surfaced them.
 
 ## Historical releases before the NeuralForge rename
 

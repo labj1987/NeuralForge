@@ -225,6 +225,18 @@ impl ShmMapping {
         }
     }
 
+    /// The proxy and answer regions' own addresses and capacity within this process's
+    /// mapping -- for `frame::FrameResources`'s own `VK_EXT_external_memory_host`
+    /// import (see its module doc comment), the only legitimate reason anything
+    /// outside this module needs these addresses at all; every other caller already
+    /// goes through [`Self::read_proxy`]/[`Self::write_answer`]/[`Self::frame_regions`].
+    pub fn proxy_and_answer_regions(&self) -> ((*mut u8, usize), (*mut u8, usize)) {
+        let base = self.pixel_base();
+        // SAFETY: both stay within the `shm_total_bytes()` mapping `open` established,
+        // same reasoning as `frame_regions`' own pointer arithmetic.
+        unsafe { ((base.add(proxy_offset()), MAX_FRAME), (base.add(answer_offset()), MAX_FRAME)) }
+    }
+
     /// Returns disjoint views of this request's proxy and answer regions.  The helper
     /// owns each request from observing `seq_req` until publishing `seq_resp`, so it
     /// can write the answer directly into shared memory instead of copying through a
