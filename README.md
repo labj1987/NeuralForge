@@ -13,11 +13,6 @@ see [Legal](#legal) before you use it.
 
 Repository: [labj1987/NeuralForge](https://github.com/labj1987/NeuralForge).
 
-See [PHASE1.md](PHASE1.md) for coexistence, installation, migration and the benchmark roadmap.
-Current target-machine findings are tracked in [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md).
-NeuralForge's guarded GTA render tap has been validated with the full helper and model;
-its current synchronous host transport is a correctness baseline, not a performance result.
-
 ## Screenshots
 
 | Settings |
@@ -57,18 +52,6 @@ its current synchronous host transport is a correctness baseline, not a performa
   builds don't bundle DXVK-NVAPI, so they aren't a supported runner.
 - NVIDIA's own NGX DLLs, which this project doesn't and can't ship — see below.
 
-## NVIDIA NGX DLLs
-
-`nvngx_dlssnr.dll` is NVIDIA's proprietary model binary and isn't included here. Get it
-from your own NVIDIA driver/SDK install and import it with:
-
-```bash
-neuralforge-cli import-binaries /path/to/dlls
-```
-
-or from the GUI's binaries import flow. Files are copied into
-`$XDG_DATA_HOME/neuralforge/binaries`; restart the helper afterward.
-
 ## Install
 
 Download the AppImage from [Releases](https://github.com/labj1987/NeuralForge/releases):
@@ -86,41 +69,41 @@ python3 scripts/install.py install --appdir build-appimage/AppDir
 ```
 
 The GUI is `neuralforge`; the CLI is `neuralforge-cli`; the Windows helper is
-`neuralforge-helper.exe`. Use `NEURALFORGE_ENABLE=1` to activate the layer. Config,
-data, state, runtime, control mapping and helper prefix use their own `neuralforge`
-locations. Upstream DLSS5VKLayer can remain installed; NeuralForge neither migrates
-ambiguous upstream state nor changes its files, configuration, launch options, helper,
-or runtime. See [PHASE1.md](PHASE1.md) for executable targeting, migration, uninstall
-and the exact GTA baseline.
+`neuralforge-helper.exe`. Config, data, state, runtime, control mapping and helper
+prefix use their own `neuralforge` locations. Upstream DLSS5VKLayer can remain
+installed; NeuralForge neither migrates ambiguous upstream state nor changes its
+files, configuration, launch options, helper, or runtime. See
+[PHASE1.md](PHASE1.md) for executable targeting, migration and uninstall.
 
-## GTA status
+## Usage
 
-On the RTX 5070 target, GTA V Enhanced exposes a swapchain without transfer-source
-usage. NeuralForge therefore does not read the swapchain image. It tracks GTA's own
-render-to-swapchain blit, captures the demonstrated transfer-capable source only
-after its layout has returned to `GENERAL`, restores that layout, and presents through
-the original swapchain. Rockstar Launcher, Social Club, Wine Explorer, Xalia, and
-overlays remain pass-through. The full model and helper remain enabled; the known-good
-baseline uses `NEURALFORGE_DMABUF=0`.
+`nvngx_dlssnr.dll` is NVIDIA's proprietary model binary and isn't included here. Get it
+from your own NVIDIA driver/SDK install and import it with:
 
-Use this Steam launch option for the isolated GTA session:
-
-```text
-NEURALFORGE_ENABLE=1 NEURALFORGE_DMABUF=0 NEURALFORGE_TARGET_EXE=GTA5_Enhanced.exe %command%
+```bash
+neuralforge-cli import-binaries /path/to/dlls
 ```
 
-The target validation uses GTA V Enhanced Steam AppID `3240220`, an RTX 5070 with
-driver `615.71.09`, 2560×1440 at 288 Hz, GNOME scale 100%, passes=1, model
-resolution=1, and motion disabled. The render tap keeps Rockstar Launcher, Social
-Club, Wine Explorer, Xalia, Steam overlay, and other non-target processes pass-through.
+or from the GUI's binaries import flow. Files are copied into
+`$XDG_DATA_HOME/neuralforge/binaries`; restart the helper afterward.
 
-The synchronous host-SHM baseline processed 475 and 474 layer frames in two separate
-61-second GTA intervals: 7.73 and 7.72 layer frames/sec. Those intervals confirm the
-tap works and identify the capture fence wait as the bottleneck. They are not game FPS,
-1%-low metrics, or an upstream comparison because the scene was not controlled. See
-[HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) for the measurements,
-[RENDER_TAP_DESIGN.md](RENDER_TAP_DESIGN.md) for the capture constraints, and
-[ASYNC_CAPTURE_DESIGN.md](ASYNC_CAPTURE_DESIGN.md) for the next bounded pipeline.
+Add `NEURALFORGE_ENABLE=1` (and, for a specific target executable in a multi-process
+game, `NEURALFORGE_TARGET_EXE=<name>.exe`) to a game's Steam launch options to
+activate the layer. GUI and layer share live settings over the same shared-memory
+segment; `neuralforge-cli shmctl status/set/toggle/capture` covers the same controls
+from a terminal.
+
+## Status
+
+Validated on GTA V Enhanced (RTX 5070, driver `615.71.09`): the render tap correctly
+captures GTA's own render target while leaving Rockstar Launcher, Social Club, Wine
+Explorer, Xalia and overlays pass-through, and the full model/helper round-trip runs
+end to end. The current synchronous host-SHM transport is a correctness baseline, not
+a performance result — see [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) for
+measurements, [RENDER_TAP_DESIGN.md](RENDER_TAP_DESIGN.md) for the capture
+constraints, and [ASYNC_CAPTURE_DESIGN.md](ASYNC_CAPTURE_DESIGN.md) and
+[EXTERNAL_MEMORY_HOST_DESIGN.md](EXTERNAL_MEMORY_HOST_DESIGN.md) for the zero-copy
+transport work in progress.
 
 ## Building from source
 

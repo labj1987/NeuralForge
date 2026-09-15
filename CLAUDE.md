@@ -41,4 +41,4 @@ Current target-machine evidence and unresolved Vulkan errors are in
 [Pre-rename development notes](docs/history/development-before-neuralforge.md) retain
 old commands, measured failures and toolchain investigations as historical evidence.
 Those old deployment recipes are not current instructions. The historical GTA handoff
-is [HANDOFF_2026-09-12.md](HANDOFF_2026-09-12.md).
+is [docs/history/handoff-2026-09-12-fps-freeze-regression.md](docs/history/handoff-2026-09-12-fps-freeze-regression.md).
