@@ -1,0 +1,35 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      # See build-appimage.sh's own comment: it self-installs its apt dependencies
+      # (gtk4/libadwaita dev headers, mingw, zsync) when they're missing, so this
+      # step alone is enough on a from-scratch runner -- CARGO_HELPER picks the
+      # rustup-managed "stable" toolchain dtolnay/rust-toolchain just set up, matching
+      # PHASE1.md's own documented CI-appropriate invocation.
+      - name: Build AppImage
+        run: sudo -E env "PATH=$PATH" CARGO_HELPER='cargo +stable' bash build-appimage.sh
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: NeuralForge-*-x86_64.AppImage*
+          generate_release_notes: true
