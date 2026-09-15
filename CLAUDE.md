@@ -36,6 +36,28 @@ changes. Keep the Rust implementation independent; review licenses before source
 Current target-machine evidence and unresolved Vulkan errors are in
 [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md).
 
+## Deliberately not done
+
+Two items from the completion plan's Phase 6 were considered and intentionally left
+as-is; don't re-raise either without new information:
+
+- **AdwViewSwitcherTitle/Bar, not AdwToolbarView + AdwViewSwitcher + AdwBreakpoint.**
+  The newer widgets need libadwaita 1.4+; this project's own feature flags
+  (`crates/gui/Cargo.toml`, `v1_4`/`v1_5`) already claim that, but whether GitHub
+  Actions' `ubuntu-latest` `libadwaita-1-dev` package actually provides it was never
+  confirmed (see the in-code comment at the header construction in
+  `crates/gui/src/ui.rs`). Revisit only after checking the actual CI-installed
+  libadwaita version, not this dev machine's.
+- **Hotkey capture does not filter non-keyboard evdev devices** (Phase 6 item 6, as
+  literally worded). Investigated 2026-09-15: neither the layer's in-game hotkey
+  polling (`crates/layer/src/hotkey.rs`, X11 `XQueryKeymap`) nor the GUI's
+  hotkey-capture row (`crates/gui/src/ui.rs`'s `hotkey_row`, GDK key-press events) does
+  raw `/dev/input/eventN` enumeration at all -- both are already inherently
+  keyboard-scoped by construction (`XQueryKeymap` only ever reports keyboard state;
+  GDK key-press events only fire for keyboard input). The item doesn't map onto this
+  architecture without inventing a new raw-evdev capture mechanism neither mechanism
+  currently has any reason to need.
+
 ## Historical evidence
 
 [Pre-rename development notes](docs/history/development-before-neuralforge.md) retain
