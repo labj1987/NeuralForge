@@ -9,7 +9,7 @@
 
 use std::ffi::c_void;
 
-use neuralforge_protocol::{answer_offset, proxy_offset, shm_default_path, shm_total_bytes, MAX_FRAME};
+use neuralforge_protocol::{answer_offset, answer_offset_slot, proxy_offset, proxy_offset_slot, shm_default_path, shm_total_bytes, MAX_FRAME};
 
 #[link(name = "kernel32")]
 extern "system" {
@@ -225,32 +225,36 @@ impl ShmMapping {
         }
     }
 
-    /// The proxy and answer regions' own addresses and capacity within this process's
-    /// mapping -- for `frame::FrameResources`'s own `VK_EXT_external_memory_host`
-    /// import (see its module doc comment), the only legitimate reason anything
-    /// outside this module needs these addresses at all; every other caller already
-    /// goes through [`Self::read_proxy`]/[`Self::write_answer`]/[`Self::frame_regions`].
-    pub fn proxy_and_answer_regions(&self) -> ((*mut u8, usize), (*mut u8, usize)) {
+    /// The given slot's proxy and answer regions' own addresses and capacity within
+    /// this process's mapping -- for `frame::FrameResources`'s own
+    /// `VK_EXT_external_memory_host` import (see its module doc comment), the only
+    /// legitimate reason anything outside this module needs these addresses at all;
+    /// every other caller already goes through
+    /// [`Self::read_proxy`]/[`Self::write_answer`]/[`Self::frame_regions`].
+    pub fn proxy_and_answer_regions(&self, slot: usize) -> ((*mut u8, usize), (*mut u8, usize)) {
         let base = self.pixel_base();
         // SAFETY: both stay within the `shm_total_bytes()` mapping `open` established,
         // same reasoning as `frame_regions`' own pointer arithmetic.
-        unsafe { ((base.add(proxy_offset()), MAX_FRAME), (base.add(answer_offset()), MAX_FRAME)) }
+        unsafe { ((base.add(proxy_offset_slot(slot)), MAX_FRAME), (base.add(answer_offset_slot(slot)), MAX_FRAME)) }
     }
 
-    /// Returns disjoint views of this request's proxy and answer regions.  The helper
-    /// owns each request from observing `seq_req` until publishing `seq_resp`, so it
-    /// can write the answer directly into shared memory instead of copying through a
-    /// second process-local frame buffer.
+    /// Returns disjoint views of this slot's request's proxy and answer regions. The
+    /// helper owns each request from observing that slot's `seq_req` until publishing
+    /// its `seq_resp`, so it can write the answer directly into shared memory instead
+    /// of copying through a second process-local frame buffer. Protocol v3
+    /// (`PROTOCOL_V3_DESIGN.md`) gives slot 0 and slot 1 disjoint regions, so this is
+    /// still sound when the helper is processing both slots, one after another.
     ///
     /// # Safety
-    /// The caller must only use these views while it owns the current request.
-    pub unsafe fn frame_regions(&self, bytes: usize) -> (&[u8], &mut [u8]) {
+    /// The caller must only use these views while it owns the current request on this
+    /// slot.
+    pub unsafe fn frame_regions(&self, slot: usize, bytes: usize) -> (&[u8], &mut [u8]) {
         let n = bytes.min(MAX_FRAME);
         let base = self.pixel_base();
         unsafe {
             (
-                std::slice::from_raw_parts(base.add(proxy_offset()), n),
-                std::slice::from_raw_parts_mut(base.add(answer_offset()), n),
+                std::slice::from_raw_parts(base.add(proxy_offset_slot(slot)), n),
+                std::slice::from_raw_parts_mut(base.add(answer_offset_slot(slot)), n),
             )
         }
     }

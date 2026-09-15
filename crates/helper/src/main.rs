@@ -99,117 +99,36 @@ fn main() {
     neuralforge_helper::log!("[helper] NGX snippet disabled={}", snippet.disabled);
     neuralforge_helper::logging::flush();
 
-    let mut frame_resources: Option<frame::FrameResources> = None;
+    // Protocol v3 (`PROTOCOL_V3_DESIGN.md`): one persistent `FrameResources` per wire
+    // slot, each importing (or staging into) that slot's own disjoint proxy/answer
+    // region -- so slot 1's upload never has to wait on slot 0's own resources being
+    // free. `snippet` (the single NGX feature/model) is deliberately *not*
+    // duplicated -- shared across both calls to `process_request` below, since this
+    // project has no evidence a single reverse-engineered NGX feature handle is safe
+    // to evaluate from two overlapping submissions (see that design doc's own
+    // reasoning). Each slot is still processed to completion, one at a time, before
+    // the other is even checked this same loop tick.
+    let mut frame_resources: [Option<frame::FrameResources>; 2] = [None, None];
     // Resized (not reallocated fresh every frame) to whatever the current frame's
     // real byte count is -- never the full `MAX_FRAME` reservation, which is sized for
     // the protocol's absolute ceiling (7680x4320 float16), not a typical frame.
-    let mut last_seq_req = hdr.seq_req.load(Ordering::Acquire);
+    let mut last_seq_req = [hdr.seq_req.load(Ordering::Acquire), hdr.seq_req_b.load(Ordering::Acquire)];
     let mut frames: u64 = 0;
 
     loop {
         if hdr.quit.load(Ordering::Relaxed) != 0 {
             break;
         }
-        let seq_req = hdr.seq_req.load(Ordering::Acquire);
-        if seq_req != last_seq_req {
-            last_seq_req = seq_req;
-            let width = hdr.width.load(Ordering::Relaxed);
-            let height = hdr.height.load(Ordering::Relaxed);
-            let proxy_format = hdr.proxy_format.load(Ordering::Relaxed);
-            let bytes = (neuralforge_protocol::enums::proxy_format::bytes_per_pixel(proxy_format) * (width as usize) * (height as usize))
-                .min(neuralforge_protocol::MAX_FRAME);
-            let n = bytes;
-            let mut motion = Vec::new();
-            if hdr.frame_mvec_valid.load(Ordering::Relaxed) != 0 {
-                motion.resize((width as usize * height as usize * 4).min(neuralforge_protocol::MAX_FRAME),0);
-                shm.read_motion(&mut motion);
+        for slot in 0..2 {
+            let seq_req = hdr.seq_req_slot(slot).load(Ordering::Acquire);
+            if seq_req == last_seq_req[slot] {
+                continue;
             }
-            let motion_scale = neuralforge_protocol::motion::scales(hdr.frame_mvec_scale_mode.load(Ordering::Relaxed),width,height);
-            // Fixed addresses/capacity regardless of this frame's own width/height --
-            // `FrameResources::new` decides for itself (per its own doc comment)
-            // whether they're actually importable.
-            let (proxy_region, answer_region) = shm.proxy_and_answer_regions();
-
-            let model_requested = hdr.neural_enabled()
-                && hdr.apply_model.load(Ordering::Relaxed) != 0;
-            // Reserve the frame-sized Vulkan images as soon as the layer sees the
-            // game's real swapchain, but do not enter the proprietary NGX runtime
-            // while NR is switched off.  GTA is still bringing up its own GPU work at
-            // that point; calling CreateFeature there has been observed to hang.  The
-            // resource reservation itself is safe, makes later activation possible
-            // even after GTA fills VRAM, and performs no model work or write-back.
-            if !model_requested
-                && neuralforge_protocol::enums::proxy_format::is_8bit(proxy_format)
-                && !frame_resources.as_ref().is_some_and(|f| f.matches(0, width, height, proxy_format))
-            {
-                if let Some(old) = frame_resources.take() {
-                    unsafe { old.destroy(&device) };
-                }
-                frame_resources = frame::FrameResources::new(
-                    &device, &instance, physical_device, 0, width, height, proxy_format,
-                    proxy_region, answer_region,
-                );
-                neuralforge_helper::log!(
-                    "[helper] prewarmed {}x{} frame resources: {}",
-                    width, height, frame_resources.is_some()
-                );
-            }
-            let ready = model_requested && ngx::ensure_feature(&mut snippet, &device, queue, width, height);
-            if ready {
-                hdr.model_up.store(1, Ordering::Relaxed);
-            } else if model_requested && snippet.disabled {
-                // `ensure_feature` only ever disables the snippet after a real,
-                // one-shot `CreateFeature` attempt (see its own doc comment) -- worth
-                // surfacing in status immediately rather than leaving `RUNNING`
-                // displayed forever after the model is permanently unavailable.
-                hdr.helper_state.store(neuralforge_protocol::enums::helper_state::MODEL_FAILED, Ordering::Relaxed);
-            }
-            // SAFETY: this helper exclusively owns the request after observing
-            // `seq_req`; proxy and answer are disjoint fixed regions in the mapping.
-            let (proxy, answer) = unsafe { shm.frame_regions(n) };
-            let timing = if ready
-                && neuralforge_protocol::enums::proxy_format::is_8bit(proxy_format)
-            {
-                (|| {
-                    if !frame_resources.as_ref().is_some_and(|f| f.matches(0, width, height, proxy_format)) {
-                        // SAFETY: any previous resources are no longer referenced by
-                        // in-flight work -- `FrameResources::evaluate` always waits on
-                        // its own fences before returning, so by the time we're back
-                        // here (a later loop iteration) nothing is still submitted.
-                        if let Some(old) = frame_resources.take() {
-                            unsafe { old.destroy(&device) };
-                        }
-                        frame_resources = frame::FrameResources::new(&device, &instance, physical_device, 0, width, height, proxy_format, proxy_region, answer_region);
-                    }
-                    let f = frame_resources.as_ref()?;
-                    let (Some(eval_fn), params) = (snippet.evaluate_feature_fn(), snippet.params()) else { return None };
-                    let tuning = hdr.resolve_pass(0);
-                    f.evaluate(&device, queue, eval_fn, snippet.feature, params, proxy, &motion, motion_scale, hdr.mvec_enabled() && motion.is_empty(), tuning, answer)
-                })()
-            } else {
-                None
-            };
-            let evaluated = timing.is_some();
-            if let Some(timing) = timing {
-                store_ms(&hdr.helper_upload_ms_bits, timing.upload);
-                store_ms(&hdr.helper_eval_ms_bits, timing.evaluate);
-                store_ms(&hdr.helper_readback_ms_bits, timing.download);
-            }
-            if !evaluated {
-                // Fail open: no real answer yet (feature still warming up, wrong
-                // proxy format, or a guarded `EvaluateFeature` failure) -- echo the
-                // proxy straight through so the transport round trip still completes
-                // with *something* rather than stale/all-zero bytes.
-                answer.copy_from_slice(proxy);
-            }
-            hdr.seq_ok.store(seq_req, Ordering::Relaxed);
-            if !helper_delay.is_zero() {
-                std::thread::sleep(helper_delay);
-            }
-            hdr.seq_resp.store(seq_req, Ordering::Release);
-            frames += 1;
-            neuralforge_protocol::store64(&hdr.helper_frames_lo, &hdr.helper_frames_hi, frames);
-            neuralforge_helper::log!("[helper] frame {frames}: {width}x{height} evaluated={evaluated}");
+            last_seq_req[slot] = seq_req;
+            process_request(
+                hdr, &shm, &device, &instance, physical_device, queue, &mut snippet,
+                &mut frame_resources[slot], slot, seq_req, helper_delay, &mut frames,
+            );
         }
         hdr.heartbeat.fetch_add(1, Ordering::Relaxed);
         std::thread::sleep(Duration::from_micros(200));
@@ -217,8 +136,10 @@ fn main() {
 
     // SAFETY: process is tearing down; nothing else can still be submitting work
     // against `frame_resources`'s handles.
-    if let Some(f) = frame_resources {
-        unsafe { f.destroy(&device) };
+    for f in frame_resources {
+        if let Some(f) = f {
+            unsafe { f.destroy(&device) };
+        }
     }
     ngx::teardown(snippet);
     hdr.helper_state.store(neuralforge_protocol::enums::helper_state::STOPPED, Ordering::Relaxed);
@@ -230,6 +151,127 @@ fn main() {
         shm.close();
     }
     drop(entry);
+}
+
+/// Handles one newly-observed request on the given wire slot: reads its width/
+/// height/proxy_format (via the header's own `*_slot` accessors -- see
+/// `PROTOCOL_V3_DESIGN.md`), prewarms or evaluates against `frame_resources` (that
+/// slot's own, independent from the other slot's), and publishes the answer plus
+/// this slot's `seq_resp`. Exactly the per-request body `main`'s loop used to run
+/// inline for the single slot v2 had; pulled out so both slots run the identical
+/// logic instead of a copy that could drift, not because either slot is special.
+///
+/// The motion payload (`frame_mvec_valid`/`frame_mvec_scale_mode`) is deliberately
+/// only ever read for slot 0 -- v3 did not duplicate those fields (see that design
+/// doc's own reasoning: the only code that ever writes them is itself unconditionally
+/// disabled today), so slot 1 always evaluates with empty motion, same as slot 0 does
+/// whenever motion is off. `hdr.seq_ok` is likewise shared, not per-slot: nothing
+/// anywhere in this workspace ever reads it back (confirmed by grep), so there is
+/// nothing to race by having both slots write the same dead field.
+#[allow(clippy::too_many_arguments)]
+fn process_request(
+    hdr: &neuralforge_protocol::ShmHeader,
+    shm: &shm::ShmMapping,
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    queue: vk::Queue,
+    snippet: &mut ngx::NgxSnippet,
+    frame_resources: &mut Option<frame::FrameResources>,
+    slot: usize,
+    seq_req: u32,
+    helper_delay: Duration,
+    frames: &mut u64,
+) {
+    let width = hdr.width_slot(slot).load(Ordering::Relaxed);
+    let height = hdr.height_slot(slot).load(Ordering::Relaxed);
+    let proxy_format = hdr.proxy_format_slot(slot).load(Ordering::Relaxed);
+    let bytes = (neuralforge_protocol::enums::proxy_format::bytes_per_pixel(proxy_format) * (width as usize) * (height as usize))
+        .min(neuralforge_protocol::MAX_FRAME);
+    let n = bytes;
+    let mut motion = Vec::new();
+    if slot == 0 && hdr.frame_mvec_valid.load(Ordering::Relaxed) != 0 {
+        motion.resize((width as usize * height as usize * 4).min(neuralforge_protocol::MAX_FRAME), 0);
+        shm.read_motion(&mut motion);
+    }
+    let motion_scale = neuralforge_protocol::motion::scales(hdr.frame_mvec_scale_mode.load(Ordering::Relaxed), width, height);
+    // Fixed addresses/capacity regardless of this frame's own width/height --
+    // `FrameResources::new` decides for itself (per its own doc comment) whether
+    // they're actually importable.
+    let (proxy_region, answer_region) = shm.proxy_and_answer_regions(slot);
+
+    let model_requested = hdr.neural_enabled() && hdr.apply_model.load(Ordering::Relaxed) != 0;
+    // Reserve the frame-sized Vulkan images as soon as the layer sees the game's real
+    // swapchain, but do not enter the proprietary NGX runtime while NR is switched
+    // off.  GTA is still bringing up its own GPU work at that point; calling
+    // CreateFeature there has been observed to hang.  The resource reservation itself
+    // is safe, makes later activation possible even after GTA fills VRAM, and
+    // performs no model work or write-back.
+    if !model_requested
+        && neuralforge_protocol::enums::proxy_format::is_8bit(proxy_format)
+        && !frame_resources.as_ref().is_some_and(|f| f.matches(0, width, height, proxy_format))
+    {
+        if let Some(old) = frame_resources.take() {
+            unsafe { old.destroy(device) };
+        }
+        *frame_resources = frame::FrameResources::new(device, instance, physical_device, 0, width, height, proxy_format, proxy_region, answer_region);
+        neuralforge_helper::log!("[helper] slot {slot}: prewarmed {}x{} frame resources: {}", width, height, frame_resources.is_some());
+    }
+    let ready = model_requested && ngx::ensure_feature(snippet, device, queue, width, height);
+    if ready {
+        hdr.model_up.store(1, Ordering::Relaxed);
+    } else if model_requested && snippet.disabled {
+        // `ensure_feature` only ever disables the snippet after a real, one-shot
+        // `CreateFeature` attempt (see its own doc comment) -- worth surfacing in
+        // status immediately rather than leaving `RUNNING` displayed forever after
+        // the model is permanently unavailable.
+        hdr.helper_state.store(neuralforge_protocol::enums::helper_state::MODEL_FAILED, Ordering::Relaxed);
+    }
+    // SAFETY: this helper exclusively owns this slot's request after observing its
+    // own `seq_req`; slot 0's and slot 1's regions are disjoint fixed regions in the
+    // mapping (`PROTOCOL_V3_DESIGN.md`).
+    let (proxy, answer) = unsafe { shm.frame_regions(slot, n) };
+    let timing = if ready && neuralforge_protocol::enums::proxy_format::is_8bit(proxy_format) {
+        (|| {
+            if !frame_resources.as_ref().is_some_and(|f| f.matches(0, width, height, proxy_format)) {
+                // SAFETY: any previous resources are no longer referenced by in-flight
+                // work -- `FrameResources::evaluate` always waits on its own fences
+                // before returning, so by the time we're back here (a later loop
+                // iteration) nothing is still submitted.
+                if let Some(old) = frame_resources.take() {
+                    unsafe { old.destroy(device) };
+                }
+                *frame_resources = frame::FrameResources::new(device, instance, physical_device, 0, width, height, proxy_format, proxy_region, answer_region);
+            }
+            let f = frame_resources.as_ref()?;
+            let (Some(eval_fn), params) = (snippet.evaluate_feature_fn(), snippet.params()) else { return None };
+            let tuning = hdr.resolve_pass(0);
+            f.evaluate(device, queue, eval_fn, snippet.feature, params, proxy, &motion, motion_scale, hdr.mvec_enabled() && motion.is_empty(), tuning, answer)
+        })()
+    } else {
+        None
+    };
+    let evaluated = timing.is_some();
+    if let Some(timing) = timing {
+        store_ms(&hdr.helper_upload_ms_bits, timing.upload);
+        store_ms(&hdr.helper_eval_ms_bits, timing.evaluate);
+        store_ms(&hdr.helper_readback_ms_bits, timing.download);
+    }
+    if !evaluated {
+        // Fail open: no real answer yet (feature still warming up, wrong proxy
+        // format, or a guarded `EvaluateFeature` failure) -- echo the proxy straight
+        // through so the transport round trip still completes with *something*
+        // rather than stale/all-zero bytes.
+        answer.copy_from_slice(proxy);
+    }
+    hdr.seq_ok.store(seq_req, Ordering::Relaxed);
+    if !helper_delay.is_zero() {
+        std::thread::sleep(helper_delay);
+    }
+    hdr.seq_resp_slot(slot).store(seq_req, Ordering::Release);
+    *frames += 1;
+    neuralforge_protocol::store64(&hdr.helper_frames_lo, &hdr.helper_frames_hi, *frames);
+    neuralforge_helper::log!("[helper] slot {slot} frame {frames}: {width}x{height} evaluated={evaluated}");
 }
 
 /// A minimal Vulkan instance + device — just enough to hand NGX a live

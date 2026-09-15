@@ -14,17 +14,25 @@
 //! `neuralforge_protocol::mapping::open`, which only maps the header -- the GUI/CLI's own
 //! use case never needs the pixel regions) -- same reasoning `read_mapping.rs` already
 //! uses for going around the library's own (header-only) `mapping` module.
+//!
+//! Takes an optional third argument, 0 or 1, for which protocol v3 wire slot to drive
+//! (`PROTOCOL_V3_DESIGN.md`) -- defaults to 0, matching this tool's pre-v3 behavior.
+//! Run it twice concurrently with different slots to confirm the helper answers both
+//! independently against real hardware, the same thing
+//! `neuralforge_layer::shm::tests::the_two_slots_are_fully_independent` already proves
+//! against a fake helper.
 
 use std::os::fd::AsRawFd;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use neuralforge_protocol::{answer_offset, proxy_offset, shm_default_path, shm_total_bytes, ShmHeader};
+use neuralforge_protocol::{answer_offset_slot, proxy_offset_slot, shm_default_path, shm_total_bytes, ShmHeader};
 
 fn main() {
     let path = std::env::var("NEURALFORGE_SHM").ok().filter(|s| !s.is_empty()).unwrap_or_else(shm_default_path);
     let width: u32 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(64);
     let height: u32 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(64);
+    let slot: usize = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(0);
 
     let file = std::fs::OpenOptions::new().read(true).write(true).open(&path)
         .unwrap_or_else(|e| panic!("failed to open {path}: {e} -- is a helper actually running against this NEURALFORGE_UID?"));
@@ -47,29 +55,29 @@ fn main() {
     // (as opposed to a silently-echoed-back) evaluation is at least plausible from
     // the byte pattern alone, same spirit as the layer-side `DirectCapture` test's own
     // known fill color.
-    // SAFETY: `base.add(proxy_offset())` is in bounds for `frame_bytes <= MAX_FRAME`
-    // by the mapping's own region layout.
+    // SAFETY: `base.add(proxy_offset_slot(slot))` is in bounds for `frame_bytes <=
+    // MAX_FRAME` by the mapping's own region layout.
     unsafe {
-        let proxy = std::slice::from_raw_parts_mut(base.add(proxy_offset()), frame_bytes);
+        let proxy = std::slice::from_raw_parts_mut(base.add(proxy_offset_slot(slot)), frame_bytes);
         for (i, chunk) in proxy.chunks_exact_mut(4).enumerate() {
             chunk.copy_from_slice(&[(i % 256) as u8, 100, 150, 255]);
         }
     }
 
-    hdr.width.store(width, Ordering::Relaxed);
-    hdr.height.store(height, Ordering::Relaxed);
-    hdr.proxy_format.store(proxy_format, Ordering::Relaxed);
+    hdr.width_slot(slot).store(width, Ordering::Relaxed);
+    hdr.height_slot(slot).store(height, Ordering::Relaxed);
+    hdr.proxy_format_slot(slot).store(proxy_format, Ordering::Relaxed);
     hdr.apply_model.store(1, Ordering::Relaxed);
     hdr.enabled.store(1, Ordering::Relaxed);
     hdr.frame_mvec_valid.store(0, Ordering::Relaxed);
 
-    let seq = hdr.seq_req.load(Ordering::Relaxed).wrapping_add(1).max(1);
-    println!("trigger_helper_roundtrip: {width}x{height}, requesting seq={seq}");
-    hdr.seq_req.store(seq, Ordering::Release);
+    let seq = hdr.seq_req_slot(slot).load(Ordering::Relaxed).wrapping_add(1).max(1);
+    println!("trigger_helper_roundtrip: slot {slot}: {width}x{height}, requesting seq={seq}");
+    hdr.seq_req_slot(slot).store(seq, Ordering::Release);
 
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        if hdr.seq_resp.load(Ordering::Acquire) == seq {
+        if hdr.seq_resp_slot(slot).load(Ordering::Acquire) == seq {
             break;
         }
         if Instant::now() > deadline {
@@ -82,7 +90,7 @@ fn main() {
     println!("trigger_helper_roundtrip: got a response (seq_ok match: {ok})");
 
     // SAFETY: same reasoning as the proxy write above, mirrored for the answer region.
-    let answer = unsafe { std::slice::from_raw_parts(base.add(answer_offset()), frame_bytes) };
+    let answer = unsafe { std::slice::from_raw_parts(base.add(answer_offset_slot(slot)), frame_bytes) };
     let all_zero = answer.iter().all(|&b| b == 0);
     println!(
         "trigger_helper_roundtrip: answer first 16 bytes: {:?}{}",
