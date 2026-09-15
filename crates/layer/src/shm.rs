@@ -51,13 +51,15 @@ pub struct ShmClient {
     last_heartbeat: u32,
     dead: bool,
     frames: u64,
-    /// The request number and send time of a round trip issued via
+    /// Per-slot: the request number and send time of a round trip issued via
     /// [`Self::begin_async_request`] that [`Self::poll_async_request`] hasn't yet
-    /// resolved (answered or timed out). `None` means no request is in flight --
-    /// callers use this to decide whether it's time to capture and send a new frame,
-    /// per the same one-outstanding-request-at-a-time limit the wire protocol has
-    /// always had (a single `seq_req`/`seq_resp` pair, not a queue).
-    pending: Option<(u32, Instant)>,
+    /// resolved (answered or timed out). `None` means that slot has no request in
+    /// flight -- callers use this to decide whether it's time to capture and send a
+    /// new frame on that slot. Protocol v3 (`PROTOCOL_V3_DESIGN.md`) gives the wire
+    /// two fully independent request/response slots instead of one, so this is an
+    /// array of two, not a single value -- each slot still only ever has one
+    /// outstanding request at a time.
+    pending: [Option<(u32, Instant)>; 2],
 }
 
 // SAFETY: `header` points at a `MAP_SHARED` mapping that stays valid for the process's
@@ -86,7 +88,7 @@ impl Default for ShmClient {
             last_heartbeat: 0,
             dead: false,
             frames: 0,
-            pending: None,
+            pending: [None, None],
         }
     }
 }
@@ -197,19 +199,24 @@ impl ShmClient {
         })
     }
 
-    /// Records what the proxy bytes about to be written actually are -- the helper
-    /// (and, on the way back, this same layer reading the answer) needs `width`/
-    /// `height`/`proxy_format` to know how many of the region's bytes are real for
-    /// this frame, not the full `MAX_FRAME`-sized reservation. Call before
-    /// [`Self::write_proxy`]/[`Self::try_round_trip`] so the helper never observes the
+    /// Records what the proxy bytes about to be written actually are, for the given
+    /// slot -- the helper (and, on the way back, this same layer reading the answer)
+    /// needs `width`/`height`/`proxy_format` to know how many of the region's bytes
+    /// are real for this frame, not the full `MAX_FRAME`-sized reservation. Call
+    /// before [`Self::write_proxy`]/[`Self::begin_async_request`]/[`Self::try_round_trip`]
+    /// (the last of which only ever uses slot 0) so the helper never observes the
     /// `seq_req` bump before it can see what raster it describes.
-    pub fn set_frame_info(&mut self, width: u32, height: u32, proxy_format: u32) {
+    ///
+    /// `layer_attached`/`layer_heartbeat`/`layer_width`/`layer_height`/`layer_format`/
+    /// `layer_frames` are status telemetry, not part of the handshake -- deliberately
+    /// not per-slot; they just reflect whichever slot most recently captured.
+    pub fn set_frame_info(&mut self, slot: usize, width: u32, height: u32, proxy_format: u32) {
         self.frames += 1;
         let frames = self.frames;
         let Some(hdr) = self.header() else { return };
-        hdr.width.store(width, Ordering::Relaxed);
-        hdr.height.store(height, Ordering::Relaxed);
-        hdr.proxy_format.store(proxy_format, Ordering::Relaxed);
+        hdr.width_slot(slot).store(width, Ordering::Relaxed);
+        hdr.height_slot(slot).store(height, Ordering::Relaxed);
+        hdr.proxy_format_slot(slot).store(proxy_format, Ordering::Relaxed);
 
         // The layer's own "I am alive and capturing" telemetry -- mirrors what
         // `neuralforge_helper::main`'s loop already does for `hdr.helper_*`/`heartbeat`.
@@ -247,23 +254,25 @@ impl ShmClient {
     }
 
     /// Writes `bytes` (truncated to `MAX_FRAME`, same discipline as the free-text
-    /// fields in `ShmHeader`) into the proxy region -- the frame the layer is about to
-    /// hand the model. Call before bumping `seq_req` (via [`Self::try_round_trip`]):
-    /// the helper only starts reading once it observes that bump, so there is no
-    /// concurrent-write hazard to guard against the way the header's atomics do.
+    /// fields in `ShmHeader`) into the given slot's proxy region -- the frame the
+    /// layer is about to hand the model. Call before bumping that slot's `seq_req`
+    /// (via [`Self::begin_async_request`]/[`Self::try_round_trip`], the latter always
+    /// slot 0): the helper only starts reading once it observes that bump, so there
+    /// is no concurrent-write hazard to guard against the way the header's atomics do.
     ///
     /// # Safety
     /// Must only be called after a successful [`Self::open`]/[`Self::try_round_trip`].
-    pub fn write_proxy(&self, bytes: &[u8]) {
+    pub fn write_proxy(&self, slot: usize, bytes: &[u8]) {
         let Some(base) = self.pixel_base() else { return };
         let n = bytes.len().min(MAX_FRAME);
         // SAFETY: `base` is the start of this process's own mapping of the full
-        // `shm_total_bytes()` region (see `open_at`); `proxy_offset()..+n` is in bounds
-        // for any `n <= MAX_FRAME` by that region's own definition.
+        // `shm_total_bytes()` region (see `open_at`); `proxy_offset_slot(slot)..+n` is
+        // in bounds for any `n <= MAX_FRAME` and `slot < 2` by that region's own
+        // definition.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
-                base.add(neuralforge_protocol::proxy_offset()),
+                base.add(neuralforge_protocol::proxy_offset_slot(slot)),
                 n,
             );
         }
@@ -320,20 +329,21 @@ impl ShmClient {
         self.motion_last = Some(Instant::now());
     }
 
-    /// Reads up to `out.len()` (capped at `MAX_FRAME`) bytes back from the answer
-    /// region into `out`, returning the number of bytes copied. Meaningful only after
-    /// [`Self::try_round_trip`] has returned `true` for the request this answer goes
-    /// with -- reading it any earlier just observes whatever the helper last wrote
-    /// (stale or all-zero), which is why this never blocks or checks sequence numbers
-    /// itself; the caller already knows from the round trip's own return value whether
-    /// there is a real answer to read.
-    pub fn read_answer(&self, out: &mut [u8]) -> usize {
+    /// Reads up to `out.len()` (capped at `MAX_FRAME`) bytes back from the given
+    /// slot's answer region into `out`, returning the number of bytes copied.
+    /// Meaningful only after [`Self::poll_async_request`]/[`Self::try_round_trip`] has
+    /// returned a real answer for the request this goes with -- reading it any
+    /// earlier just observes whatever the helper last wrote (stale or all-zero),
+    /// which is why this never blocks or checks sequence numbers itself; the caller
+    /// already knows from the round trip's own return value whether there is a real
+    /// answer to read.
+    pub fn read_answer(&self, slot: usize, out: &mut [u8]) -> usize {
         let Some(base) = self.pixel_base() else { return 0 };
         let n = out.len().min(MAX_FRAME);
         // SAFETY: same reasoning as `write_proxy`, mirrored for the answer region.
         unsafe {
             std::ptr::copy_nonoverlapping(
-                base.add(neuralforge_protocol::answer_offset()),
+                base.add(neuralforge_protocol::answer_offset_slot(slot)),
                 out.as_mut_ptr(),
                 n,
             );
@@ -345,16 +355,17 @@ impl ShmClient {
         (!self.header.is_null()).then_some(self.header as *mut u8)
     }
 
-    /// The proxy region's own address and capacity within this process's mapping --
-    /// `None` before [`Self::open`]/[`Self::open_at`] has actually mapped anything.
-    /// For [`crate::capture::DirectCapture`]'s `VK_EXT_external_memory_host` import:
-    /// the *only* legitimate reason anything outside this module needs this address at
-    /// all, since every other caller goes through [`Self::write_proxy`] instead.
-    pub fn proxy_region(&self) -> Option<(*mut u8, usize)> {
-        // SAFETY: `pixel_base` plus `proxy_offset()` stays within the
+    /// The given slot's proxy region address and capacity within this process's
+    /// mapping -- `None` before [`Self::open`]/[`Self::open_at`] has actually mapped
+    /// anything. For [`crate::capture::DirectCapture`]'s `VK_EXT_external_memory_host`
+    /// import: the *only* legitimate reason anything outside this module needs this
+    /// address at all, since every other caller goes through [`Self::write_proxy`]
+    /// instead.
+    pub fn proxy_region(&self, slot: usize) -> Option<(*mut u8, usize)> {
+        // SAFETY: `pixel_base` plus `proxy_offset_slot(slot)` stays within the
         // `shm_total_bytes()` mapping `open_at` established, same reasoning as
         // `write_proxy`'s own pointer arithmetic.
-        self.pixel_base().map(|base| (unsafe { base.add(neuralforge_protocol::proxy_offset()) }, neuralforge_protocol::MAX_FRAME))
+        self.pixel_base().map(|base| (unsafe { base.add(neuralforge_protocol::proxy_offset_slot(slot)) }, neuralforge_protocol::MAX_FRAME))
     }
 
     /// Opens (or creates) the mapping if not already attached. Idempotent.
@@ -549,28 +560,33 @@ impl ShmClient {
         false
     }
 
-    /// Whether a round trip started by [`Self::begin_async_request`] is still
-    /// in flight (sent, not yet resolved by [`Self::poll_async_request`]). Callers use
-    /// this to decide whether it's worth capturing and sending a new frame this present
-    /// call -- the wire protocol has only ever supported one outstanding request at a
-    /// time (a single `seq_req`/`seq_resp` pair, not a queue), so starting a second one
-    /// before the first resolves would just overwrite it.
-    pub fn has_pending_request(&self) -> bool {
-        self.pending.is_some()
+    /// Whether a round trip started on this slot by [`Self::begin_async_request`] is
+    /// still in flight (sent, not yet resolved by [`Self::poll_async_request`]).
+    /// Callers use this to decide whether it's worth capturing and sending a new
+    /// frame on this slot this present call -- each slot still only ever supports one
+    /// outstanding request at a time (its own `seq_req`/`seq_resp` pair, not a
+    /// queue); protocol v3 (`PROTOCOL_V3_DESIGN.md`) is what makes there be two
+    /// slots to ask this about instead of one.
+    pub fn has_pending_request(&self, slot: usize) -> bool {
+        self.pending[slot].is_some()
     }
 
-    /// Starts a round trip without waiting for it: bumps `seq_req` and records when,
-    /// exactly like the first half of [`Self::round_trip_after_open`], but returns
-    /// immediately instead of blocking. Pair with [`Self::poll_async_request`], called
-    /// once per frame thereafter, to find out when (or whether) it resolves.
+    /// Starts a round trip on the given slot without waiting for it: bumps that
+    /// slot's `seq_req` and records when, exactly like the first half of
+    /// [`Self::round_trip_after_open`] (which only ever uses slot 0), but returns
+    /// immediately instead of blocking. Pair with [`Self::poll_async_request`] on the
+    /// same slot, called once per frame thereafter, to find out when (or whether) it
+    /// resolves.
     ///
     /// Returns `false` (and starts nothing) on a dead connection whose retry timer
     /// hasn't elapsed, on `quit`, or if the mapping can't be opened -- the same
     /// conditions [`Self::try_round_trip`] fails open on. Only ever call this when
-    /// [`Self::has_pending_request`] is `false`; calling it with a request already in
-    /// flight would silently abandon that one (its `seq_req` gets overwritten before
-    /// `poll_async_request` ever sees a matching `seq_resp`).
-    pub fn begin_async_request(&mut self) -> bool {
+    /// [`Self::has_pending_request`] for this same slot is `false`; calling it with a
+    /// request already in flight on that slot would silently abandon that one (its
+    /// `seq_req` gets overwritten before `poll_async_request` ever sees a matching
+    /// `seq_resp`) -- the two slots are otherwise completely independent, so a
+    /// pending request on the *other* slot never blocks this call.
+    pub fn begin_async_request(&mut self, slot: usize) -> bool {
         if !self.open() {
             self.dead = true;
             return false;
@@ -586,38 +602,39 @@ impl ShmClient {
             return false;
         }
 
-        let req = hdr.seq_req.load(Ordering::Relaxed) + 1;
+        let req = hdr.seq_req_slot(slot).load(Ordering::Relaxed) + 1;
         std::sync::atomic::fence(Ordering::Release);
-        hdr.seq_req.store(req, Ordering::Relaxed);
-        self.pending = Some((req, Instant::now()));
+        hdr.seq_req_slot(slot).store(req, Ordering::Relaxed);
+        self.pending[slot] = Some((req, Instant::now()));
         true
     }
 
     /// Non-blocking: checks whether the request [`Self::begin_async_request`] started
-    /// has answered yet. `Some(true)` once, the instant `seq_resp` catches up (clears
-    /// the pending state, so [`Self::has_pending_request`] is `false` again
-    /// afterward -- the caller is free to start a new one). `Some(false)` while still
-    /// genuinely waiting, within budget. `None` once the budget is exceeded --
-    /// also clears the pending state (same timeout/dead-connection bookkeeping
+    /// on this slot has answered yet. `Some(true)` once, the instant that slot's
+    /// `seq_resp` catches up (clears its pending state, so
+    /// [`Self::has_pending_request`] for this slot is `false` again afterward -- the
+    /// caller is free to start a new one on it). `Some(false)` while still genuinely
+    /// waiting, within budget. `None` once the budget is exceeded -- also clears the
+    /// pending state (same timeout/dead-connection bookkeeping
     /// [`Self::round_trip_after_open`] already does), so the caller knows to give up
-    /// on this cycle and start fresh rather than keep polling a request that will
-    /// never resolve. Returns `Some(false)` (never blocks, never panics) if called
-    /// with nothing pending.
-    pub fn poll_async_request(&mut self) -> Option<bool> {
-        let Some((req, sent_at)) = self.pending else { return Some(false) };
+    /// on this slot's cycle and start fresh rather than keep polling a request that
+    /// will never resolve. Returns `Some(false)` (never blocks, never panics) if
+    /// called with nothing pending on this slot.
+    pub fn poll_async_request(&mut self, slot: usize) -> Option<bool> {
+        let Some((req, sent_at)) = self.pending[slot] else { return Some(false) };
         let Some(hdr) = self.header() else {
-            self.pending = None;
+            self.pending[slot] = None;
             return None;
         };
-        if hdr.seq_resp.load(Ordering::Relaxed) >= req {
+        if hdr.seq_resp_slot(slot).load(Ordering::Relaxed) >= req {
             std::sync::atomic::fence(Ordering::Acquire);
-            self.pending = None;
+            self.pending[slot] = None;
             self.timeouts = 0;
             self.ever_answered = true;
             return Some(true);
         }
         if hdr.quit.load(Ordering::Relaxed) != 0 {
-            self.pending = None;
+            self.pending[slot] = None;
             self.dead = true;
             return None;
         }
@@ -633,7 +650,7 @@ impl ShmClient {
         if sent_at.elapsed() < budget {
             return Some(false);
         }
-        self.pending = None;
+        self.pending[slot] = None;
         self.timeouts += 1;
         if self.timeouts >= 4 {
             self.dead = true;
@@ -823,24 +840,65 @@ mod tests {
             }
         });
 
-        assert!(client.begin_async_request(), "should start a request against an already-open mapping");
-        assert!(client.has_pending_request());
+        assert!(client.begin_async_request(0), "should start a request against an already-open mapping");
+        assert!(client.has_pending_request(0));
         // Real non-blocking behavior: a call arriving before the echo thread has had a
         // chance to run must not hang waiting -- it either sees `Some(false)` (not
         // answered yet) or, if the thread was fast enough, `Some(true)` -- either way
         // this call itself returns immediately.
-        let mut resolved = client.poll_async_request() == Some(true);
+        let mut resolved = client.poll_async_request(0) == Some(true);
         let deadline = Instant::now() + Duration::from_secs(2);
         while !resolved {
             assert!(Instant::now() < deadline, "poll_async_request never resolved true");
-            resolved = client.poll_async_request() == Some(true);
+            resolved = client.poll_async_request(0) == Some(true);
         }
-        assert!(!client.has_pending_request(), "a resolved request must clear pending state");
+        assert!(!client.has_pending_request(0), "a resolved request must clear pending state");
         assert!(client.ever_answered);
         assert!(!client.dead);
 
         stop.store(true, Ordering::Relaxed);
         echo.join().unwrap();
+    }
+
+    #[test]
+    fn the_two_slots_are_fully_independent() {
+        // The actual point of protocol v3 (PROTOCOL_V3_DESIGN.md): slot 1 can have a
+        // request outstanding while slot 0's is still pending, and each resolves on
+        // its own seq_req/seq_resp pair without disturbing the other -- proven here
+        // with a helper that only ever answers slot 0, confirming slot 1 staying
+        // genuinely pending is not somehow a side effect of slot 0's own state.
+        let path = scratch_path();
+        let mut client = ShmClient::default();
+        assert!(client.open_at(&path));
+        header_of(&client).helper_state.store(neuralforge_protocol::enums::helper_state::RUNNING, Ordering::Relaxed);
+
+        assert!(client.begin_async_request(0));
+        assert!(client.begin_async_request(1));
+        assert!(client.has_pending_request(0));
+        assert!(client.has_pending_request(1));
+
+        // Nothing has answered either slot yet.
+        assert_eq!(client.poll_async_request(0), Some(false));
+        assert_eq!(client.poll_async_request(1), Some(false));
+
+        // Answer slot 0 only.
+        let req0 = header_of(&client).seq_req.load(Ordering::Relaxed);
+        header_of(&client).seq_resp.store(req0, Ordering::Relaxed);
+
+        assert_eq!(client.poll_async_request(0), Some(true), "slot 0 should resolve once its own seq_resp catches up");
+        assert!(!client.has_pending_request(0));
+
+        // Slot 1 must still be genuinely pending -- answering slot 0 must not have
+        // touched slot 1's own seq_req_b/seq_resp_b handshake at all.
+        assert!(client.has_pending_request(1), "slot 1 must still be pending after only slot 0 was answered");
+        assert_eq!(client.poll_async_request(1), Some(false));
+        assert_eq!(header_of(&client).seq_resp_b.load(Ordering::Relaxed), 0, "nothing answered slot 1's own seq_resp_b");
+
+        // Now answer slot 1 too.
+        let req1 = header_of(&client).seq_req_b.load(Ordering::Relaxed);
+        header_of(&client).seq_resp_b.store(req1, Ordering::Relaxed);
+        assert_eq!(client.poll_async_request(1), Some(true));
+        assert!(!client.has_pending_request(1));
     }
 
     #[test]
@@ -850,17 +908,17 @@ mod tests {
         assert!(client.open_at(&path));
         // helper_state defaults to STOPPED -- short "nobody's listening" budget (20ms),
         // so this test still runs fast despite exercising a real timeout.
-        assert!(client.begin_async_request());
-        assert!(client.has_pending_request());
+        assert!(client.begin_async_request(0));
+        assert!(client.has_pending_request(0));
 
         let deadline = Instant::now() + Duration::from_secs(2);
-        let mut result = client.poll_async_request();
+        let mut result = client.poll_async_request(0);
         while result == Some(false) {
             assert!(Instant::now() < deadline, "poll_async_request never gave up");
-            result = client.poll_async_request();
+            result = client.poll_async_request(0);
         }
         assert_eq!(result, None, "an unanswered request past budget must resolve to None, not Some(true)");
-        assert!(!client.has_pending_request(), "a timed-out request must clear pending state too");
+        assert!(!client.has_pending_request(0), "a timed-out request must clear pending state too");
     }
 
     #[test]
@@ -899,8 +957,8 @@ mod motion_transport_tests {
         let mut pixels = vec![0u8;512*512*4];
         for (i,p) in pixels.chunks_exact_mut(4).enumerate() { let v = ((i as u32).wrapping_mul(747796405) >> 24) as u8; p.copy_from_slice(&[v,v,v,255]); }
         let format = neuralforge_protocol::enums::proxy_format::BGRA8;
-        client.set_frame_info(512,512,format);
-        client.write_proxy(&pixels);
+        client.set_frame_info(0,512,512,format);
+        client.write_proxy(0,&pixels);
         client.prepare_motion(&instance,pd,512,512,format,&pixels);
         assert_eq!(client.header().unwrap().frame_mvec_valid.load(Ordering::Relaxed),0);
         client.prepare_motion(&instance,pd,512,512,format,&pixels);

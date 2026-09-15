@@ -109,13 +109,15 @@ struct State {
     capture_pipeline: Option<capture::CapturePipeline>,
     /// The Phase 3 zero-copy capture path (`EXTERNAL_MEMORY_HOST_DESIGN.md`) --
     /// mutually exclusive with `capture_pipeline` above, never both active for the
-    /// same device (see `DirectCapture`'s own doc comment for why sharing the SHM
-    /// proxy region between two concurrently in-flight slots would be a write-write
-    /// hazard). `capture::run` decides which of the two to use every call, cheaply,
-    /// from `external_memory_host` below plus a live alignment query -- so this stays
-    /// populated (or not) correctly even if that decision's answer could somehow
-    /// change mid-process, though in practice it never does.
-    direct_capture: Option<capture::DirectCapture>,
+    /// same device. One per protocol v3 wire slot (`PROTOCOL_V3_DESIGN.md`), each
+    /// importing that slot's own disjoint proxy region -- no write-write hazard
+    /// between them (unlike two of the same slot, which `DirectCapture`'s own doc
+    /// comment still explains). `capture::run` decides `DirectCapture` vs.
+    /// `CapturePipeline` once per call, cheaply, from `external_memory_host` below
+    /// plus a live alignment query -- so this stays populated (or not) correctly even
+    /// if that decision's answer could somehow change mid-process, though in practice
+    /// it never does.
+    direct_capture: [Option<capture::DirectCapture>; 2],
     /// Whether `NeuralForgeInstanceHooks::create_device` (crate::lib) got
     /// `VK_EXT_external_memory_host` added to this device's own creation -- set once,
     /// at construction, from a side channel only that hook can populate (see its own
@@ -137,10 +139,25 @@ struct State {
     /// The pipelined redesign's own persistent state -- see `capture::run`'s own doc
     /// comment for why a round trip's original frame has to outlive the present call
     /// that sent it, across however many present calls it takes the helper to answer.
-    inflight: capture::Inflight,
+    /// One per protocol v3 wire slot: each slot's in-flight request has its own,
+    /// completely independent original frame and dims.
+    inflight: [capture::Inflight; 2],
+    /// A single disabled-state evaluation reserves the helper's images and NGX
+    /// feature before the game's working set fills available VRAM (see
+    /// `capture::run`'s own doc comment on why) -- one flag for the whole process,
+    /// not per-slot: it only ever uses wire slot 0.
+    bootstrap_complete: bool,
     /// Reused across frames the same way `original_scratch` is, for the answer bytes
     /// `capture::run` reads back once a round trip resolves.
     answer_scratch: Vec<u8>,
+    /// The original frame paired with whichever wire slot most recently produced the
+    /// answer currently held in `last_answer` -- not per-slot, since only one answer
+    /// is ever the "currently presented" one at a time (see `capture::Inflight`'s own
+    /// doc comment for why this moved out of the per-slot array).
+    raw_answer_base: Vec<u8>,
+    /// Monotonic identity for `raw_answer_base`/`last_answer` together -- GPU
+    /// composition uploads only when this changes.
+    raw_answer_generation: u64,
     last_answer: Vec<u8>,
     hotkey: crate::hotkey::Poller,
     /// Passive transfer observations for swapchains which could not be admitted at
@@ -164,12 +181,14 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
     let owned = CLEANUP.lock().unwrap().remove(&handle);
     if let Some((device, state)) = owned {
         let mut state = state.lock().unwrap();
-        if state.capture.is_some() || state.capture_pipeline.is_some() || state.direct_capture.is_some() || state.gpu_compose.is_some() {
+        if state.capture.is_some() || state.capture_pipeline.is_some() || state.direct_capture.iter().any(Option::is_some) || state.gpu_compose.is_some() {
             match unsafe { device.device_wait_idle() } {
                 Ok(()) | Err(vk::Result::ERROR_DEVICE_LOST) => {
                     unsafe { capture::destroy(state.capture.take(), &device); }
                     unsafe { capture::destroy_pipeline(state.capture_pipeline.take(), &device); }
-                    unsafe { capture::destroy_direct_capture(state.direct_capture.take(), &device); }
+                    for slot in &mut state.direct_capture {
+                        unsafe { capture::destroy_direct_capture(slot.take(), &device); }
+                    }
                     if let Some(compose) = state.gpu_compose.take() {
                         unsafe { compose.destroy(&device); }
                     }
@@ -548,7 +567,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 let proxy_format = swapchain::proxy_format_for(sw.format);
                 let bgr_order = swapchain::is_bgr_order(sw.format);
                 let (capture_image, capture_layout) = tap.unwrap_or((image, vk::ImageLayout::PRESENT_SRC_KHR));
-                let State { shm, capture, capture_pipeline, direct_capture, external_memory_host, gpu_compose, original_scratch, inflight, answer_scratch, last_answer, hotkey, .. } = &mut *state;
+                let State { shm, capture, capture_pipeline, direct_capture, external_memory_host, gpu_compose, original_scratch, inflight, bootstrap_complete, answer_scratch, raw_answer_base, raw_answer_generation, last_answer, hotkey, .. } = &mut *state;
                 shm.poll_toggle_hotkey(hotkey);
                 if shm.model_known_unavailable() {
                     // The helper has permanently disabled itself for this session
@@ -590,7 +609,10 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                             shm,
                             original_scratch,
                             inflight,
+                            bootstrap_complete,
                             answer_scratch,
+                            raw_answer_base,
+                            raw_answer_generation,
                             last_answer,
                         );
                     }

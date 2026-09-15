@@ -255,25 +255,26 @@ fn barrier(image: vk::Image, old: vk::ImageLayout, new: vk::ImageLayout, src: vk
         .build()
 }
 
-/// What [`run`] is carrying forward from the round trip it most recently *sent*,
-/// across as many present calls as the helper takes to answer it. `original` holds
-/// the exact pixels captured at send time -- needed again once the answer finally
-/// arrives, since composition combines the two -- alongside the dimensions/format
-/// that capture was taken at, so a resolution change mid-flight is detected (and the
-/// stale pair discarded) rather than composited against a mismatched frame size.
+/// What [`run`] is carrying forward from the round trip it most recently *sent* **on
+/// one wire slot**, across as many present calls as the helper takes to answer it.
+/// `original` holds the exact pixels captured at send time -- needed again once the
+/// answer finally arrives, since composition combines the two -- alongside the
+/// dimensions/format that capture was taken at, so a resolution change mid-flight is
+/// detected (and the stale pair discarded) rather than composited against a
+/// mismatched frame size.
+///
+/// Protocol v3 (`PROTOCOL_V3_DESIGN.md`) gives the wire two independent slots, so
+/// `run` carries `[Inflight; 2]`, one per slot -- each slot's own in-flight capture is
+/// completely independent of the other's. What *isn't* per-slot (moved out to `run`'s
+/// own parameters instead, alongside `last_answer`): the single currently-presented
+/// answer and the one-shot bootstrap flag, both of which are properties of the
+/// process's presentation state as a whole, not of either slot specifically -- see
+/// `run`'s own doc comment for why "whichever slot answers most recently wins" is the
+/// same kind of bounded staleness tradeoff this module already accepts.
 #[derive(Default)]
 pub struct Inflight {
     original: Vec<u8>,
     dims: Option<(u32, u32, u32)>,
-    /// A single disabled-state evaluation reserves the helper's images and NGX
-    /// feature before the game's working set fills available VRAM.  It never writes
-    /// a result to the swapchain, so starting the game with NR off stays visually
-    /// and functionally off.
-    bootstrap_complete: bool,
-    /// Monotonic identity for the held raw helper result.  GPU slots use this to
-    /// upload only when a newly evaluated answer arrives.
-    raw_answer_generation: u64,
-    raw_answer_base: Vec<u8>,
 }
 
 /// Real per-frame NR compute (a helper round trip through a Wine-hosted process, plus
@@ -330,10 +331,12 @@ pub struct Inflight {
 /// need bytes that survive whatever capture starts next and overwrites that region,
 /// which the live proxy region itself can't provide once it's shared, imported memory.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn poll_or_submit_capture(
+    slot: usize,
     use_direct: bool,
     pipeline: &mut Option<CapturePipeline>,
-    direct: &mut Option<DirectCapture>,
+    direct: &mut [Option<DirectCapture>; 2],
     device: &ash::Device,
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
@@ -349,18 +352,21 @@ fn poll_or_submit_capture(
     original_scratch: &mut Vec<u8>,
 ) -> bool {
     if use_direct {
-        let Some((host_ptr, capacity)) = shm.proxy_region() else { return false };
-        // SAFETY: `host_ptr`/`capacity` describe `shm`'s own live proxy region, valid
-        // for as long as `shm` stays open (the life of this process, since the
-        // mapping is never unmapped -- see `neuralforge_protocol::mapping::Mapping::header`'s
-        // own doc comment on the equivalent GUI/CLI mapping); nothing else writes to
-        // it except through `ShmClient::write_proxy`, which this branch never calls.
+        let Some((host_ptr, capacity)) = shm.proxy_region(slot) else { return false };
+        // SAFETY: `host_ptr`/`capacity` describe `shm`'s own live proxy region for
+        // this slot, valid for as long as `shm` stays open (the life of this process,
+        // since the mapping is never unmapped -- see
+        // `neuralforge_protocol::mapping::Mapping::header`'s own doc comment on the
+        // equivalent GUI/CLI mapping); nothing else writes to it except through
+        // `ShmClient::write_proxy`, which this branch never calls, and slot 0's/slot
+        // 1's regions are disjoint (`PROTOCOL_V3_DESIGN.md`), so the other slot's own
+        // `DirectCapture` never touches these same bytes.
         if !unsafe {
-            ensure_direct_capture(direct, device, instance, physical_device, queue_family, host_ptr, capacity as vk::DeviceSize)
+            ensure_direct_capture(&mut direct[slot], device, instance, physical_device, queue_family, host_ptr, capacity as vk::DeviceSize)
         } {
             return false;
         }
-        let d = direct.as_mut().expect("just ensured above");
+        let d = direct[slot].as_mut().expect("just ensured above");
         if let Some(_dims) = poll_direct_capture(d, device) {
             let n = capacity.min(frame_bytes as usize);
             original_scratch.clear();
@@ -370,7 +376,7 @@ fn poll_or_submit_capture(
             // CPU (host-coherent memory backs every capture buffer in this module,
             // imported or not).
             original_scratch.extend_from_slice(unsafe { std::slice::from_raw_parts(host_ptr, n) });
-            shm.set_frame_info(width, height, proxy_format);
+            shm.set_frame_info(slot, width, height, proxy_format);
             return true;
         }
         submit_direct_capture(d, device, queue, capture_image, capture_layout, width, height, proxy_format);
@@ -380,12 +386,12 @@ fn poll_or_submit_capture(
             return false;
         }
         let p = pipeline.as_mut().expect("just ensured above");
-        if poll_pipeline_capture(p, device, original_scratch).is_some() {
-            shm.set_frame_info(width, height, proxy_format);
-            shm.write_proxy(original_scratch);
+        if poll_pipeline_capture(p, slot, device, original_scratch).is_some() {
+            shm.set_frame_info(slot, width, height, proxy_format);
+            shm.write_proxy(slot, original_scratch);
             return true;
         }
-        submit_pipeline_capture(p, device, queue, capture_image, capture_layout, width, height, proxy_format);
+        submit_pipeline_capture(p, slot, device, queue, capture_image, capture_layout, width, height, proxy_format);
         false
     }
 }
@@ -410,13 +416,16 @@ pub unsafe fn run(
     bgr_order: bool,
     resources: &mut Option<CaptureResources>,
     pipeline: &mut Option<CapturePipeline>,
-    direct: &mut Option<DirectCapture>,
+    direct: &mut [Option<DirectCapture>; 2],
     external_memory_host: bool,
     gpu_compose: &mut Option<crate::composition::gpu::GpuCompose>,
     shm: &mut ShmClient,
     original_scratch: &mut Vec<u8>,
-    inflight: &mut Inflight,
+    inflight: &mut [Inflight; 2],
+    bootstrap_complete: &mut bool,
     answer_scratch: &mut Vec<u8>,
+    raw_answer_base: &mut Vec<u8>,
+    raw_answer_generation: &mut u64,
     last_answer: &mut Vec<u8>,
 ) -> Option<vk::Semaphore> {
     let pipeline_start = std::time::Instant::now();
@@ -445,11 +454,20 @@ pub unsafe fn run(
     // of this device's life (`ensure_direct_capture` failing is the only signal, and
     // this function has no per-call fallback to `CapturePipeline` once `use_direct` is
     // decided) rather than fail open onto the always-correct staging-buffer path.
+    // Both slots' regions must independently satisfy the driver's alignment (they're
+    // both just offsets within the same mapping, so in practice this only ever
+    // differs if the mapping's own base address doesn't -- but "in practice" is
+    // exactly the kind of assumption this project's own history says to verify, not
+    // guess) -- `DirectCapture`/`CapturePipeline` are chosen once for the whole
+    // device, never per-slot (see `direct_capture`'s own doc comment in `device.rs`),
+    // so a single combined decision is what `run` actually needs here.
     let use_direct = external_memory_host
-        && shm.proxy_region().is_some_and(|(ptr, capacity)| {
-            min_imported_host_pointer_alignment(instance, physical_device).is_some_and(|alignment| {
-                let alignment = alignment as usize;
-                alignment != 0 && (ptr as usize) % alignment == 0 && capacity % alignment == 0
+        && (0..2).all(|slot| {
+            shm.proxy_region(slot).is_some_and(|(ptr, capacity)| {
+                min_imported_host_pointer_alignment(instance, physical_device).is_some_and(|alignment| {
+                    let alignment = alignment as usize;
+                    alignment != 0 && (ptr as usize) % alignment == 0 && capacity % alignment == 0
+                })
             })
         });
     let Some(settings) = shm.composition_settings() else { return None };
@@ -505,12 +523,16 @@ pub unsafe fn run(
     // its answer.  This is deliberately one request per process, never a hidden
     // rendering loop while NR is switched off.
     if disabled {
-        if inflight.bootstrap_complete {
+        // The one-shot bootstrap only ever needs one wire slot -- deliberately always
+        // slot 0, exactly like `run_sync`'s own single-slot debug path, so it never
+        // depends on protocol v3's second slot existing at all.
+        const SLOT: usize = 0;
+        if *bootstrap_complete {
             return None;
         }
-        if shm.has_pending_request() {
-            if shm.poll_async_request() == Some(true) {
-                inflight.bootstrap_complete = true;
+        if shm.has_pending_request(SLOT) {
+            if shm.poll_async_request(SLOT) == Some(true) {
+                *bootstrap_complete = true;
             }
             return None;
         }
@@ -519,76 +541,90 @@ pub unsafe fn run(
         // it just takes a call or two longer to land (irrelevant for a once-per-process
         // bootstrap) instead of stalling the present it happens on.
         if poll_or_submit_capture(
-            use_direct, pipeline, direct, device, instance, physical_device, queue, queue_family,
+            SLOT, use_direct, pipeline, direct, device, instance, physical_device, queue, queue_family,
             capture_image, capture_layout, width, height, proxy_format, frame_bytes, shm, original_scratch,
         ) {
             shm.prepare_motion(instance, physical_device, width, height, proxy_format, original_scratch);
-            if shm.begin_async_request() {
-                inflight.dims = Some((width, height, proxy_format));
+            if shm.begin_async_request(SLOT) {
+                inflight[SLOT].dims = Some((width, height, proxy_format));
             }
         }
         return None;
     }
 
-    // Poll whatever was sent on some earlier frame *before* touching anything else --
-    // `inflight`'s current contents correspond to it, and must be read (below) before
-    // a new capture this same frame (if one happens) is allowed to replace them.
-    let mut have_answer = false;
-    if shm.has_pending_request() {
-        if shm.poll_async_request() == Some(true) {
-            answer_scratch.resize(frame_bytes as usize, 0);
-            shm.read_answer(answer_scratch);
-            // Preserve the exact game frame supplied to the model before the next
-            // request replaces `inflight.original`; the temporal GPU path uses it
-            // to carry only the model's enhancement delta onto current frames.
-            inflight.raw_answer_base.clear();
-            inflight.raw_answer_base.extend_from_slice(&inflight.original);
-            have_answer = true;
-        }
-    }
-
-    // Non-blocking capture (`ASYNC_CAPTURE_DESIGN.md`, `EXTERNAL_MEMORY_HOST_DESIGN.md`):
-    // poll whatever capture is already in flight -- never a queue/fence wait -- before
-    // deciding whether to submit a new one. Same wire-protocol constraint as before:
-    // only start a new round trip (and only bother keeping a just-finished capture's
-    // bytes at all) when nothing is already outstanding. A capture that finishes while
-    // a request is *already* in flight is still polled here (freeing its slot for
-    // reuse) but its bytes are simply not consumed -- the same bounded
-    // temporal-staleness tradeoff `run`'s own doc comment already accepts, not a new
-    // one. `poll_or_submit_capture` never submits in the same call it successfully
-    // polls, so a single check here (rather than the two separate ones a poll-then-
-    // maybe-submit split would need) already correctly skips submitting a redundant
-    // capture on the same call a round trip just started.
-    if !shm.has_pending_request() {
-        if poll_or_submit_capture(
-            use_direct, pipeline, direct, device, instance, physical_device, queue, queue_family,
-            capture_image, capture_layout, width, height, proxy_format, frame_bytes, shm, original_scratch,
-        ) {
-            shm.prepare_motion(instance, physical_device, width, height, proxy_format, original_scratch);
-            if shm.begin_async_request() {
-                std::mem::swap(&mut inflight.original, original_scratch);
-                inflight.dims = Some((width, height, proxy_format));
+    // Protocol v3 (`PROTOCOL_V3_DESIGN.md`): the same poll-then-maybe-submit sequence
+    // as before, just run once per wire slot instead of once total. Each slot is
+    // completely independent -- slot 1 submitting a new capture never waits on slot
+    // 0's own pending request, and vice versa, which is the entire point of having
+    // two slots instead of one. If *both* slots answer within the same present call,
+    // the second one processed simply overwrites `last_answer`/`raw_answer_base` --
+    // the same "whichever is freshest wins" bounded-staleness tradeoff `run`'s own
+    // doc comment already documents for a single slot, not a new one v3 introduces.
+    for slot in 0..2 {
+        // Poll whatever was sent on some earlier frame *before* touching anything
+        // else -- `inflight[slot]`'s current contents correspond to it, and must be
+        // read (below) before a new capture this same frame (if one happens) is
+        // allowed to replace them.
+        let mut have_answer = false;
+        if shm.has_pending_request(slot) {
+            if shm.poll_async_request(slot) == Some(true) {
+                answer_scratch.resize(frame_bytes as usize, 0);
+                shm.read_answer(slot, answer_scratch);
+                // Preserve the exact game frame supplied to the model before the next
+                // request replaces `inflight[slot].original`; the temporal GPU path
+                // uses it to carry only the model's enhancement delta onto current
+                // frames.
+                raw_answer_base.clear();
+                raw_answer_base.extend_from_slice(&inflight[slot].original);
+                have_answer = true;
             }
         }
-    }
 
-    if have_answer && inflight.dims == Some((width, height, proxy_format)) && neuralforge_protocol::enums::proxy_format::is_8bit(proxy_format) {
-        // Retain the model's raw answer for continuous re-presentation below --
-        // deliberately *not* run through `composition::gpu`/`composition::apply`'s
-        // tone-map compositor. That compositor's `UpgradeToneMap` targets `original`'s
-        // own luminance exactly whenever `original <= proxy`; this pipeline's `proxy
-        // == original` (no real downscaled proxy exists yet -- see this crate's other
-        // doc comments) makes that true on every pixel, which doesn't just dilute the
-        // model's edit but actively fights it: a *stronger* raw answer gets *more*
-        // aggressively cancelled by the same ratio-based rescale, confirmed by direct
-        // measurement on `lordnikon` 2026-09-12 (maxing every tuning parameter nearly
-        // doubled the raw model's own delta from original, then the compositor's
-        // output delta *dropped* below the unmodified baseline). No tuning knob fixes
-        // that; it's this pipeline's proxy/original conflation actively working
-        // against the model's answer, not merely muting it.
-        last_answer.clear();
-        last_answer.extend_from_slice(answer_scratch);
-        inflight.raw_answer_generation = inflight.raw_answer_generation.wrapping_add(1).max(1);
+        // Non-blocking capture (`ASYNC_CAPTURE_DESIGN.md`, `EXTERNAL_MEMORY_HOST_DESIGN.md`):
+        // poll whatever capture is already in flight for this slot -- never a queue/
+        // fence wait -- before deciding whether to submit a new one on it. Same
+        // per-slot wire-protocol constraint as before: only start a new round trip on
+        // this slot (and only bother keeping a just-finished capture's bytes at all)
+        // when nothing is already outstanding on it. A capture that finishes while a
+        // request is *already* in flight on this slot is still polled here (freeing
+        // its GPU buffer for reuse) but its bytes are simply not consumed -- the same
+        // bounded temporal-staleness tradeoff `run`'s own doc comment already
+        // accepts, not a new one. `poll_or_submit_capture` never submits in the same
+        // call it successfully polls, so a single check here (rather than the two
+        // separate ones a poll-then-maybe-submit split would need) already correctly
+        // skips submitting a redundant capture on the same call a round trip just
+        // started.
+        if !shm.has_pending_request(slot) {
+            if poll_or_submit_capture(
+                slot, use_direct, pipeline, direct, device, instance, physical_device, queue, queue_family,
+                capture_image, capture_layout, width, height, proxy_format, frame_bytes, shm, original_scratch,
+            ) {
+                shm.prepare_motion(instance, physical_device, width, height, proxy_format, original_scratch);
+                if shm.begin_async_request(slot) {
+                    std::mem::swap(&mut inflight[slot].original, original_scratch);
+                    inflight[slot].dims = Some((width, height, proxy_format));
+                }
+            }
+        }
+
+        if have_answer && inflight[slot].dims == Some((width, height, proxy_format)) && neuralforge_protocol::enums::proxy_format::is_8bit(proxy_format) {
+            // Retain the model's raw answer for continuous re-presentation below --
+            // deliberately *not* run through `composition::gpu`/`composition::apply`'s
+            // tone-map compositor. That compositor's `UpgradeToneMap` targets `original`'s
+            // own luminance exactly whenever `original <= proxy`; this pipeline's `proxy
+            // == original` (no real downscaled proxy exists yet -- see this crate's other
+            // doc comments) makes that true on every pixel, which doesn't just dilute the
+            // model's edit but actively fights it: a *stronger* raw answer gets *more*
+            // aggressively cancelled by the same ratio-based rescale, confirmed by direct
+            // measurement on `lordnikon` 2026-09-12 (maxing every tuning parameter nearly
+            // doubled the raw model's own delta from original, then the compositor's
+            // output delta *dropped* below the unmodified baseline). No tuning knob fixes
+            // that; it's this pipeline's proxy/original conflation actively working
+            // against the model's answer, not merely muting it.
+            last_answer.clear();
+            last_answer.extend_from_slice(answer_scratch);
+            *raw_answer_generation = raw_answer_generation.wrapping_add(1).max(1);
+        }
     }
 
     // Re-present the most recently retained answer on *every* call, not only the
@@ -625,9 +661,9 @@ pub unsafe fn run(
             queue,
             width,
             height,
-            &inflight.raw_answer_base,
+            raw_answer_base,
             last_answer,
-            inflight.raw_answer_generation,
+            *raw_answer_generation,
             bgr_order,
             image,
         ) {
@@ -822,53 +858,63 @@ fn build_pipeline(
     true
 }
 
-/// Non-blocking: checks every slot for a submission whose fence has actually signaled
-/// (`vkGetFenceStatus`, never `vkWaitForFences`) and, for the first one found, copies
-/// its bytes into `out` and frees the slot. Returns that submission's own
+/// Non-blocking: checks the given slot for a submission whose fence has actually
+/// signaled (`vkGetFenceStatus`, never `vkWaitForFences`) and, if so, copies its bytes
+/// into `out` and frees the slot. Returns that submission's own
 /// `(width, height, proxy_format)` -- the caller needs it to detect a resolution
 /// change against whatever it was expecting, same as every other dims check in this
-/// module. `None` (leaving `out` untouched) if nothing is signaled yet, or if a slot's
-/// fence reported a real error (left `pending` forever rather than guessed safe to
-/// reuse -- fail-closed on that one slot, not a reason to stop trying the other).
-fn poll_pipeline_capture(pipeline: &mut CapturePipeline, device: &ash::Device, out: &mut Vec<u8>) -> Option<(u32, u32, u32)> {
-    for slot in &mut pipeline.slots {
-        let dims = slot.pending?;
-        // SAFETY: `slot.buf.fence` belongs to this slot; a status query never touches
-        // command-buffer/buffer/memory state, so it's sound to call regardless of
-        // whether the submission this fence guards has actually completed yet.
-        match unsafe { device.get_fence_status(slot.buf.fence) } {
-            Ok(true) => {
-                let (width, height, proxy_format) = dims;
-                let bytes_per_pixel = neuralforge_protocol::enums::proxy_format::bytes_per_pixel(proxy_format) as u64;
-                let frame_bytes = (u64::from(width) * u64::from(height) * bytes_per_pixel) as usize;
-                // SAFETY: `slot.buf.ptr` is a live host-coherent mapping of at least
-                // `frame_bytes` bytes (`submit_pipeline_capture` only ever submits
-                // into a slot `build_capture_buffer` already sized for this exact
-                // `frame_bytes`); the fence just confirmed signaled means the GPU's
-                // writes are visible to the CPU with no explicit flush/invalidate
-                // needed (host-coherent memory, same as every other read of a
-                // `CaptureBuffer::ptr` in this module).
-                let captured = unsafe { std::slice::from_raw_parts(slot.buf.ptr, frame_bytes) };
-                out.clear();
-                out.extend_from_slice(captured);
-                slot.pending = None;
-                return Some(dims);
-            }
-            Ok(false) => {} // still in flight -- leave `pending`, check again next call
-            Err(_) => {}     // real device error -- leave `pending`; never guess reuse is safe
+/// module. `None` (leaving `out` untouched) if nothing is signaled yet, or if this
+/// slot's fence reported a real error (left `pending` forever rather than guessed
+/// safe to reuse).
+///
+/// Indexed by `slot`, not pooled: protocol v3 (`PROTOCOL_V3_DESIGN.md`) dedicates
+/// `pipeline.slots[0]` to wire slot 0's captures and `pipeline.slots[1]` to wire slot
+/// 1's, one-to-one, rather than handing either wire slot whichever GPU buffer happens
+/// to be free. That mapping is sound precisely because a caller only ever submits a
+/// new capture into `pipeline.slots[slot]` when wire slot `slot` itself has no
+/// request outstanding (see `run`'s own orchestration) -- by the time that's true,
+/// any earlier capture headed for this same wire slot has already been polled out
+/// and sent, so this GPU slot is free too, not just "some" slot in a shared pool.
+fn poll_pipeline_capture(pipeline: &mut CapturePipeline, slot: usize, device: &ash::Device, out: &mut Vec<u8>) -> Option<(u32, u32, u32)> {
+    let slot = &mut pipeline.slots[slot];
+    let dims = slot.pending?;
+    // SAFETY: `slot.buf.fence` belongs to this slot; a status query never touches
+    // command-buffer/buffer/memory state, so it's sound to call regardless of
+    // whether the submission this fence guards has actually completed yet.
+    match unsafe { device.get_fence_status(slot.buf.fence) } {
+        Ok(true) => {
+            let (width, height, proxy_format) = dims;
+            let bytes_per_pixel = neuralforge_protocol::enums::proxy_format::bytes_per_pixel(proxy_format) as u64;
+            let frame_bytes = (u64::from(width) * u64::from(height) * bytes_per_pixel) as usize;
+            // SAFETY: `slot.buf.ptr` is a live host-coherent mapping of at least
+            // `frame_bytes` bytes (`submit_pipeline_capture` only ever submits
+            // into a slot `build_capture_buffer` already sized for this exact
+            // `frame_bytes`); the fence just confirmed signaled means the GPU's
+            // writes are visible to the CPU with no explicit flush/invalidate
+            // needed (host-coherent memory, same as every other read of a
+            // `CaptureBuffer::ptr` in this module).
+            let captured = unsafe { std::slice::from_raw_parts(slot.buf.ptr, frame_bytes) };
+            out.clear();
+            out.extend_from_slice(captured);
+            slot.pending = None;
+            Some(dims)
         }
+        Ok(false) => None, // still in flight -- leave `pending`, check again next call
+        Err(_) => None,     // real device error -- leave `pending`; never guess reuse is safe
     }
-    None
 }
 
-/// Non-blocking: records and submits a new capture into whichever slot is free
-/// (`pending: None`), if any. `false` (no new capture this frame) if both slots are
-/// still pending or recording/submission itself failed -- the caller already treats
-/// that as "skip capture this frame", the same fail-open discipline as every other
-/// path in this module. Never waits, never touches a slot that is still `pending`.
+/// Non-blocking: records and submits a new capture into the given slot, if it's free
+/// (`pending: None`). `false` (no new capture this frame) if it's still pending or
+/// recording/submission itself failed -- the caller already treats that as "skip
+/// capture this frame", the same fail-open discipline as every other path in this
+/// module. Never waits, never touches a slot that is still `pending`. See
+/// [`poll_pipeline_capture`]'s own doc comment for why an indexed, dedicated slot per
+/// wire slot is sound (not a free-pool search like this function had before v3).
 #[allow(clippy::too_many_arguments)]
 fn submit_pipeline_capture(
     pipeline: &mut CapturePipeline,
+    slot: usize,
     device: &ash::Device,
     queue: vk::Queue,
     image: vk::Image,
@@ -877,7 +923,10 @@ fn submit_pipeline_capture(
     height: u32,
     proxy_format: u32,
 ) -> bool {
-    let Some(slot) = pipeline.slots.iter_mut().find(|s| s.pending.is_none()) else { return false };
+    let slot = &mut pipeline.slots[slot];
+    if slot.pending.is_some() {
+        return false;
+    }
     if !record_capture_commands(device, slot.buf.cmd, image, initial_layout, slot.buf.buffer, width, height) {
         return false;
     }
@@ -1481,8 +1530,12 @@ unsafe fn run_sync(
     let original: &[u8] = original_scratch.as_slice();
     let t_snapshot = t_snapshot_start.elapsed();
     let t_write_proxy_start = std::time::Instant::now();
-    shm.set_frame_info(width, height, proxy_format);
-    shm.write_proxy(captured);
+    // `run_sync` is the synchronous debug/one-shot path (debug_view, a one-shot
+    // capture_request dump) -- deliberately always slot 0, paired with
+    // `try_round_trip`'s own blocking wait, never protocol v3's second slot.
+    const SLOT: usize = 0;
+    shm.set_frame_info(SLOT, width, height, proxy_format);
+    shm.write_proxy(SLOT, captured);
     shm.prepare_motion(instance, physical_device, width, height, proxy_format, captured);
     let t_write_proxy = t_write_proxy_start.elapsed();
     let t_roundtrip_start = std::time::Instant::now();
@@ -1501,7 +1554,7 @@ unsafe fn run_sync(
         // SAFETY: same reasoning as the read above; `ShmClient::read_answer` never
         // writes past the slice's length, which is exactly `frame_bytes` here.
         let answer_dst = unsafe { std::slice::from_raw_parts_mut(r.ptr, frame_bytes as usize) };
-        shm.read_answer(answer_dst);
+        shm.read_answer(SLOT, answer_dst);
         // Only `RGBA8` is handled -- `RGBA16F` still passes the helper's raw answer
         // through untouched (see `composition::apply`'s own doc comment for why, and
         // `neuralforge_protocol::enums::proxy_format` for the format codes).
@@ -2029,12 +2082,15 @@ mod tests {
 
         let mut resources: Option<CaptureResources> = None;
         let mut pipeline: Option<CapturePipeline> = None;
-        let mut direct: Option<DirectCapture> = None;
+        let mut direct: [Option<DirectCapture>; 2] = [None, None];
         let mut gpu_compose: Option<crate::composition::gpu::GpuCompose> = None;
         let mut original_scratch = Vec::new();
         let mut answer_scratch = Vec::new();
+        let mut raw_answer_base = Vec::new();
+        let mut raw_answer_generation = 0u64;
         let mut last_answer = Vec::new();
-        let mut inflight = Inflight::default();
+        let mut inflight: [Inflight; 2] = Default::default();
+        let mut bootstrap_complete = false;
 
         let mut got_semaphore = false;
         let mut iteration = 0u32;
@@ -2077,7 +2133,10 @@ mod tests {
                     &mut shm,
                     &mut original_scratch,
                     &mut inflight,
+                    &mut bootstrap_complete,
                     &mut answer_scratch,
+                    &mut raw_answer_base,
+                    &mut raw_answer_generation,
                     &mut last_answer,
                 )
             };
@@ -2155,7 +2214,9 @@ mod tests {
             device.destroy_command_pool(pool, None);
             destroy(resources, &device);
             destroy_pipeline(pipeline, &device);
-            destroy_direct_capture(direct, &device);
+            for slot in direct {
+                destroy_direct_capture(slot, &device);
+            }
             if let Some(gpu) = gpu_compose {
                 gpu.destroy(&device);
             }
