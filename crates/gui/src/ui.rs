@@ -293,6 +293,7 @@ pub fn build_ui(app: &adw::Application) {
     view_stack.add_titled_with_icon(&debug_page, Some("debug"), "Debug", "edit-find-symbolic");
 
     let status_page = adw::PreferencesPage::new();
+    status_page.add(&build_telemetry_group(&shm));
     status_page.add(&build_status_group(&shm, &toasts));
     view_stack.add_titled_with_icon(&status_page, Some("status"), "Status", "network-transmit-receive-symbolic");
 
@@ -604,6 +605,183 @@ fn build_setup_page(toasts: &adw::ToastOverlay) -> adw::PreferencesPage {
     page.add(&build_install_group(toasts));
     page.add(&build_launch_option_group());
     page
+}
+
+/// One sample of the three timing series the sparkline plots, all already published
+/// by the layer/helper for `neuralforge-cli shmctl status` -- this just samples them
+/// on a faster timer than the once-a-second status labels above need, and keeps the
+/// last few seconds of them for the drawing area to plot.
+#[derive(Clone, Copy)]
+struct TelemetrySample {
+    layer_ms: f32,
+    helper_round_trip_ms: f32,
+    helper_eval_ms: f32,
+}
+
+const TELEMETRY_INTERVAL_MS: u32 = 200;
+const TELEMETRY_WINDOW_SECS: u32 = 5;
+const TELEMETRY_SAMPLES: usize = (TELEMETRY_WINDOW_SECS * 1000 / TELEMETRY_INTERVAL_MS) as usize;
+
+fn draw_telemetry_sparkline(cr: &gtk4::cairo::Context, width: i32, height: i32, history: &std::collections::VecDeque<TelemetrySample>) {
+    let (width, height) = (f64::from(width), f64::from(height));
+    let _ = cr.save();
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.0);
+    let _ = cr.paint();
+
+    if history.len() < 2 {
+        let _ = cr.restore();
+        return;
+    }
+
+    // A fixed ceiling (not the window's own max) so the line's height means the same
+    // thing frame to frame instead of visually flattening every series out whenever
+    // one of them briefly spikes -- 20ms is comfortably above a healthy per-stage
+    // budget at the frame rates this project targets, without being so tall that
+    // ordinary sub-millisecond noise disappears into the bottom pixel row.
+    const CEILING_MS: f32 = 20.0;
+    let plot = |cr: &gtk4::cairo::Context, pick: fn(&TelemetrySample) -> f32| {
+        for (i, sample) in history.iter().enumerate() {
+            let x = width * (i as f64) / ((history.len() - 1) as f64);
+            let y = height * (1.0 - f64::from(pick(sample).min(CEILING_MS) / CEILING_MS));
+            if i == 0 {
+                cr.move_to(x, y);
+            } else {
+                cr.line_to(x, y);
+            }
+        }
+        let _ = cr.stroke();
+    };
+
+    cr.set_line_width(1.6);
+    cr.set_source_rgb(0.988, 0.686, 0.243); // helper round trip -- amber
+    plot(cr, |s| s.helper_round_trip_ms);
+    cr.set_source_rgb(0.204, 0.780, 0.678); // model eval -- teal
+    plot(cr, |s| s.helper_eval_ms);
+    cr.set_source_rgb(0.596, 0.478, 0.953); // layer (capture+compose) -- violet, matches the app's own accent
+    plot(cr, |s| s.layer_ms);
+
+    let _ = cr.restore();
+}
+
+fn legend_label(text: &str, rgb: (f64, f64, f64)) -> gtk4::Box {
+    let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    let swatch = gtk4::DrawingArea::new();
+    swatch.set_content_width(10);
+    swatch.set_content_height(10);
+    swatch.set_valign(gtk4::Align::Center);
+    swatch.set_draw_func(move |_, cr, w, h| {
+        cr.set_source_rgb(rgb.0, rgb.1, rgb.2);
+        cr.rectangle(0.0, 0.0, f64::from(w), f64::from(h));
+        let _ = cr.fill();
+    });
+    row.append(&swatch);
+    row.append(&gtk4::Label::new(Some(text)));
+    row
+}
+
+fn build_telemetry_group(shm: &std::sync::Arc<neuralforge_protocol::mapping::Mapping>) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::new();
+    group.set_title("Telemetry");
+    group.set_description(Some("Live from the running helper/layer -- all zero until a targeted game attaches"));
+
+    let model_row = adw::ActionRow::new();
+    model_row.set_title("Model");
+    let game_row = adw::ActionRow::new();
+    game_row.set_title("Game");
+    let fps_row = adw::ActionRow::new();
+    fps_row.set_title("Frame rate");
+    group.add(&model_row);
+    group.add(&game_row);
+    group.add(&fps_row);
+
+    let legend = gtk4::Box::new(gtk4::Orientation::Horizontal, 16);
+    legend.set_margin_top(10);
+    legend.set_margin_start(10);
+    legend.set_margin_end(10);
+    legend.append(&legend_label("Layer", (0.596, 0.478, 0.953)));
+    legend.append(&legend_label("Helper round trip", (0.988, 0.686, 0.243)));
+    legend.append(&legend_label("Model eval", (0.204, 0.780, 0.678)));
+
+    let sparkline = gtk4::DrawingArea::new();
+    // A minimum, not a ceiling: `AdwPreferencesGroup` still stretches this row taller
+    // than 80px on a short page with room to spare (confirmed visually; `vexpand`
+    // false the whole way down this box's ancestor chain didn't stop it either).
+    // Harmless -- `draw_telemetry_sparkline` normalizes against whatever height it's
+    // actually given each draw, so the plot still reads correctly at any size.
+    sparkline.set_size_request(-1, 80);
+    sparkline.set_hexpand(true);
+    sparkline.set_vexpand(false);
+    sparkline.set_margin_start(10);
+    sparkline.set_margin_end(10);
+    sparkline.set_margin_bottom(10);
+
+    // One card-styled box for both, matching the boxed-row look every other group in
+    // this app already has -- adding `legend`/`sparkline` straight to `group` instead
+    // makes each its own bare, unstyled top-level row with layout that doesn't match
+    // (confirmed visually: `AdwPreferencesGroup` gives each direct child list-row
+    // spacing meant for `AdwActionRow`-shaped content, not a fixed-height drawing
+    // area, so `set_content_height` alone doesn't produce the intended fixed size).
+    let card = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    card.add_css_class("card");
+    card.set_vexpand(false);
+    card.set_valign(gtk4::Align::Start);
+    card.set_margin_top(6);
+    card.set_margin_bottom(6);
+    card.set_margin_start(12);
+    card.set_margin_end(12);
+    card.append(&legend);
+    card.append(&sparkline);
+    group.add(&card);
+
+    let history = std::rc::Rc::new(std::cell::RefCell::new(std::collections::VecDeque::<TelemetrySample>::with_capacity(TELEMETRY_SAMPLES)));
+    {
+        let history = std::rc::Rc::clone(&history);
+        sparkline.set_draw_func(move |_, cr, width, height| draw_telemetry_sparkline(cr, width, height, &history.borrow()));
+    }
+
+    let shm_for_timer = std::sync::Arc::clone(shm);
+    let sparkline_for_timer = sparkline.clone();
+    let mut last_helper_frames: Option<u64> = None;
+    let mut last_layer_frames: Option<u64> = None;
+    glib::timeout_add_local(std::time::Duration::from_millis(u64::from(TELEMETRY_INTERVAL_MS)), move || {
+        let hdr = shm_for_timer.header();
+
+        model_row.set_subtitle(if hdr.model_up.load(Ordering::Relaxed) != 0 { "loaded" } else { "not loaded" });
+        let game = hdr.game_name();
+        game_row.set_subtitle(if game.is_empty() { "none attached" } else { &game });
+
+        let helper_frames = (u64::from(hdr.helper_frames_hi.load(Ordering::Relaxed)) << 32) | u64::from(hdr.helper_frames_lo.load(Ordering::Relaxed));
+        let layer_frames = (u64::from(hdr.layer_frames_hi.load(Ordering::Relaxed)) << 32) | u64::from(hdr.layer_frames_lo.load(Ordering::Relaxed));
+        let per_second = 1000.0 / f64::from(TELEMETRY_INTERVAL_MS);
+        let helper_fps = last_helper_frames.map(|prev| (helper_frames.saturating_sub(prev)) as f64 * per_second);
+        let layer_fps = last_layer_frames.map(|prev| (layer_frames.saturating_sub(prev)) as f64 * per_second);
+        last_helper_frames = Some(helper_frames);
+        last_layer_frames = Some(layer_frames);
+        match (layer_fps, helper_fps) {
+            (Some(l), Some(h)) => fps_row.set_subtitle(&format!("layer {l:.1}/s, helper {h:.1}/s")),
+            _ => fps_row.set_subtitle("—"),
+        }
+
+        let sample = TelemetrySample {
+            layer_ms: f32::from_bits(hdr.layer_ms_bits.load(Ordering::Relaxed)),
+            helper_round_trip_ms: f32::from_bits(hdr.helper_upload_ms_bits.load(Ordering::Relaxed))
+                + f32::from_bits(hdr.helper_eval_ms_bits.load(Ordering::Relaxed))
+                + f32::from_bits(hdr.helper_readback_ms_bits.load(Ordering::Relaxed)),
+            helper_eval_ms: f32::from_bits(hdr.helper_eval_ms_bits.load(Ordering::Relaxed)),
+        };
+        {
+            let mut history = history.borrow_mut();
+            if history.len() == TELEMETRY_SAMPLES {
+                history.pop_front();
+            }
+            history.push_back(sample);
+        }
+        sparkline_for_timer.queue_draw();
+
+        glib::ControlFlow::Continue
+    });
+
+    group
 }
 
 fn build_status_group(shm: &std::sync::Arc<neuralforge_protocol::mapping::Mapping>, toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
