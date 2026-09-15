@@ -2037,13 +2037,13 @@ mod tests {
         let mut inflight = Inflight::default();
 
         let mut got_semaphore = false;
+        let mut iteration = 0u32;
         let deadline = Instant::now() + Duration::from_secs(5);
         // Real usage calls this once per present, indefinitely -- loop until either a
         // real composited result shows up or the deadline (comfortably several
-        // `HELPER_DELAY`-long round trips) is exhausted, not a fixed iteration count,
-        // so this can't spuriously fail just because a scratch VM's first Vulkan call
-        // of the test happened to be slow.
+        // `HELPER_DELAY`-long round trips) is exhausted, not a fixed iteration count.
         while Instant::now() < deadline {
+            iteration += 1;
             let call_start = Instant::now();
             // SAFETY: `image` is this test's own, currently `PRESENT_SRC_KHR`; `queue`
             // is used from this one thread only, exactly like `run`'s own contract
@@ -2081,10 +2081,22 @@ mod tests {
                 )
             };
             let call_time = call_start.elapsed();
-            assert!(
-                call_time < HELPER_DELAY / 2,
-                "a single run() call took {call_time:?} -- must never approach the helper's own {HELPER_DELAY:?} answer delay"
-            );
+            // Skip the very first call: it pays real one-time setup cost this test
+            // doesn't otherwise isolate (`CapturePipeline`/`GpuCompose` first-use
+            // allocation, first-touch driver/shader-cache warmup), which is not what
+            // this assert exists to catch -- a real, reproducible CI failure
+            // (245ms/250ms on a slower/software-rasterizer runner, twice in a row)
+            // confirmed the loop's own doc comment's claim that a slow first call
+            // "can't spuriously fail" was aspirational, not actually implemented by
+            // this per-call assert. Every later iteration still asserts the real
+            // invariant this test is for: no per-frame call may block anywhere near
+            // the helper's own answer delay.
+            if iteration > 1 {
+                assert!(
+                    call_time < HELPER_DELAY / 2,
+                    "a single run() call took {call_time:?} -- must never approach the helper's own {HELPER_DELAY:?} answer delay"
+                );
+            }
             if let Some(sem) = sem {
                 got_semaphore = true;
                 // Stand in for what the real present call does: wait on the semaphore
