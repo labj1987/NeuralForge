@@ -107,6 +107,23 @@ struct State {
     /// both purposes -- a slot mid-flight for one would otherwise have to be safe to
     /// borrow for the other's completely different, fully-synchronous contract.
     capture_pipeline: Option<capture::CapturePipeline>,
+    /// The Phase 3 zero-copy capture path (`EXTERNAL_MEMORY_HOST_DESIGN.md`) --
+    /// mutually exclusive with `capture_pipeline` above, never both active for the
+    /// same device (see `DirectCapture`'s own doc comment for why sharing the SHM
+    /// proxy region between two concurrently in-flight slots would be a write-write
+    /// hazard). `capture::run` decides which of the two to use every call, cheaply,
+    /// from `external_memory_host` below plus a live alignment query -- so this stays
+    /// populated (or not) correctly even if that decision's answer could somehow
+    /// change mid-process, though in practice it never does.
+    direct_capture: Option<capture::DirectCapture>,
+    /// Whether `NeuralForgeInstanceHooks::create_device` (crate::lib) got
+    /// `VK_EXT_external_memory_host` added to this device's own creation -- set once,
+    /// at construction, from a side channel only that hook can populate (see its own
+    /// doc comment for why `create_info` here would always say "no" regardless of
+    /// what was actually enabled). `false` is the common case (no ordinary game
+    /// requests this extension on its own); `capture::run` treats it as "keep using
+    /// the staging-buffer path", not an error.
+    external_memory_host: bool,
     gpu_compose: Option<crate::composition::gpu::GpuCompose>,
     /// Reused across frames by `capture::run` for its own pre-edit frame snapshot,
     /// instead of a fresh `frame_bytes`-sized heap allocation every single present
@@ -147,11 +164,12 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
     let owned = CLEANUP.lock().unwrap().remove(&handle);
     if let Some((device, state)) = owned {
         let mut state = state.lock().unwrap();
-        if state.capture.is_some() || state.capture_pipeline.is_some() || state.gpu_compose.is_some() {
+        if state.capture.is_some() || state.capture_pipeline.is_some() || state.direct_capture.is_some() || state.gpu_compose.is_some() {
             match unsafe { device.device_wait_idle() } {
                 Ok(()) | Err(vk::Result::ERROR_DEVICE_LOST) => {
                     unsafe { capture::destroy(state.capture.take(), &device); }
                     unsafe { capture::destroy_pipeline(state.capture_pipeline.take(), &device); }
+                    unsafe { capture::destroy_direct_capture(state.direct_capture.take(), &device); }
                     if let Some(compose) = state.gpu_compose.take() {
                         unsafe { compose.destroy(&device); }
                     }
@@ -210,9 +228,9 @@ impl NeuralForgeDeviceInfo {
         // device existed at all -- see that function's own doc comment for why this
         // is the only way to learn it here, since `create_info` below always reflects
         // the app's *original*, un-injected request regardless of what actually got
-        // enabled. Logged, not yet stored on `State`: nothing reads it past this line
-        // yet -- see EXTERNAL_MEMORY_HOST_DESIGN.md's own "not done yet" for the actual
-        // import path this unblocks next.
+        // enabled. Stored on `State` below; `capture::run` reads it every call to
+        // decide between `DirectCapture` and `CapturePipeline` (see
+        // EXTERNAL_MEMORY_HOST_DESIGN.md).
         let external_memory_host = crate::take_external_memory_host_enabled(handle);
         crate::log!(
             "[layer] hooked device {:?} (swapchain support: {}, external_memory_host: {})",
@@ -227,7 +245,7 @@ impl NeuralForgeDeviceInfo {
         // line after this one, including real per-frame activity, purely because
         // nothing forced a flush past this first, coincidentally-flushed call).
         crate::logging::flush();
-        let state = Arc::new(Mutex::new(State::default()));
+        let state = Arc::new(Mutex::new(State { external_memory_host, ..State::default() }));
         CLEANUP.lock().unwrap().insert(handle, (device.clone(), state.clone()));
         Self {
             // SAFETY: create_info is the loader chain for this newly created device.
@@ -530,7 +548,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 let proxy_format = swapchain::proxy_format_for(sw.format);
                 let bgr_order = swapchain::is_bgr_order(sw.format);
                 let (capture_image, capture_layout) = tap.unwrap_or((image, vk::ImageLayout::PRESENT_SRC_KHR));
-                let State { shm, capture, capture_pipeline, gpu_compose, original_scratch, inflight, answer_scratch, last_answer, hotkey, .. } = &mut *state;
+                let State { shm, capture, capture_pipeline, direct_capture, external_memory_host, gpu_compose, original_scratch, inflight, answer_scratch, last_answer, hotkey, .. } = &mut *state;
                 shm.poll_toggle_hotkey(hotkey);
                 if shm.model_known_unavailable() {
                     // The helper has permanently disabled itself for this session
@@ -566,6 +584,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                             bgr_order,
                             capture,
                             capture_pipeline,
+                            direct_capture,
+                            *external_memory_host,
                             gpu_compose,
                             shm,
                             original_scratch,

@@ -311,6 +311,85 @@ pub struct Inflight {
 /// capture this function's own composited output instead of the game's real
 /// rendering, feeding a corrupted "original" into the next cycle.
 ///
+/// Polls whatever capture is already in flight -- [`DirectCapture`] when `use_direct`,
+/// otherwise [`CapturePipeline`] -- and, if one just completed, gets its bytes into
+/// `original_scratch` and the SHM proxy region, then returns `true`. If nothing
+/// completed this call, tries to submit a new capture into whichever strategy is
+/// active instead (`false` either way). Shared by both of `run`'s capture call sites
+/// (the disabled-bootstrap one-shot and the main enabled path below) -- they differ
+/// only in what they do with a successful result afterward (`inflight` bookkeeping),
+/// not in how a capture gets started or consumed.
+///
+/// For [`CapturePipeline`], "gets its bytes into `original_scratch` and the SHM proxy
+/// region" means what it always has: copy staging memory into `original_scratch`, then
+/// [`ShmClient::write_proxy`] copies that into the proxy region. For [`DirectCapture`],
+/// the GPU write already landed the bytes in the proxy region directly -- no
+/// `write_proxy` call needed, that copy is exactly what importing the region as device
+/// memory removes -- but `original_scratch` still needs its own stable copy (read back
+/// out of the now-written proxy region), because `inflight.original`/`prepare_motion`
+/// need bytes that survive whatever capture starts next and overwrites that region,
+/// which the live proxy region itself can't provide once it's shared, imported memory.
+#[allow(clippy::too_many_arguments)]
+fn poll_or_submit_capture(
+    use_direct: bool,
+    pipeline: &mut Option<CapturePipeline>,
+    direct: &mut Option<DirectCapture>,
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    queue: vk::Queue,
+    queue_family: u32,
+    capture_image: vk::Image,
+    capture_layout: vk::ImageLayout,
+    width: u32,
+    height: u32,
+    proxy_format: u32,
+    frame_bytes: u64,
+    shm: &mut ShmClient,
+    original_scratch: &mut Vec<u8>,
+) -> bool {
+    if use_direct {
+        let Some((host_ptr, capacity)) = shm.proxy_region() else { return false };
+        // SAFETY: `host_ptr`/`capacity` describe `shm`'s own live proxy region, valid
+        // for as long as `shm` stays open (the life of this process, since the
+        // mapping is never unmapped -- see `neuralforge_protocol::mapping::Mapping::header`'s
+        // own doc comment on the equivalent GUI/CLI mapping); nothing else writes to
+        // it except through `ShmClient::write_proxy`, which this branch never calls.
+        if !unsafe {
+            ensure_direct_capture(direct, device, instance, physical_device, queue_family, host_ptr, capacity as vk::DeviceSize)
+        } {
+            return false;
+        }
+        let d = direct.as_mut().expect("just ensured above");
+        if let Some(_dims) = poll_direct_capture(d, device) {
+            let n = capacity.min(frame_bytes as usize);
+            original_scratch.clear();
+            // SAFETY: `host_ptr` is `shm`'s own live proxy region, valid for at least
+            // `capacity` bytes; `poll_direct_capture` returning `Some` just confirmed
+            // this slot's fence signaled, making the GPU's writes to it visible to the
+            // CPU (host-coherent memory backs every capture buffer in this module,
+            // imported or not).
+            original_scratch.extend_from_slice(unsafe { std::slice::from_raw_parts(host_ptr, n) });
+            shm.set_frame_info(width, height, proxy_format);
+            return true;
+        }
+        submit_direct_capture(d, device, queue, capture_image, capture_layout, width, height, proxy_format);
+        false
+    } else {
+        if !ensure_pipeline(pipeline, device, instance, physical_device, queue_family, frame_bytes) {
+            return false;
+        }
+        let p = pipeline.as_mut().expect("just ensured above");
+        if poll_pipeline_capture(p, device, original_scratch).is_some() {
+            shm.set_frame_info(width, height, proxy_format);
+            shm.write_proxy(original_scratch);
+            return true;
+        }
+        submit_pipeline_capture(p, device, queue, capture_image, capture_layout, width, height, proxy_format);
+        false
+    }
+}
+
 /// # Safety
 /// Same contract as [`run_sync`]: `queue` must be the same queue `image`'s
 /// presentation was requested on, with no concurrent use of it from another thread
@@ -331,6 +410,8 @@ pub unsafe fn run(
     bgr_order: bool,
     resources: &mut Option<CaptureResources>,
     pipeline: &mut Option<CapturePipeline>,
+    direct: &mut Option<DirectCapture>,
+    external_memory_host: bool,
     gpu_compose: &mut Option<crate::composition::gpu::GpuCompose>,
     shm: &mut ShmClient,
     original_scratch: &mut Vec<u8>,
@@ -353,6 +434,24 @@ pub unsafe fn run(
     // already open, see its own early return), so there's no real cost to calling it
     // here up front instead of leaving each caller to remember to.
     shm.open();
+    // Decided fresh each call rather than cached: `vkGetPhysicalDeviceProperties2` is
+    // a cheap, purely local query (the driver already has this value on hand, no real
+    // round trip), so there's no need for a whole extra piece of per-device state just
+    // to memoize something this inexpensive. Checked against the *actual* runtime
+    // proxy-region pointer, not just its constant offset within the mapping --
+    // `mmap`'s returned address alignment is not something this project can assume
+    // beyond the page size POSIX guarantees, and a wrong guess here would silently
+    // stop `poll_or_submit_capture` from ever completing a capture again for the rest
+    // of this device's life (`ensure_direct_capture` failing is the only signal, and
+    // this function has no per-call fallback to `CapturePipeline` once `use_direct` is
+    // decided) rather than fail open onto the always-correct staging-buffer path.
+    let use_direct = external_memory_host
+        && shm.proxy_region().is_some_and(|(ptr, capacity)| {
+            min_imported_host_pointer_alignment(instance, physical_device).is_some_and(|alignment| {
+                let alignment = alignment as usize;
+                alignment != 0 && (ptr as usize) % alignment == 0 && capacity % alignment == 0
+            })
+        });
     let Some(settings) = shm.composition_settings() else { return None };
     // `debug_view`'s compare/split views and a pending `capture_request`'s dump both
     // need *this* frame's own original and answer, not whatever the async pipeline
@@ -415,22 +514,17 @@ pub unsafe fn run(
             }
             return None;
         }
-        // Same non-blocking two-slot pipeline as the enabled path below, used here
-        // too so this one-shot warm-up capture never costs a blocking fence wait
-        // either -- it just takes a call or two longer to land (irrelevant for a
-        // once-per-process bootstrap) instead of stalling the present it happens on.
-        if ensure_pipeline(pipeline, device, instance, physical_device, queue_family, frame_bytes) {
-            if let Some(p) = pipeline {
-                if poll_pipeline_capture(p, device, original_scratch).is_some() {
-                    shm.set_frame_info(width, height, proxy_format);
-                    shm.write_proxy(original_scratch);
-                    shm.prepare_motion(instance, physical_device, width, height, proxy_format, original_scratch);
-                    if shm.begin_async_request() {
-                        inflight.dims = Some((width, height, proxy_format));
-                    }
-                } else {
-                    submit_pipeline_capture(p, device, queue, capture_image, capture_layout, width, height, proxy_format);
-                }
+        // Same non-blocking capture strategy as the enabled path below, used here too
+        // so this one-shot warm-up capture never costs a blocking fence wait either --
+        // it just takes a call or two longer to land (irrelevant for a once-per-process
+        // bootstrap) instead of stalling the present it happens on.
+        if poll_or_submit_capture(
+            use_direct, pipeline, direct, device, instance, physical_device, queue, queue_family,
+            capture_image, capture_layout, width, height, proxy_format, frame_bytes, shm, original_scratch,
+        ) {
+            shm.prepare_motion(instance, physical_device, width, height, proxy_format, original_scratch);
+            if shm.begin_async_request() {
+                inflight.dims = Some((width, height, proxy_format));
             }
         }
         return None;
@@ -453,34 +547,27 @@ pub unsafe fn run(
         }
     }
 
-    // Non-blocking two-slot capture pipeline (`ASYNC_CAPTURE_DESIGN.md`): poll
-    // whatever capture is already in flight -- never a queue/fence wait -- before
-    // deciding whether to submit a new one. `ensure_pipeline` itself only blocks on
-    // a resize/queue-family change, never on this per-present path.
-    if ensure_pipeline(pipeline, device, instance, physical_device, queue_family, frame_bytes) {
-        if let Some(p) = pipeline {
-            // Same wire-protocol constraint as before: only start a new round trip
-            // (and only bother keeping a just-finished capture's bytes at all) when
-            // nothing is already outstanding. A capture that finishes while a
-            // request is *already* in flight is still polled here (freeing its
-            // slot for reuse) but its bytes are simply not consumed -- the same
-            // bounded temporal-staleness tradeoff `run`'s own doc comment already
-            // accepts, not a new one.
-            if !shm.has_pending_request() && poll_pipeline_capture(p, device, original_scratch).is_some() {
-                shm.set_frame_info(width, height, proxy_format);
-                shm.write_proxy(original_scratch);
-                shm.prepare_motion(instance, physical_device, width, height, proxy_format, original_scratch);
-                if shm.begin_async_request() {
-                    std::mem::swap(&mut inflight.original, original_scratch);
-                    inflight.dims = Some((width, height, proxy_format));
-                }
-            }
-            // Deliberately checked again (rather than `else`): the poll above may
-            // have just started a new round trip, which makes this correctly skip
-            // submitting a redundant capture this same call -- `has_pending_request`
-            // reflects that state change immediately, no separate flag needed.
-            if !shm.has_pending_request() {
-                submit_pipeline_capture(p, device, queue, capture_image, capture_layout, width, height, proxy_format);
+    // Non-blocking capture (`ASYNC_CAPTURE_DESIGN.md`, `EXTERNAL_MEMORY_HOST_DESIGN.md`):
+    // poll whatever capture is already in flight -- never a queue/fence wait -- before
+    // deciding whether to submit a new one. Same wire-protocol constraint as before:
+    // only start a new round trip (and only bother keeping a just-finished capture's
+    // bytes at all) when nothing is already outstanding. A capture that finishes while
+    // a request is *already* in flight is still polled here (freeing its slot for
+    // reuse) but its bytes are simply not consumed -- the same bounded
+    // temporal-staleness tradeoff `run`'s own doc comment already accepts, not a new
+    // one. `poll_or_submit_capture` never submits in the same call it successfully
+    // polls, so a single check here (rather than the two separate ones a poll-then-
+    // maybe-submit split would need) already correctly skips submitting a redundant
+    // capture on the same call a round trip just started.
+    if !shm.has_pending_request() {
+        if poll_or_submit_capture(
+            use_direct, pipeline, direct, device, instance, physical_device, queue, queue_family,
+            capture_image, capture_layout, width, height, proxy_format, frame_bytes, shm, original_scratch,
+        ) {
+            shm.prepare_motion(instance, physical_device, width, height, proxy_format, original_scratch);
+            if shm.begin_async_request() {
+                std::mem::swap(&mut inflight.original, original_scratch);
+                inflight.dims = Some((width, height, proxy_format));
             }
         }
     }
@@ -825,6 +912,314 @@ pub unsafe fn destroy_pipeline(pipeline: Option<CapturePipeline>, device: &ash::
             unsafe { slot.buf.destroy(device) };
         }
     }
+}
+
+/// Whether, and by how much, this device's driver requires host pointers imported via
+/// `VK_EXT_external_memory_host` to be aligned (`VkPhysicalDeviceExternalMemoryHostPropertiesEXT::minImportedHostPointerAlignment`).
+/// `None` if the query itself fails -- treated as "don't attempt import", the same
+/// fail-open discipline as every other capability check in this module.
+fn min_imported_host_pointer_alignment(instance: &ash::Instance, physical_device: vk::PhysicalDevice) -> Option<vk::DeviceSize> {
+    let mut ext_props = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
+    let mut props2 = vk::PhysicalDeviceProperties2::builder().push_next(&mut ext_props);
+    // SAFETY: `physical_device` belongs to `instance`; `props2` is a freshly built,
+    // valid out-parameter with the EXT struct chained into its `pNext`.
+    unsafe { instance.get_physical_device_properties2(physical_device, &mut props2) };
+    (ext_props.min_imported_host_pointer_alignment > 0).then_some(ext_props.min_imported_host_pointer_alignment)
+}
+
+/// The Phase 3 zero-copy capture path (`EXTERNAL_MEMORY_HOST_DESIGN.md`): a single
+/// [`CaptureBuffer`] whose device memory is *imported* directly from the live SHM
+/// proxy region (`ShmClient::proxy_region`), so `vkCmdCopyImageToBuffer` writes
+/// straight into shared memory -- no staging buffer, no CPU copy on the way there.
+///
+/// Deliberately one slot, not two like [`CapturePipeline`]: the imported memory *is*
+/// the one shared proxy region every caller of `ShmClient::write_proxy` ultimately
+/// writes to. Two of these submitted concurrently would be two unsynchronized GPU
+/// writes to the exact same destination bytes -- a real write-write hazard, not just
+/// wasted work -- so there is no second slot to hide capture latency behind here. The
+/// tradeoff for a direct write is capping this at one in-flight capture at a time;
+/// [`run`] only ever uses one of [`DirectCapture`] or [`CapturePipeline`] for a given
+/// device, never both, precisely so nothing else can also be writing to the same
+/// region through the other path.
+pub struct DirectCapture {
+    buf: CaptureBuffer,
+    /// Same meaning as `PipelineSlot::pending`, for this capture's own single slot.
+    pending: Option<(u32, u32, u32)>,
+}
+
+/// Builds (or rebuilds, on a capacity/queue-family change) the one slot
+/// [`DirectCapture`] needs, importing `host_ptr`/`capacity` (the live SHM proxy
+/// region) rather than allocating fresh device memory. `false` on any failure --
+/// every caller already treats that as "fall back to `CapturePipeline`", never a
+/// reason to stop trying on a later frame.
+///
+/// # Safety
+/// `host_ptr` must be valid for `capacity` bytes for as long as `existing` holds
+/// `Some` afterward, and nothing outside the resulting `DirectCapture`'s own command
+/// buffer may write to those bytes while a capture against them is in flight.
+unsafe fn ensure_direct_capture(
+    existing: &mut Option<DirectCapture>,
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    queue_family: u32,
+    host_ptr: *mut u8,
+    capacity: vk::DeviceSize,
+) -> bool {
+    if let Some(d) = existing.as_ref() {
+        if d.buf.capacity >= capacity && d.buf.ptr == host_ptr {
+            return true;
+        }
+        // A resize/pointer change (the mapping is only ever established once per
+        // process in practice, but this mirrors `ensure_pipeline`'s own rebuild
+        // discipline rather than assuming that) needs the same drain-before-destroy
+        // care: never touch a slot that might still be in flight.
+        if d.pending.is_some() {
+            // SAFETY: `d.buf.fence` is this slot's own fence; waiting for it before
+            // any destroy below touches the resources it guards is exactly what makes
+            // that destroy sound. Unbounded, like every other rebuild wait in this
+            // module -- rare, not latency sensitive, and there is no timeout to guess.
+            if unsafe { device.wait_for_fences(&[d.buf.fence], true, u64::MAX) }.is_err() {
+                return false;
+            }
+        }
+        let d = existing.take().expect("checked above");
+        // SAFETY: the fence was just confirmed signaled above (or was never pending).
+        unsafe { d.buf.destroy(device) };
+    }
+    // SAFETY: forwarded from this function's own contract.
+    let Some(buf) = (unsafe { build_imported_capture_buffer(device, instance, physical_device, queue_family, host_ptr, capacity) }) else {
+        return false;
+    };
+    *existing = Some(DirectCapture { buf, pending: None });
+    true
+}
+
+/// Non-blocking, mirrors [`poll_pipeline_capture`] -- except there is nothing to copy
+/// out: a signaled fence here means the bytes are already sitting in the SHM proxy
+/// region this slot's memory was imported from. Returns the completed submission's own
+/// `(width, height, proxy_format)`, or `None` if nothing is signaled yet (or the fence
+/// reported a real error, left `pending` forever rather than guessed safe to reuse).
+fn poll_direct_capture(direct: &mut DirectCapture, device: &ash::Device) -> Option<(u32, u32, u32)> {
+    let dims = direct.pending?;
+    // SAFETY: `direct.buf.fence` belongs to this slot; a status query never touches
+    // command-buffer/buffer/memory state, so it's sound regardless of whether the
+    // submission this fence guards has actually completed yet.
+    match unsafe { device.get_fence_status(direct.buf.fence) } {
+        Ok(true) => {
+            direct.pending = None;
+            Some(dims)
+        }
+        Ok(false) => None,
+        Err(_) => None, // real device error -- leave `pending`; never guess reuse is safe
+    }
+}
+
+/// Non-blocking, mirrors [`submit_pipeline_capture`] -- records and submits a new
+/// capture into the one slot, if it's free (`pending: None`). `false` if it's still
+/// pending or recording/submission itself failed.
+#[allow(clippy::too_many_arguments)]
+fn submit_direct_capture(
+    direct: &mut DirectCapture,
+    device: &ash::Device,
+    queue: vk::Queue,
+    image: vk::Image,
+    initial_layout: vk::ImageLayout,
+    width: u32,
+    height: u32,
+    proxy_format: u32,
+) -> bool {
+    if direct.pending.is_some() {
+        return false;
+    }
+    if !record_capture_commands(device, direct.buf.cmd, image, initial_layout, direct.buf.buffer, width, height) {
+        return false;
+    }
+    // SAFETY: `direct.buf.fence` is `pending: None` here -- either never used yet
+    // (starts signaled) or its previous signal was already confirmed and consumed by
+    // `poll_direct_capture` -- so resetting it now cannot race an in-flight wait.
+    if unsafe { device.reset_fences(&[direct.buf.fence]) }.is_err() {
+        return false;
+    }
+    let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&direct.buf.cmd)).build();
+    // SAFETY: `direct.buf.cmd` was just recorded and ended above. Deliberately not
+    // waited on -- same reasoning as `submit_pipeline_capture`.
+    if unsafe { device.queue_submit(queue, &[submit], direct.buf.fence) }.is_err() {
+        return false;
+    }
+    direct.pending = Some((width, height, proxy_format));
+    true
+}
+
+/// # Safety
+/// Must only be called at device-destruction time, with no submitted work referencing
+/// these handles still in flight -- same contract as [`destroy`]. Never unmaps or
+/// otherwise touches the imported host pointer itself -- that memory belongs to
+/// `ShmClient`, not this buffer, exactly like every other Vulkan-object-only destroy
+/// in this module.
+pub unsafe fn destroy_direct_capture(direct: Option<DirectCapture>, device: &ash::Device) {
+    if let Some(d) = direct {
+        // SAFETY: forwarded from this function's own contract.
+        unsafe { d.buf.destroy(device) };
+    }
+}
+
+/// Builds a [`CaptureBuffer`] whose device memory is *imported* from `host_ptr`
+/// (`VK_EXT_external_memory_host`) rather than freshly allocated -- `ptr` in the
+/// result is `host_ptr` itself, not a separate `vkMapMemory` mapping, so a capture
+/// submitted against it writes straight into whatever `host_ptr` already points at.
+/// `None` on any failure, exactly like [`build_capture_buffer`].
+///
+/// # Safety
+/// `host_ptr` must be valid for `bytes` bytes and already aligned/sized to whatever
+/// `min_imported_host_pointer_alignment` the caller queried -- this function does not
+/// re-check either, only the driver does (at `vkAllocateMemory`, where a violation is
+/// a validation error, not proactively caught here).
+unsafe fn build_imported_capture_buffer(
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    queue_family: u32,
+    host_ptr: *mut u8,
+    bytes: vk::DeviceSize,
+) -> Option<CaptureBuffer> {
+    let pool_info =
+        vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+    // SAFETY: `device` is the live device this capture serves; `pool_info` is valid.
+    let Ok(pool) = (unsafe { device.create_command_pool(&pool_info, None) }) else { return None };
+    let alloc_info = vk::CommandBufferAllocateInfo::builder()
+        .command_pool(pool)
+        .level(vk::CommandBufferLevel::PRIMARY)
+        .command_buffer_count(1);
+    // SAFETY: `pool` was just created above.
+    let cmd = match unsafe { crate::loader_data::allocate_commands(device, &alloc_info) } {
+        Ok(bufs) => bufs[0],
+        Err(_) => {
+            // SAFETY: `pool` owns no other resources yet.
+            unsafe { device.destroy_command_pool(pool, None) };
+            return None;
+        }
+    };
+    let fence_info = vk::FenceCreateInfo::builder().flags(vk::FenceCreateFlags::SIGNALED);
+    // SAFETY: starting signaled means the first use's own poll never reports pending
+    // for a fence nothing has submitted work against yet.
+    let fence = match unsafe { device.create_fence(&fence_info, None) } {
+        Ok(f) => f,
+        Err(_) => {
+            // SAFETY: `pool` owns no other resources yet; freeing it also frees `cmd`.
+            unsafe { device.destroy_command_pool(pool, None) };
+            return None;
+        }
+    };
+
+    // Imported host memory has its own compatibility query -- separate from (and not
+    // necessarily the same memory-type set as) `build_capture_buffer`'s own
+    // HOST_VISIBLE|HOST_COHERENT search for a fresh allocation.
+    // SAFETY: `instance`/`device` are live for the duration of this call.
+    let ext_fn = unsafe {
+        vk::ExtExternalMemoryHostFn::load(|name| std::mem::transmute(instance.get_device_proc_addr(device.handle(), name.as_ptr())))
+    };
+    let mut host_props = vk::MemoryHostPointerPropertiesEXT::default();
+    // SAFETY: `device` is live; `host_ptr` is valid for `bytes` bytes per this
+    // function's own contract.
+    let query_result = unsafe {
+        (ext_fn.get_memory_host_pointer_properties_ext)(
+            device.handle(),
+            vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT,
+            host_ptr.cast(),
+            &mut host_props,
+        )
+    };
+    if query_result != vk::Result::SUCCESS {
+        // SAFETY: neither `fence` nor `pool` owns any other resource yet.
+        unsafe {
+            device.destroy_fence(fence, None);
+            device.destroy_command_pool(pool, None);
+        }
+        return None;
+    }
+
+    // A buffer that will be bound to *imported* memory must declare that up front:
+    // VUID-vkBindBufferMemory-memory-02985 requires the external handle type used at
+    // import time to already be set in the buffer's own `VkExternalMemoryBufferCreateInfo`
+    // at creation -- found live, on real hardware, via `VK_LAYER_VALIDATE_SYNC=1`
+    // (see EXTERNAL_MEMORY_HOST_DESIGN.md), not caught by the local software ICD this
+    // crate's tests otherwise run against.
+    let mut external_info = vk::ExternalMemoryBufferCreateInfo::builder().handle_types(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
+    let buf_info = vk::BufferCreateInfo::builder()
+        .size(bytes)
+        .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .push_next(&mut external_info);
+    // SAFETY: `buf_info` is valid.
+    let buffer = match unsafe { device.create_buffer(&buf_info, None) } {
+        Ok(b) => b,
+        Err(_) => {
+            // SAFETY: neither `fence` nor `pool` owns `buffer` (it doesn't exist).
+            unsafe {
+                device.destroy_fence(fence, None);
+                device.destroy_command_pool(pool, None);
+            }
+            return None;
+        }
+    };
+    // SAFETY: `buffer` was just created and is not yet bound to memory.
+    let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
+    // SAFETY: `physical_device` is the device this capture serves; `instance` is its
+    // owning instance.
+    let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+    let wanted = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+    // Only a memory type both the buffer itself (`reqs`) and the imported pointer
+    // (`host_props`) agree on is actually usable here.
+    let compatible = reqs.memory_type_bits & host_props.memory_type_bits;
+    let Some(type_index) = (0..mem_props.memory_type_count)
+        .find(|&i| (compatible & (1 << i)) != 0 && mem_props.memory_types[i as usize].property_flags.contains(wanted))
+    else {
+        // SAFETY: `buffer` has no memory bound yet; nothing else owns `fence`/`pool`.
+        unsafe {
+            device.destroy_buffer(buffer, None);
+            device.destroy_fence(fence, None);
+            device.destroy_command_pool(pool, None);
+        }
+        return None;
+    };
+
+    let mut import_info =
+        vk::ImportMemoryHostPointerInfoEXT::builder().handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT).host_pointer(host_ptr.cast());
+    let alloc = vk::MemoryAllocateInfo::builder().allocation_size(bytes).memory_type_index(type_index).push_next(&mut import_info);
+    // SAFETY: `alloc` is valid; `type_index` was just confirmed to satisfy both
+    // `reqs` and `host_props` above; `host_ptr`/`bytes` satisfy this function's own
+    // safety contract on alignment/size.
+    let memory = match unsafe { device.allocate_memory(&alloc, None) } {
+        Ok(m) => m,
+        Err(_) => {
+            // SAFETY: same reasoning as the branch above.
+            unsafe {
+                device.destroy_buffer(buffer, None);
+                device.destroy_fence(fence, None);
+                device.destroy_command_pool(pool, None);
+            }
+            return None;
+        }
+    };
+    // SAFETY: `buffer`/`memory` were each just created above, sized/typed to satisfy
+    // each other by construction.
+    if unsafe { device.bind_buffer_memory(buffer, memory, 0) }.is_err() {
+        // SAFETY: `memory` is not yet bound to anything that would make freeing it
+        // unsound; `buffer` has no memory bound.
+        unsafe {
+            device.free_memory(memory, None);
+            device.destroy_buffer(buffer, None);
+            device.destroy_fence(fence, None);
+            device.destroy_command_pool(pool, None);
+        }
+        return None;
+    }
+
+    // No `vkMapMemory` here, unlike `build_capture_buffer`: `host_ptr` already *is*
+    // the address this imported memory refers to -- that is the entire point of a
+    // host-pointer import, and re-mapping it would be redundant at best.
+    Some(CaptureBuffer { pool, cmd, fence, buffer, memory, ptr: host_ptr, capacity: bytes })
 }
 
 /// Writes `bytes` (exactly `width*height*4` `RGBA8` bytes) into `image` via
@@ -1312,6 +1707,8 @@ pub unsafe fn destroy(resources: Option<CaptureResources>, device: &ash::Device)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::EXTERNAL_MEMORY_HOST_EXTENSION;
+    use std::ffi::CStr;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -1389,6 +1786,180 @@ mod tests {
         format!("{}/neuralforge-capture-test-{}-{tag}-{n}/shm.bin", std::env::temp_dir().display(), std::process::id())
     }
 
+    /// Same shape as `test_device`, except the device is created with
+    /// `VK_EXT_external_memory_host` enabled when (and only when) the physical device
+    /// actually advertises it -- `None` if there's no Vulkan loader/ICD at all, or a
+    /// separate flag saying whether the extension actually ended up enabled, so
+    /// `direct_capture_writes_straight_into_imported_host_memory` can skip itself
+    /// cleanly on a machine (this dev sandbox's software ICD, most likely) that
+    /// doesn't support it, rather than fail for a reason that has nothing to do with
+    /// this crate's own code.
+    fn test_device_with_external_memory_host() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDevice, ash::Device, vk::Queue, u32, bool)> {
+        // SAFETY: same reasoning as `test_device`.
+        let entry = unsafe { ash::Entry::load() }.ok()?;
+        let app_info = vk::ApplicationInfo::builder().api_version(vk::API_VERSION_1_3);
+        let create_info = vk::InstanceCreateInfo::builder().application_info(&app_info);
+        let instance = unsafe { entry.create_instance(&create_info, None) }.ok()?;
+        let physical_device = *unsafe { instance.enumerate_physical_devices() }.ok()?.first()?;
+        let supported = unsafe { instance.enumerate_device_extension_properties(physical_device) }.is_ok_and(|extensions| {
+            extensions.iter().any(|extension| {
+                let name = unsafe { CStr::from_ptr(extension.extension_name.as_ptr()) };
+                name == EXTERNAL_MEMORY_HOST_EXTENSION
+            })
+        });
+        let queue_family = 0;
+        let queue_info = [vk::DeviceQueueCreateInfo::builder().queue_family_index(queue_family).queue_priorities(&[1.0]).build()];
+        let extension_names = [EXTERNAL_MEMORY_HOST_EXTENSION.as_ptr()];
+        let mut device_create_info = vk::DeviceCreateInfo::builder().queue_create_infos(&queue_info);
+        if supported {
+            device_create_info = device_create_info.enabled_extension_names(&extension_names);
+        }
+        let device = unsafe { instance.create_device(physical_device, &device_create_info, None) }.ok()?;
+        let queue = unsafe { device.get_device_queue(queue_family, 0) };
+        Some((entry, instance, physical_device, device, queue, queue_family, supported))
+    }
+
+    /// Like `make_present_src_image`, but also fills the image with a known solid
+    /// color before transitioning it to `PRESENT_SRC_KHR` -- `make_present_src_image`
+    /// itself leaves its image's contents undefined, fine for tests that only check
+    /// *that* a copy happened, not *what* it copied. This test needs the latter: the
+    /// whole point is confirming the imported-memory capture lands the *right* bytes,
+    /// not just *some* bytes.
+    fn make_filled_present_src_image(device: &ash::Device, mem_props: &vk::PhysicalDeviceMemoryProperties, queue: vk::Queue, pool: vk::CommandPool, width: u32, height: u32, color: [f32; 4]) -> (vk::Image, vk::DeviceMemory) {
+        let info = vk::ImageCreateInfo::builder()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .extent(vk::Extent3D { width, height, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::STORAGE)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { device.create_image(&info, None) }.expect("failed to create the test's own target image");
+        let reqs = unsafe { device.get_image_memory_requirements(image) };
+        let type_index = (0..mem_props.memory_type_count)
+            .find(|&i| reqs.memory_type_bits & (1 << i) != 0 && mem_props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL))
+            .expect("no suitable memory type for the test's own target image");
+        let memory = unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(type_index), None) }.unwrap();
+        unsafe { device.bind_image_memory(image, memory, 0) }.unwrap();
+
+        let alloc_info = vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
+        let cmd = unsafe { device.allocate_command_buffers(&alloc_info) }.unwrap()[0];
+        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+        let begin_info = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe {
+            device.begin_command_buffer(cmd, &begin_info).unwrap();
+            let to_dst = barrier(image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE);
+            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_dst]);
+            device.cmd_clear_color_image(cmd, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &vk::ClearColorValue { float32: color }, &[subresource()]);
+            let to_present = barrier(image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::empty());
+            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[to_present]);
+            device.end_command_buffer(cmd).unwrap();
+            device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&cmd)).build()], fence).unwrap();
+            device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
+            device.destroy_fence(fence, None);
+            device.free_command_buffers(pool, &[cmd]);
+        }
+        (image, memory)
+    }
+
+    /// The actual point of `EXTERNAL_MEMORY_HOST_DESIGN.md`, exercised end to end
+    /// against a real (if software) device: a capture submitted against a
+    /// `DirectCapture` slot must land its bytes directly in the imported host
+    /// pointer -- not a staging buffer, not something that merely runs without
+    /// crashing, but the *exact* pixels the source image held. Skips itself (not a
+    /// failure) if this machine's Vulkan device doesn't advertise
+    /// `VK_EXT_external_memory_host` at all.
+    #[test]
+    fn direct_capture_writes_straight_into_imported_host_memory() {
+        let Some((_entry, instance, physical_device, device, queue, queue_family, supported)) = test_device_with_external_memory_host() else {
+            eprintln!("direct_capture_writes_straight_into_imported_host_memory: no Vulkan loader/ICD, skipping");
+            return;
+        };
+        if !supported {
+            eprintln!("direct_capture_writes_straight_into_imported_host_memory: VK_EXT_external_memory_host not supported here, skipping");
+            unsafe { device.destroy_device(None); instance.destroy_instance(None); }
+            return;
+        }
+        let Some(alignment) = min_imported_host_pointer_alignment(&instance, physical_device) else {
+            eprintln!("direct_capture_writes_straight_into_imported_host_memory: alignment query failed, skipping");
+            unsafe { device.destroy_device(None); instance.destroy_instance(None); }
+            return;
+        };
+
+        let (width, height) = (8u32, 8u32);
+        let frame_bytes = (width * height * 4) as usize;
+        // A real `mmap` (page-aligned, so a multiple of any real driver's alignment
+        // requirement -- NVIDIA's own is 4096) standing in for the SHM proxy region
+        // this path is actually meant to import; rounded up to `alignment` for
+        // drivers that want more than a page.
+        let region_len = frame_bytes.max(alignment as usize).div_ceil(alignment as usize) * alignment as usize;
+        // SAFETY: a plain anonymous mapping, valid for the rest of this test; never
+        // shared with another process, matching every other precondition
+        // `ensure_direct_capture`'s own safety contract asks for.
+        let host_ptr = unsafe {
+            libc::mmap(std::ptr::null_mut(), region_len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+        };
+        assert_ne!(host_ptr, libc::MAP_FAILED, "mmap for the test's own host region failed");
+        let host_ptr = host_ptr.cast::<u8>();
+        assert_eq!(host_ptr as usize % alignment as usize, 0, "mmap must hand back at least page-aligned memory");
+
+        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool = unsafe { device.create_command_pool(&pool_info, None) }.expect("failed to create the test's own command pool");
+        // An arbitrary, checkable, non-zero pattern -- chosen so every channel lands
+        // on an *exact* u8 value (100/150/200/255), not a half-integer boundary like
+        // 0.5*255=127.5, where real drivers can reasonably round either way and a
+        // fixed `.round()` in this test would be guessing which.
+        let color = [100.0 / 255.0, 150.0 / 255.0, 200.0 / 255.0, 1.0];
+        let (image, image_memory) = make_filled_present_src_image(&device, &mem_props, queue, pool, width, height, color);
+
+        let mut direct: Option<DirectCapture> = None;
+        // SAFETY: `host_ptr` is valid for `region_len` bytes for the rest of this
+        // test; nothing else writes to it. `region_len`, not `frame_bytes`, per
+        // VUID-VkMemoryAllocateInfo-allocationSize-01745: the allocation itself must
+        // be a multiple of `alignment` (4096 on this real NVIDIA driver) even though
+        // the actual pixel copy below only ever touches the first `frame_bytes`.
+        assert!(
+            unsafe { ensure_direct_capture(&mut direct, &device, &instance, physical_device, queue_family, host_ptr, region_len as vk::DeviceSize) },
+            "ensure_direct_capture should succeed with a supported, correctly aligned host pointer"
+        );
+        let d = direct.as_mut().unwrap();
+        assert!(submit_direct_capture(d, &device, queue, image, vk::ImageLayout::PRESENT_SRC_KHR, width, height, neuralforge_protocol::enums::proxy_format::RGBA8));
+        // A real wait (not `poll_direct_capture`'s own non-blocking check) is correct
+        // here: this test cares whether the capture is *correct*, not whether `run`'s
+        // own present-hook discipline of never blocking holds -- that's
+        // `run_never_blocks_on_a_slow_helper_and_eventually_composites`'s job, not
+        // this test's.
+        unsafe { device.wait_for_fences(&[d.buf.fence], true, u64::MAX) }.expect("capture fence wait failed");
+        assert_eq!(poll_direct_capture(d, &device), Some((width, height, neuralforge_protocol::enums::proxy_format::RGBA8)));
+
+        // SAFETY: the fence wait above confirms the GPU's writes to `host_ptr` are
+        // complete and visible to the CPU (host-coherent memory).
+        let captured = unsafe { std::slice::from_raw_parts(host_ptr, frame_bytes) };
+        // `.round()`, not a bare `as u8` truncation: the real float->UNORM8 conversion
+        // `vkCmdClearColorImage`/the copy actually perform rounds to nearest (found
+        // live: 0.25 * 255 = 63.75, which truncation would wrongly expect as 63
+        // against the real, correct 64).
+        let expected: [u8; 4] = [(color[0] * 255.0).round() as u8, (color[1] * 255.0).round() as u8, (color[2] * 255.0).round() as u8, (color[3] * 255.0).round() as u8];
+        for pixel in captured.chunks_exact(4) {
+            assert_eq!(pixel, expected, "every captured pixel must match the source image's own fill color, read straight out of the imported host pointer");
+        }
+
+        unsafe {
+            device.device_wait_idle().unwrap();
+            device.destroy_image(image, None);
+            device.free_memory(image_memory, None);
+            device.destroy_command_pool(pool, None);
+            destroy_direct_capture(direct, &device);
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+            libc::munmap(host_ptr.cast(), region_len);
+        }
+    }
+
     /// The real point of the pipelined redesign, exercised end to end against a real
     /// (if software) Vulkan device: `run` must never block a present call waiting on
     /// the helper, even when the helper genuinely takes far longer than one frame to
@@ -1440,6 +2011,7 @@ mod tests {
 
         let mut resources: Option<CaptureResources> = None;
         let mut pipeline: Option<CapturePipeline> = None;
+        let mut direct: Option<DirectCapture> = None;
         let mut gpu_compose: Option<crate::composition::gpu::GpuCompose> = None;
         let mut original_scratch = Vec::new();
         let mut answer_scratch = Vec::new();
@@ -1474,6 +2046,14 @@ mod tests {
                     false,
                     &mut resources,
                     &mut pipeline,
+                    &mut direct,
+                    // This test's own device never enables `VK_EXT_external_memory_host`
+                    // (see `test_device`'s minimal `DeviceCreateInfo`), so this must be
+                    // `false` -- exercising `CapturePipeline`, the path this test
+                    // actually validates. A `DirectCapture` equivalent needs its own
+                    // test with the extension genuinely enabled, not this one lying
+                    // about it.
+                    false,
                     &mut gpu_compose,
                     &mut shm,
                     &mut original_scratch,
@@ -1530,6 +2110,7 @@ mod tests {
             device.destroy_command_pool(pool, None);
             destroy(resources, &device);
             destroy_pipeline(pipeline, &device);
+            destroy_direct_capture(direct, &device);
             if let Some(gpu) = gpu_compose {
                 gpu.destroy(&device);
             }

@@ -283,3 +283,31 @@ itself. **Not done yet**: the actual memory import this unblocks -- `CapturePipe
 still always allocates and copies through its own staging buffer regardless of
 `external_memory_host`'s value, which today is logged and immediately discarded, not
 stored or read anywhere yet.
+
+## 2026-09-15 (later still) -- Phase 3 step 2: the actual zero-copy import, `DirectCapture`
+
+See `EXTERNAL_MEMORY_HOST_DESIGN.md` for the full design. Summary: added
+`capture::DirectCapture`, a single capture slot whose device memory is imported
+directly from the live SHM proxy region, so a capture's `vkCmdCopyImageToBuffer`
+writes straight into shared memory. `run` now shares one `poll_or_submit_capture`
+helper across both `DirectCapture` and `CapturePipeline`, deciding per call (cheaply)
+which to use.
+
+Wrote a dedicated test (`capture::tests::direct_capture_writes_straight_into_imported_host_memory`)
+that builds a device with the extension actually enabled, fills a source image with a
+known color, captures it through `DirectCapture`, and asserts every captured byte
+matches exactly -- not just "ran without crashing". **This test found two real bugs**
+on first real-hardware run (`lordnikon`, `VK_LAYER_VALIDATE_SYNC=1`): a missing
+`VkExternalMemoryBufferCreateInfo` on the buffer (a real production bug,
+`VUID-vkBindBufferMemory-memory-02985`) and a misaligned `allocationSize` in the test
+itself (`VUID-VkMemoryAllocateInfo-allocationSize-01745`, this NVIDIA driver's real
+`minImportedHostPointerAlignment` is 4096) -- neither was caught by this project's
+local software Vulkan ICD, which accepted both mistakes silently. Both fixed; the test
+now passes on both the local software ICD and `lordnikon`'s real driver under full
+synchronization validation, with zero hazards. The full test suite (47 tests, 1
+ignored) stayed green on `lordnikon` throughout.
+
+**Not done**: no GTA session. The real payoff this phase promises -- layer fps moving
+toward upstream's ~74/s on `lordnikon` -- is still unmeasured; `DirectCapture` itself
+has never run against a real game, only a synthetic single-frame test and (indirectly,
+for device creation only) `vkcube`.

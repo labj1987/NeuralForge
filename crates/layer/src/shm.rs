@@ -345,6 +345,18 @@ impl ShmClient {
         (!self.header.is_null()).then_some(self.header as *mut u8)
     }
 
+    /// The proxy region's own address and capacity within this process's mapping --
+    /// `None` before [`Self::open`]/[`Self::open_at`] has actually mapped anything.
+    /// For [`crate::capture::DirectCapture`]'s `VK_EXT_external_memory_host` import:
+    /// the *only* legitimate reason anything outside this module needs this address at
+    /// all, since every other caller goes through [`Self::write_proxy`] instead.
+    pub fn proxy_region(&self) -> Option<(*mut u8, usize)> {
+        // SAFETY: `pixel_base` plus `proxy_offset()` stays within the
+        // `shm_total_bytes()` mapping `open_at` established, same reasoning as
+        // `write_proxy`'s own pointer arithmetic.
+        self.pixel_base().map(|base| (unsafe { base.add(neuralforge_protocol::proxy_offset()) }, neuralforge_protocol::MAX_FRAME))
+    }
+
     /// Opens (or creates) the mapping if not already attached. Idempotent.
     pub fn open(&mut self) -> bool {
         if self.header().is_some() { return true; }

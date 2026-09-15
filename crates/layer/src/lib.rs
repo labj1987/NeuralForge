@@ -133,7 +133,7 @@ impl GlobalHooks for NeuralForgeGlobalHooks {
 /// proxy region directly as device memory needs it on whichever device the layer's own
 /// capture commands submit against -- the game's, not a private one, since the image
 /// being copied is the game's own swapchain/render-tap source.
-const EXTERNAL_MEMORY_HOST_EXTENSION: &CStr = c"VK_EXT_external_memory_host";
+pub(crate) const EXTERNAL_MEMORY_HOST_EXTENSION: &CStr = c"VK_EXT_external_memory_host";
 
 /// Devices [`NeuralForgeInstanceHooks::create_device`] actually added
 /// [`EXTERNAL_MEMORY_HOST_EXTENSION`] to. `create_device_info` (the framework's own,

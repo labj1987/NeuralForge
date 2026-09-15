@@ -53,24 +53,64 @@ implemented `InstanceHooks`/`InstanceInfo` before now (`Layer::InstanceInfo` was
    `VkDeviceCreateInfo` regardless of what a hooked `create_device` actually passed to
    the real driver -- there's no other way for `device.rs` to learn what happened.
 
-`State::external_memory_host: bool` carries this into `capture::run`'s own state; `false`
-(no real game requests the extension, or the driver lacks it) just means the capture
-pipeline keeps using the staging-buffer path it already has -- nothing about capture
-correctness depends on this being `true`, today or once it's actually wired into the
-import path (next step, not done yet).
+`State::external_memory_host: bool` carries this into `capture::run`'s own state,
+read fresh every present call (cheap: `vkGetPhysicalDeviceProperties2` is a purely
+local query) alongside a live check that the *actual* mmap'd proxy-region pointer
+(not just its constant offset within the mapping) is aligned to whatever the driver's
+own `minImportedHostPointerAlignment` requires. `false` either way just means the
+capture pipeline keeps using the staging-buffer path it already has.
+
+## The actual import path: `DirectCapture`
+
+Implemented: `capture::DirectCapture`, a single capture slot (deliberately not two
+like `CapturePipeline` -- see its own doc comment) whose device memory is *imported*
+from `ShmClient::proxy_region()`'s live pointer via `VkImportMemoryHostPointerInfoEXT`,
+so `vkCmdCopyImageToBuffer` writes straight into the SHM proxy region with no staging
+buffer. `run`'s shared `poll_or_submit_capture` helper drives whichever of
+`DirectCapture`/`CapturePipeline` is active; for the direct path, `ShmClient::write_proxy`
+is never called (its one copy is exactly what importing removes) -- though
+`original_scratch`/`inflight.original` still need their own one-copy readback out of
+the now-written proxy region, since that Vec has to remain stable across whatever
+capture starts next and overwrites the shared, imported memory (see `poll_or_submit_capture`'s
+own doc comment). Net effect versus the pre-Phase-3 path: two CPU copies (staging ->
+Vec -> SHM) become one (SHM -> Vec) for the capture direction.
+
+Two real bugs found and fixed via real-hardware validation (not caught by this
+project's local software ICD, which is more permissive than NVIDIA's driver +
+validation layers here):
+1. `VkBufferCreateInfo` for a buffer that will be bound to imported memory must chain
+   `VkExternalMemoryBufferCreateInfo` with the same handle type used at import time
+   (`VUID-vkBindBufferMemory-memory-02985`) -- missing entirely in the first version,
+   caught immediately by `VK_LAYER_VALIDATE_SYNC=1` on `lordnikon`.
+2. The import's `allocationSize` must be a multiple of `minImportedHostPointerAlignment`
+   (`VUID-VkMemoryAllocateInfo-allocationSize-01745`) -- a *test* bug (passing the raw
+   pixel byte count instead of the alignment-rounded region size), not the production
+   code, but only visible once real hardware reported the real alignment (4096 on this
+   NVIDIA driver) instead of the local software ICD's more forgiving behavior.
 
 ## Validation
 
-Real hardware, `lordnikon`, RTX 5070, driver 615.71.09: `vkcube` at both 1280x720 and
-2560x1440 (the real GTA render resolution) under
-`VK_LAYER_KHRONOS_validation:VK_LAYER_neuralforge_neural` with `VK_LAYER_VALIDATE_SYNC=1`.
-Both runs logged `external_memory_host: true` (the NVIDIA driver does advertise the
-extension) with zero validation errors or synchronization hazards, and the capture
-pipeline kept advancing `layer_frames` normally (474 in 20s at 2560x1440) -- no
-regression versus the pre-Phase-3 behavior. Not yet validated: a device where the
-extension genuinely isn't available (this driver always has it, so the `Unhandled`
-fallback branch for "not supported" is exercised only by code review, not a live run);
-GTA itself, which needs a real session.
+Real hardware, `lordnikon`, RTX 5070, driver 615.71.09, both via `vkcube` and via a
+dedicated test copied to and run directly against the real driver:
+
+- `vkcube` at 1280x720 and 2560x1440 (GTA's real render resolution) under
+  `VK_LAYER_KHRONOS_validation:VK_LAYER_neuralforge_neural` with `VK_LAYER_VALIDATE_SYNC=1`:
+  both logged `external_memory_host: true`, zero validation errors or hazards, capture
+  pipeline throughput unregressed (474 layer frames in 20s at 2560x1440). This only
+  exercises device creation, not `DirectCapture` itself -- `vkcube` never triggers the
+  render tap (see `HARDWARE_VALIDATION.md`), same limitation as Phase 2.
+- `capture::tests::direct_capture_writes_straight_into_imported_host_memory` (new):
+  builds a device with the extension actually enabled, fills a source image with a
+  known, checkable color, captures it through `DirectCapture` into a real `mmap`'d
+  host region, and asserts every captured byte matches the source exactly. Passes
+  locally (this dev machine's software ICD also supports the extension, useful bonus
+  coverage) and on `lordnikon` under full synchronization validation -- the two real
+  bugs above were found and fixed via this exact test, on this exact hardware.
+
+**Not yet validated**: a device where the extension genuinely isn't available (both
+tested drivers have it, so the `Unhandled`/fallback branches are reviewed, not
+exercised live); GTA itself, which needs a real session and is the only way to measure
+whether this actually moves layer fps toward upstream's ~74/s on `lordnikon`.
 
 ## Not done yet
 

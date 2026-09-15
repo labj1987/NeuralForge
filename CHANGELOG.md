@@ -65,6 +65,15 @@
   Khronos validation + synchronization validation: injection confirmed active, zero
   hazards, no regression. The actual host-memory import this unblocks is not wired up
   yet -- this commit only adds the mechanism for getting the extension enabled.
+- Implement the actual zero-copy import (`DirectCapture`, see
+  `EXTERNAL_MEMORY_HOST_DESIGN.md`): a capture's `vkCmdCopyImageToBuffer` now writes
+  straight into the SHM proxy region when the device extension is available, no
+  staging buffer. A new test that checks captured bytes are exactly correct (not just
+  "didn't crash") found two real bugs on its first real-hardware run: a missing
+  `VkExternalMemoryBufferCreateInfo` on the buffer, and a misaligned allocation size --
+  neither caught by this project's local software Vulkan ICD. Both fixed; the test now
+  passes on both, on `lordnikon` under full synchronization validation. GTA fps still
+  unmeasured -- the real payoff of this phase needs a live session.
 
 ## Historical releases before the NeuralForge rename
 
