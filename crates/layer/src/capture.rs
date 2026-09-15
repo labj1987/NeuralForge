@@ -2038,6 +2038,7 @@ mod tests {
 
         let mut got_semaphore = false;
         let mut iteration = 0u32;
+        let mut slow_calls: Vec<Duration> = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(5);
         // Real usage calls this once per present, indefinitely -- loop until either a
         // real composited result shows up or the deadline (comfortably several
@@ -2083,24 +2084,21 @@ mod tests {
             let call_time = call_start.elapsed();
             // Skip the very first call: it pays real one-time setup cost this test
             // doesn't otherwise isolate (`CapturePipeline`/`GpuCompose` first-use
-            // allocation, first-touch driver/shader-cache warmup), which is not what
-            // this assert exists to catch.
+            // allocation, first-touch driver/shader-cache warmup).
             //
             // The real invariant this guards is "`run()` never synchronously waits
-            // for the helper's own answer" -- a genuine regression of that kind would
-            // show up as a call taking close to the *full* `HELPER_DELAY`, not a
-            // little over half of it. Two separate real CI failures (245ms then
-            // 174ms, on two different unrelated commits, both on GitHub's shared
-            // runners) confirmed a flat `HELPER_DELAY / 2` ceiling is well within
-            // this environment's own ordinary scheduler/software-rasterizer jitter,
-            // not evidence of blocking -- so the threshold sits close enough to the
-            // full delay to still catch an actual synchronous wait, while tolerating
-            // that jitter. Local/real-hardware runs stay far under either number.
-            if iteration > 1 {
-                assert!(
-                    call_time < HELPER_DELAY * 9 / 10,
-                    "a single run() call took {call_time:?} -- must never approach the helper's own {HELPER_DELAY:?} answer delay"
-                );
+            // for the helper's own answer". A single call occasionally running long
+            // is not, by itself, evidence of that: GitHub's shared runners saw calls
+            // up to 466ms (nearly *double* `HELPER_DELAY`) with no code change
+            // involved, purely from real scheduler/software-rasterizer contention on
+            // that infra -- worse than this test's own fake helper thread's sleep, so
+            // no fixed per-call ceiling can both reject that noise and still allow a
+            // real hardware/local run through. What a genuine synchronous-wait
+            // regression looks like instead is *every* call converging near
+            // `HELPER_DELAY`, not one noisy outlier -- so tally slow calls across the
+            // whole loop and judge the pattern, not any single sample, below.
+            if iteration > 1 && call_time >= HELPER_DELAY * 9 / 10 {
+                slow_calls.push(call_time);
             }
             if let Some(sem) = sem {
                 got_semaphore = true;
@@ -2124,6 +2122,18 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(got_semaphore, "the pipeline must eventually composite a real answer within 5s of real time, not just avoid blocking forever");
+        // A real synchronous-wait-on-the-helper regression makes *every* call take
+        // close to `HELPER_DELAY`; isolated scheduler noise makes at most a rare one.
+        // `iteration` counts the exempted first call too, so this ratio is
+        // deliberately conservative (slightly stricter than "out of every later
+        // call") rather than needing a second counter just to be exact about it.
+        assert!(
+            slow_calls.len() * 10 < iteration as usize,
+            "{}/{iteration} run() calls took close to the helper's own {HELPER_DELAY:?} answer \
+             delay ({slow_calls:?}) -- an isolated slow call is real-world scheduler noise, but \
+             this many looks like run() is actually waiting on the helper again",
+            slow_calls.len()
+        );
 
         stop.store(true, AtomicOrdering::Relaxed);
         helper.join().unwrap();
