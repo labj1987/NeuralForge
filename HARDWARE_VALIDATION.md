@@ -253,3 +253,33 @@ this session -- see PHASE1.md's own unmet benchmark gate above, still open). Pha
 item 6 calls for "then on GTA. Report layer frames/sec and GTA fps against the Phase 1
 table" -- that comparison, and confirmation that GTA fps recovers to within ~10% of
 native with neural on, is still outstanding and needs a live session.
+
+## 2026-09-15 (later still) -- Phase 3 step 1: device-extension injection
+
+See `EXTERNAL_MEMORY_HOST_DESIGN.md` for the design. Summary: this project had never
+hooked `InstanceHooks`/`InstanceInfo` before (`Layer::InstanceInfo` was the pinned
+framework's own `StubInstanceInfo`, a real no-op) -- the game's own `vkCreateDevice`
+call determines its device's extensions, and the only hook point that runs *before*
+that call actually happens (letting a layer add one) lives on `InstanceHooks`, not the
+`DeviceHooks` trait everything else in this crate already implements. Added
+`NeuralForgeInstanceHooks::create_device`: adds `VK_EXT_external_memory_host` when the
+physical device supports it and the app hasn't already requested it, retries with the
+exact original request if the extended one is refused, and otherwise (the overwhelming
+common case) returns `LayerResult::Unhandled` -- identical to not hooking at all.
+
+**Validated on `lordnikon`** (RTX 5070, driver 615.71.09): `vkcube` at 1280x720 and at
+2560x1440 (the real GTA render resolution) under `VK_LAYER_KHRONOS_validation` with
+`VK_LAYER_VALIDATE_SYNC=1`. Both logged `external_memory_host: true` (confirming the
+injection actually happened -- this driver does advertise the extension) with zero
+validation errors and zero synchronization hazards; the capture pipeline kept advancing
+`layer_frames` normally at both resolutions (474 in 20s at 2560x1440), no regression
+from the pre-Phase-3 behavior. `cargo test` (all 45 layer tests, run 4x to rule out
+flakiness after one unrelated one-off failure in an ownership test unrelated to this
+change) stayed green throughout.
+
+**Not validated**: a device that genuinely lacks the extension (this driver always has
+it, so the "not supported" `Unhandled` branch is reviewed, not exercised live); GTA
+itself. **Not done yet**: the actual memory import this unblocks -- `CapturePipeline`
+still always allocates and copies through its own staging buffer regardless of
+`external_memory_host`'s value, which today is logged and immediately discarded, not
+stored or read anywhere yet.

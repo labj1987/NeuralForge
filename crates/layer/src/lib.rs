@@ -33,14 +33,16 @@ mod surface_usage;
 mod entry_points;
 mod present_sync;
 
+use std::collections::HashSet;
+use std::ffi::CStr;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
 use ash::vk;
 use once_cell::sync::Lazy;
 use vulkan_layer::{
-    auto_globalhooksinfo_impl, declare_introspection_queries, Global, GlobalHooks, Layer, LayerManifest,
-    LayerResult, StubInstanceInfo, VkLayerInstanceLink,
+    auto_globalhooksinfo_impl, declare_introspection_queries, Global, GlobalHooks, InstanceHooks, InstanceInfo,
+    Layer, LayerManifest, LayerResult, LayerVulkanCommand, VkLayerDeviceLink, VkLayerInstanceLink,
 };
 
 use device::NeuralForgeDeviceInfo;
@@ -126,14 +128,141 @@ impl GlobalHooks for NeuralForgeGlobalHooks {
     }
 }
 
+/// The one device extension this layer ever asks a game's own device creation to add,
+/// for Phase 3's zero-copy capture path (`ASYNC_CAPTURE_DESIGN.md`): importing the SHM
+/// proxy region directly as device memory needs it on whichever device the layer's own
+/// capture commands submit against -- the game's, not a private one, since the image
+/// being copied is the game's own swapchain/render-tap source.
+const EXTERNAL_MEMORY_HOST_EXTENSION: &CStr = c"VK_EXT_external_memory_host";
+
+/// Devices [`NeuralForgeInstanceHooks::create_device`] actually added
+/// [`EXTERNAL_MEMORY_HOST_EXTENSION`] to. `create_device_info` (the framework's own,
+/// called right after with the *original*, un-injected `VkDeviceCreateInfo` regardless
+/// of what a hooked `create_device` actually passed to the real driver -- there is no
+/// other way to learn this) checks and removes its own device's entry here exactly
+/// once. Same pattern as `device::CLEANUP`/`CURRENT_INSTANCE`: a small, short-lived,
+/// mutex-guarded side table, not a source of truth kept around indefinitely.
+static EXTERNAL_MEMORY_HOST_DEVICES: Mutex<Option<HashSet<vk::Device>>> = Mutex::new(None);
+
+/// Checks and clears whether `device` is one [`NeuralForgeInstanceHooks::create_device`]
+/// added [`EXTERNAL_MEMORY_HOST_EXTENSION`] to.
+pub(crate) fn take_external_memory_host_enabled(device: vk::Device) -> bool {
+    EXTERNAL_MEMORY_HOST_DEVICES.lock().unwrap().as_mut().is_some_and(|set| set.remove(&device))
+}
+
+#[derive(Default)]
+struct NeuralForgeInstanceHooks;
+
+impl InstanceHooks for NeuralForgeInstanceHooks {
+    /// Adds [`EXTERNAL_MEMORY_HOST_EXTENSION`] to the game's own `vkCreateDevice` call
+    /// when (and only when) it's safe to: the physical device actually advertises it
+    /// and the app hasn't already requested it either way. Every other case returns
+    /// [`LayerResult::Unhandled`], which hands the *unmodified* call straight to the
+    /// framework's own default `create_device` path -- identical to this hook not
+    /// existing at all. This function never changes device creation in any other way,
+    /// and never makes a request that would otherwise have succeeded start failing:
+    /// if creating the device with the extra extension is refused for any reason
+    /// `vkEnumerateDeviceExtensionProperties` didn't predict, it retries with the
+    /// exact, byte-identical original request before giving up.
+    fn create_device(
+        &self,
+        physical_device: vk::PhysicalDevice,
+        create_info: &vk::DeviceCreateInfo,
+        layer_device_link: &VkLayerDeviceLink,
+        allocator: Option<&vk::AllocationCallbacks>,
+        p_device: &mut std::mem::MaybeUninit<vk::Device>,
+    ) -> LayerResult<ash::prelude::VkResult<()>> {
+        let Some(instance) = CURRENT_INSTANCE.lock().unwrap().clone() else {
+            return LayerResult::Unhandled;
+        };
+        // SAFETY: `create_info` is the framework's own, valid for this call;
+        // `pp_enabled_extension_names` is a valid array of `enabled_extension_count`
+        // C strings per its own contract as a `VkDeviceCreateInfo`.
+        let requested = unsafe {
+            std::slice::from_raw_parts(create_info.pp_enabled_extension_names, create_info.enabled_extension_count as usize)
+        };
+        // SAFETY: every element of `requested` is a valid, NUL-terminated C string for
+        // the same reason as the slice itself.
+        if requested.iter().any(|&name| unsafe { CStr::from_ptr(name) } == EXTERNAL_MEMORY_HOST_EXTENSION) {
+            return LayerResult::Unhandled;
+        }
+        // SAFETY: `physical_device` is the one this exact `vkCreateDevice` call is
+        // for; `instance.instance` is its owning instance (the only kind
+        // `CURRENT_INSTANCE` ever stores).
+        let supported = unsafe { instance.instance.enumerate_device_extension_properties(physical_device) }
+            .is_ok_and(|extensions| {
+                extensions.iter().any(|extension| {
+                    // SAFETY: `extension_name` is a NUL-terminated, driver-supplied C
+                    // string per the Vulkan spec's own contract on this struct.
+                    let name = unsafe { CStr::from_ptr(extension.extension_name.as_ptr()) };
+                    name == EXTERNAL_MEMORY_HOST_EXTENSION
+                })
+            });
+        if !supported {
+            return LayerResult::Unhandled;
+        }
+
+        let mut names: Vec<*const std::ffi::c_char> = requested.to_vec();
+        names.push(EXTERNAL_MEMORY_HOST_EXTENSION.as_ptr());
+        let mut extended = *create_info;
+        extended.enabled_extension_count = names.len() as u32;
+        extended.pp_enabled_extension_names = names.as_ptr();
+
+        // SAFETY: resolved exactly like the framework's own default `create_device`
+        // path resolves it (see `vulkan_layer::Global::create_device`) -- the next
+        // layer/driver's real `vkCreateDevice`, through the instance this physical
+        // device belongs to.
+        let next_create_device: vk::PFN_vkCreateDevice = match unsafe {
+            (layer_device_link.pfnNextGetInstanceProcAddr)(instance.instance.handle(), c"vkCreateDevice".as_ptr())
+        } {
+            // SAFETY: a non-null `vkGetInstanceProcAddr(instance, "vkCreateDevice")`
+            // result is guaranteed by the Vulkan spec to have this exact signature.
+            Some(f) => unsafe { std::mem::transmute(f) },
+            None => return LayerResult::Unhandled,
+        };
+        let allocator_ptr = allocator.map_or(std::ptr::null(), std::ptr::from_ref);
+        // SAFETY: `extended` borrows `names`, which outlives this call; `p_device` is
+        // the framework's own out-parameter, valid for this call; `physical_device`
+        // was validated above via a successful query against it.
+        let result = unsafe { next_create_device(physical_device, &extended, allocator_ptr, p_device.as_mut_ptr()) };
+        if result.result().is_ok() {
+            // SAFETY: `p_device` was just written by the successful call above.
+            let device = unsafe { p_device.assume_init() };
+            EXTERNAL_MEMORY_HOST_DEVICES.lock().unwrap().get_or_insert_default().insert(device);
+            return LayerResult::Handled(Ok(()));
+        }
+        // The driver refused device creation with the extra extension for some reason
+        // the earlier query didn't predict. Retry with the caller's own, completely
+        // unmodified request -- this optimization attempt must never be the reason a
+        // device creation that would otherwise have succeeded now fails.
+        // SAFETY: same reasoning as the call above, with `create_info` (the original,
+        // borrowed, unmodified request) this time.
+        let result = unsafe { next_create_device(physical_device, create_info, allocator_ptr, p_device.as_mut_ptr()) };
+        LayerResult::Handled(result.result())
+    }
+}
+
+impl InstanceInfo for NeuralForgeInstanceHooks {
+    type HooksType = Self;
+    type HooksRefType<'a> = &'a Self;
+
+    fn hooked_commands() -> &'static [LayerVulkanCommand] {
+        &[LayerVulkanCommand::CreateDevice]
+    }
+
+    fn hooks(&self) -> Self::HooksRefType<'_> {
+        self
+    }
+}
+
 #[derive(Default)]
 struct NeuralForgeLayer(NeuralForgeGlobalHooks);
 
 impl Layer for NeuralForgeLayer {
     type GlobalHooksInfo = NeuralForgeGlobalHooks;
-    type InstanceInfo = StubInstanceInfo;
+    type InstanceInfo = NeuralForgeInstanceHooks;
     type DeviceInfo = NeuralForgeDeviceInfo;
-    type InstanceInfoContainer = StubInstanceInfo;
+    type InstanceInfoContainer = NeuralForgeInstanceHooks;
     type DeviceInfoContainer = NeuralForgeDeviceInfo;
 
     fn global_instance() -> impl Deref<Target = Global<Self>> + 'static {

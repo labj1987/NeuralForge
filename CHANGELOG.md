@@ -53,6 +53,19 @@
   (`reset_persisted_settings_changes_settings_but_preserves_the_live_session`) guards
   against reintroducing it.
 
+## Unreleased — NeuralForge Phase 3
+
+- Add device-extension injection (`NeuralForgeInstanceHooks::create_device`,
+  see `EXTERNAL_MEMORY_HOST_DESIGN.md`): adds `VK_EXT_external_memory_host` to the
+  game's own `vkCreateDevice` call when the physical device supports it and the app
+  hasn't already requested it, the precondition Phase 3's zero-copy capture path
+  needs. Falls back to the framework's default, unmodified path whenever there's
+  nothing safe to add, and retries with the original request if the extended one is
+  refused. Validated on the RTX 5070 at both 1280x720 and GTA's real 2560x1440 under
+  Khronos validation + synchronization validation: injection confirmed active, zero
+  hazards, no regression. The actual host-memory import this unblocks is not wired up
+  yet -- this commit only adds the mechanism for getting the extension enabled.
+
 ## Historical releases before the NeuralForge rename
 
 > Historical record: pre-NeuralForge names and deployment instructions below are

@@ -206,10 +206,19 @@ impl NeuralForgeDeviceInfo {
                 resolve::<vk::PFN_vkGetDeviceQueue2>(next_get_device_proc_addr, handle, c"vkGetDeviceQueue2"),
             )
         };
+        // Set by `NeuralForgeInstanceHooks::create_device` (crate::lib) before this
+        // device existed at all -- see that function's own doc comment for why this
+        // is the only way to learn it here, since `create_info` below always reflects
+        // the app's *original*, un-injected request regardless of what actually got
+        // enabled. Logged, not yet stored on `State`: nothing reads it past this line
+        // yet -- see EXTERNAL_MEMORY_HOST_DESIGN.md's own "not done yet" for the actual
+        // import path this unblocks next.
+        let external_memory_host = crate::take_external_memory_host_enabled(handle);
         crate::log!(
-            "[layer] hooked device {:?} (swapchain support: {})",
+            "[layer] hooked device {:?} (swapchain support: {}, external_memory_host: {})",
             handle,
-            create.is_some() && destroy.is_some() && present.is_some()
+            create.is_some() && destroy.is_some() && present.is_some(),
+            external_memory_host
         );
         // Explicit flush: a one-time-per-device event, not the per-frame hot path
         // `logging::log`'s modulo-64 throttle exists for -- worth the syscall so this
