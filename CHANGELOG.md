@@ -63,6 +63,25 @@
   archival record; trim `README.md` to what it does, requirements, install, usage,
   status, building and legal -- raw measurement evidence stays in
   `HARDWARE_VALIDATION.md`.
+- Fix a real CI-only flake in `run_never_blocks_on_a_slow_helper_and_eventually_composites`:
+  a fixed per-call timing ceiling (tuned against local/real-hardware timing) failed
+  three times running on GitHub's shared runners, once on a call nearly *double* the
+  helper's own simulated delay -- not evidence of a real blocking regression, just
+  scheduler/software-rasterizer jitter this infra has and this machine doesn't. Now
+  judges the pattern across the whole loop (few calls near the delay is noise, most
+  of them is the real regression) instead of any single sample.
+- Add a screenshot and the current release entry to the AppStream metainfo.
+- Port `scripts/install.py`'s install/uninstall to Rust
+  (`neuralforge_supervisor::install`; `neuralforge-cli install --appdir DIR` /
+  `uninstall`) -- same hash-tracked, symlink-refusing, atomic-rename installer and
+  `installation.json` record, confirmed to interoperate with `install.py` itself in
+  both directions against a real `build-appimage.sh` output, not just a fixture.
+  Runner discovery (Proton/Wine) moved from the CLI crate into
+  `neuralforge-supervisor` so the GUI can reuse it too.
+- Add the Setup tab: per-file NGX binaries status, a compatibility-tool picker, an
+  "Install for Steam games" button (sourced from `$APPDIR` when running as an
+  AppImage), and a Steam launch-option generator (target exe + DMA-BUF toggle -> the
+  exact `NEURALFORGE_ENABLE=1 ... %command%` string, with a copy button).
 
 ## Unreleased — NeuralForge Phase 3
 
