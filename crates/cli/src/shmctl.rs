@@ -20,12 +20,14 @@ use std::sync::atomic::Ordering;
 
 fn usage() {
     eprintln!(
-        "usage: neuralforge-cli shmctl <status|set|toggle|capture>\n\n\
+        "usage: neuralforge-cli shmctl <status|set|toggle|capture|reset>\n\n\
          \x20 status              print every setting and live status field\n\
          \x20 set <name> <value>  set one setting (float fields take a decimal value)\n\
          \x20 toggle <name>       flip a 0/1-valued setting\n\
          \x20 capture [view]      dump the next frame's original+composited PNGs\n\
-         \x20                     (see neuralforge_layer::dump); optional debug_view 0-3\n\n\
+         \x20                     (see neuralforge_layer::dump); optional debug_view 0-3\n\
+         \x20 reset               reset every setting to its default; preserves the\n\
+         \x20                     live helper/layer session (see ShmHeader::reset_persisted_settings)\n\n\
          Respects $NEURALFORGE_SHM/$NEURALFORGE_UID, same as every other tool in this workspace."
     );
 }
@@ -271,6 +273,11 @@ pub fn run(args: &[String]) -> std::process::ExitCode {
             }
         },
         Some("capture") => cmd_capture(header, args.get(1).map(String::as_str)),
+        Some("reset") => {
+            header.reset_persisted_settings();
+            println!("settings reset to defaults; helper/layer session preserved");
+            true
+        }
         _ => {
             usage();
             false

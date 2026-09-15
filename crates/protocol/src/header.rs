@@ -446,6 +446,63 @@ impl ShmHeader {
         self.frame_mvec_scale_mode.store(mvec_scale_mode::PIXELS, Ordering::Relaxed);
     }
 
+    /// Resets every user-tunable setting -- [`Self::persisted_settings`]'s own list,
+    /// plus each pass's overrides -- to its default value, on a live mapping a
+    /// helper/layer may be actively using. Deliberately narrower than
+    /// [`Self::init_defaults`] (which this is built on top of): upstream shipped a
+    /// real bug here (PR #16), where its own "reset settings" wiped the live session
+    /// out from under a running helper/layer -- seq words, helper/layer status and
+    /// counters, the DMA-BUF transport fields, HDR detection, motion-vector validity,
+    /// the free-text reason/name fields -- not just the tuning knobs a user actually
+    /// meant to reset. This never touches the ownership lease either; that lives in a
+    /// separate file (`shm.bin.owner`), entirely outside this struct.
+    ///
+    /// Implemented as "snapshot everything `init_defaults` would otherwise clobber
+    /// that isn't a user-tunable setting, call it, restore the snapshot" rather than
+    /// hand-listing default values for the 36-odd settings a second time -- that
+    /// second list is exactly the kind of thing that can silently drift from
+    /// `init_defaults`'s own and reintroduce this same class of bug. `pass[]` is not
+    /// snapshotted: per-pass overrides are also user-tunable settings and are meant
+    /// to reset along with everything else `init_defaults` already resets them to.
+    pub fn reset_persisted_settings(&self) {
+        macro_rules! snapshot {
+            ($($field:ident),+ $(,)?) => {
+                ($(self.$field.load(Ordering::Relaxed)),+)
+            };
+        }
+        let (seq_req, seq_resp, seq_ok, width, height, format, quit, heartbeat, control_seq, tuning_seq, capture_request) =
+            snapshot!(seq_req, seq_resp, seq_ok, width, height, format, quit, heartbeat, control_seq, tuning_seq, capture_request);
+        let (helper_state, model_up, helper_frames_lo, helper_frames_hi, helper_eval_ms_bits, helper_upload_ms_bits, helper_readback_ms_bits, helper_vram_mb, helper_features, helper_pass_ceiling) =
+            snapshot!(helper_state, model_up, helper_frames_lo, helper_frames_hi, helper_eval_ms_bits, helper_upload_ms_bits, helper_readback_ms_bits, helper_vram_mb, helper_features, helper_pass_ceiling);
+        let (layer_attached, layer_frames_lo, layer_frames_hi, layer_width, layer_height, layer_format, layer_composition_up, layer_ms_bits, layer_measured_white_bits, layer_heartbeat) =
+            snapshot!(layer_attached, layer_frames_lo, layer_frames_hi, layer_width, layer_height, layer_format, layer_composition_up, layer_ms_bits, layer_measured_white_bits, layer_heartbeat);
+        let (rebuild_settle_ms, answered_w, answered_h) = snapshot!(rebuild_settle_ms, answered_w, answered_h);
+        let (proxy_export_seq, proxy_pid, proxy_fd, proxy_gen, answer_export_seq, answer_pid, answer_fd, answer_gen, layer_proxy_seq, layer_answer_seq) =
+            snapshot!(proxy_export_seq, proxy_pid, proxy_fd, proxy_gen, answer_export_seq, answer_pid, answer_fd, answer_gen, layer_proxy_seq, layer_answer_seq);
+        let (hdr_detected, hdr_active, hdr_encode, proxy_format, frame_mvec_valid, frame_mvec_scale_mode) =
+            snapshot!(hdr_detected, hdr_active, hdr_encode, proxy_format, frame_mvec_valid, frame_mvec_scale_mode);
+        let helper_reason = self.helper_reason();
+        let layer_reason = self.layer_reason();
+        let game_name = self.game_name();
+
+        self.init_defaults();
+
+        macro_rules! restore {
+            ($($field:ident),+ $(,)?) => {
+                $(self.$field.store($field, Ordering::Relaxed);)+
+            };
+        }
+        restore!(seq_req, seq_resp, seq_ok, width, height, format, quit, heartbeat, control_seq, tuning_seq, capture_request);
+        restore!(helper_state, model_up, helper_frames_lo, helper_frames_hi, helper_eval_ms_bits, helper_upload_ms_bits, helper_readback_ms_bits, helper_vram_mb, helper_features, helper_pass_ceiling);
+        restore!(layer_attached, layer_frames_lo, layer_frames_hi, layer_width, layer_height, layer_format, layer_composition_up, layer_ms_bits, layer_measured_white_bits, layer_heartbeat);
+        restore!(rebuild_settle_ms, answered_w, answered_h);
+        restore!(proxy_export_seq, proxy_pid, proxy_fd, proxy_gen, answer_export_seq, answer_pid, answer_fd, answer_gen, layer_proxy_seq, layer_answer_seq);
+        restore!(hdr_detected, hdr_active, hdr_encode, proxy_format, frame_mvec_valid, frame_mvec_scale_mode);
+        self.set_helper_reason(&helper_reason);
+        self.set_layer_reason(&layer_reason);
+        self.set_game_name(&game_name);
+    }
+
     /// Whether this mapping is one of ours and laid out the way this build expects.
     pub fn is_valid(&self) -> bool {
         self.magic.load(Ordering::Relaxed) == SHM_MAGIC && self.version.load(Ordering::Relaxed) == SHM_VERSION
@@ -724,6 +781,57 @@ mod tests {
         assert_eq!(f32::from_bits(h.intensity_bits.load(Ordering::Relaxed)), 1.0);
         // Bypass is on until the user turns composition on.
         assert_eq!(h.composition_bypass.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn reset_persisted_settings_changes_settings_but_preserves_the_live_session() {
+        let h = ShmHeader::default();
+        h.init_defaults();
+
+        // A user-tunable setting, changed away from its default.
+        h.intensity_bits.store(0.4f32.to_bits(), Ordering::Relaxed);
+        h.style.store(2, Ordering::Relaxed);
+
+        // Live session/transport state a real helper and layer would have built up --
+        // exactly what upstream's PR #16 bug wiped out from under a running process.
+        h.seq_req.store(41, Ordering::Relaxed);
+        h.seq_resp.store(40, Ordering::Relaxed);
+        h.width.store(2560, Ordering::Relaxed);
+        h.height.store(1440, Ordering::Relaxed);
+        h.helper_state.store(crate::enums::helper_state::RUNNING, Ordering::Relaxed);
+        h.model_up.store(1, Ordering::Relaxed);
+        store64(&h.helper_frames_lo, &h.helper_frames_hi, 12_345);
+        h.layer_attached.store(1, Ordering::Relaxed);
+        store64(&h.layer_frames_lo, &h.layer_frames_hi, 6_789);
+        h.proxy_fd.store(17, Ordering::Relaxed);
+        h.proxy_pid.store(99, Ordering::Relaxed);
+        h.hdr_active.store(1, Ordering::Relaxed);
+        h.frame_mvec_valid.store(1, Ordering::Relaxed);
+        h.set_helper_reason("model ready");
+        h.set_game_name("GTA5_Enhanced.exe");
+
+        h.reset_persisted_settings();
+
+        // The settings actually changed.
+        assert_eq!(f32::from_bits(h.intensity_bits.load(Ordering::Relaxed)), 1.0, "settings must reset");
+        assert_eq!(h.style.load(Ordering::Relaxed), 0, "settings must reset");
+
+        // Nothing about the live session moved.
+        assert_eq!(h.seq_req.load(Ordering::Relaxed), 41);
+        assert_eq!(h.seq_resp.load(Ordering::Relaxed), 40);
+        assert_eq!(h.width.load(Ordering::Relaxed), 2560);
+        assert_eq!(h.height.load(Ordering::Relaxed), 1440);
+        assert_eq!(h.helper_state.load(Ordering::Relaxed), crate::enums::helper_state::RUNNING);
+        assert_eq!(h.model_up.load(Ordering::Relaxed), 1);
+        assert_eq!(load64(&h.helper_frames_lo, &h.helper_frames_hi), 12_345);
+        assert_eq!(h.layer_attached.load(Ordering::Relaxed), 1);
+        assert_eq!(load64(&h.layer_frames_lo, &h.layer_frames_hi), 6_789);
+        assert_eq!(h.proxy_fd.load(Ordering::Relaxed), 17);
+        assert_eq!(h.proxy_pid.load(Ordering::Relaxed), 99);
+        assert_eq!(h.hdr_active.load(Ordering::Relaxed), 1);
+        assert_eq!(h.frame_mvec_valid.load(Ordering::Relaxed), 1);
+        assert_eq!(h.helper_reason(), "model ready");
+        assert_eq!(h.game_name(), "GTA5_Enhanced.exe");
     }
 
     #[test]

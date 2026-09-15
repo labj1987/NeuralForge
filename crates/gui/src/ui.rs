@@ -424,25 +424,74 @@ fn build_status_group(shm: &std::sync::Arc<neuralforge_protocol::mapping::Mappin
     binaries_row.add_suffix(&import_button);
     group.add(&binaries_row);
 
-    let toasts = toasts.clone();
-    import_button.connect_clicked(move |button| {
+    {
         let toasts = toasts.clone();
-        let binaries_row = binaries_row.clone();
-        let parent = button.root().and_downcast::<gtk4::Window>();
-        let dialog = gtk4::FileDialog::builder().title("Select folder containing NVIDIA NGX DLLs").build();
-        dialog.select_folder(parent.as_ref(), None::<&gio::Cancellable>, move |result| {
-            let Ok(folder) = result else { return };
-            let Some(path) = folder.path() else { return };
-            match crate::binaries::import_from(&path) {
-                Ok(0) => toasts.add_toast(adw::Toast::new("No matching DLLs found in that folder")),
-                Ok(n) => {
-                    toasts.add_toast(adw::Toast::new(&format!("Imported {n} file(s) -- restart the helper to load them")));
-                    binaries_row.set_subtitle(&binaries_status_subtitle());
+        import_button.connect_clicked(move |button| {
+            let toasts = toasts.clone();
+            let binaries_row = binaries_row.clone();
+            let parent = button.root().and_downcast::<gtk4::Window>();
+            let dialog = gtk4::FileDialog::builder().title("Select folder containing NVIDIA NGX DLLs").build();
+            dialog.select_folder(parent.as_ref(), None::<&gio::Cancellable>, move |result| {
+                let Ok(folder) = result else { return };
+                let Some(path) = folder.path() else { return };
+                match crate::binaries::import_from(&path) {
+                    Ok(0) => toasts.add_toast(adw::Toast::new("No matching DLLs found in that folder")),
+                    Ok(n) => {
+                        toasts.add_toast(adw::Toast::new(&format!("Imported {n} file(s) -- restart the helper to load them")));
+                        binaries_row.set_subtitle(&binaries_status_subtitle());
+                    }
+                    Err(e) => toasts.add_toast(adw::Toast::new(&format!("Import failed: {e}"))),
                 }
-                Err(e) => toasts.add_toast(adw::Toast::new(&format!("Import failed: {e}"))),
-            }
+            });
         });
-    });
+    }
+
+    let settings_row = adw::ActionRow::new();
+    settings_row.set_title("Settings");
+    settings_row.set_subtitle("Reset every tuning value to its default");
+    let reset_button = gtk4::Button::with_label("Reset…");
+    reset_button.add_css_class("destructive-action");
+    reset_button.set_valign(gtk4::Align::Center);
+    settings_row.add_suffix(&reset_button);
+    group.add(&settings_row);
+
+    {
+        let shm = std::sync::Arc::clone(shm);
+        let toasts = toasts.clone();
+        reset_button.connect_clicked(move |button| {
+            let shm = std::sync::Arc::clone(&shm);
+            let toasts = toasts.clone();
+            let parent = button.root().and_downcast::<gtk4::Window>();
+            let dialog = adw::AlertDialog::builder()
+                .heading("Reset all settings?")
+                .body("Every tuning value returns to its default. The running helper/layer \
+                       session (frame counters, transport state) is not affected. Restart \
+                       NeuralForge afterward to see the reset values in this window.")
+                .default_response("cancel")
+                .close_response("cancel")
+                .build();
+            dialog.add_response("cancel", "Cancel");
+            dialog.add_response("reset", "Reset");
+            dialog.set_response_appearance("reset", adw::ResponseAppearance::Destructive);
+            dialog.choose(parent.as_ref(), None::<&gio::Cancellable>, move |response| {
+                if response != "reset" { return; }
+                // Reset the live mapping the running helper/layer are already
+                // attached to, then overwrite config.ini with the same defaults so a
+                // restart doesn't just reload the values this just cleared -- the
+                // same two places `persist_one` already keeps in sync for a single
+                // setting, done here for all of them at once.
+                shm.header().reset_persisted_settings();
+                let mut cfg = neuralforge_supervisor::Config::load();
+                for (name, value) in neuralforge_protocol::persist::snapshot(shm.header()) {
+                    cfg.settings.insert(name, value);
+                }
+                match cfg.save() {
+                    Ok(()) => toasts.add_toast(adw::Toast::new("Settings reset -- restart NeuralForge to see it reflected here")),
+                    Err(e) => toasts.add_toast(adw::Toast::new(&format!("Reset the live session, but saving config.ini failed: {e}"))),
+                }
+            });
+        });
+    }
 
     group
 }

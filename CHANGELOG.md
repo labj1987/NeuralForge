@@ -39,6 +39,20 @@
   cannot exercise the render tap at all (see `HARDWARE_VALIDATION.md`), so this still
   needs a real session before Phase 2 can be called done.
 
+## Unreleased — NeuralForge Phase 6
+
+- Release Cargo profile: `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`,
+  `strip = true`. Measured on `libneuralforge_layer.so`: 1,774,464 -> 1,184,760 bytes
+  (~33% smaller); full test suite still green.
+- Add `ShmHeader::reset_persisted_settings` (`neuralforge-cli shmctl reset`, and a
+  "Reset…" button on the GUI's Status tab): resets every user-tunable setting to its
+  default while preserving the live helper/layer session -- seq words, status
+  counters, DMA-BUF transport fields, HDR detection, motion-vector validity, the
+  free-text reason/name fields. Upstream shipped a real bug here (PR #16), wiping the
+  live session out from under a running process on every settings reset; a test
+  (`reset_persisted_settings_changes_settings_but_preserves_the_live_session`) guards
+  against reintroducing it.
+
 ## Historical releases before the NeuralForge rename
 
 > Historical record: pre-NeuralForge names and deployment instructions below are
