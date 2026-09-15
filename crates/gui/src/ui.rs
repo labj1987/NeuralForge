@@ -299,6 +299,26 @@ pub fn build_ui(app: &adw::Application) {
     let setup_page = build_setup_page(&toasts);
     view_stack.add_titled_with_icon(&setup_page, Some("setup"), "Setup", "preferences-system-symbolic");
 
+    // First-run flow: `nvngx_dlssnr.dll` missing means neural rendering can't work at
+    // all yet (fail-open just presents untouched frames, no error a first-time user
+    // would ever see) -- land on Setup instead of Model, with a banner explaining why,
+    // rather than a silently-inert app.
+    let missing_ngx = !crate::binaries::dir().join("nvngx_dlssnr.dll").is_file();
+    if missing_ngx {
+        view_stack.set_visible_child_name("setup");
+    }
+    let banner = adw::Banner::new("NVIDIA NGX binaries are missing -- neural rendering can't run without them");
+    banner.set_button_label(Some("Open Setup"));
+    banner.set_revealed(missing_ngx);
+    {
+        let view_stack = view_stack.clone();
+        let banner_for_closure = banner.clone();
+        banner.connect_button_clicked(move |_| {
+            view_stack.set_visible_child_name("setup");
+            banner_for_closure.set_revealed(false);
+        });
+    }
+
     // Deprecated since libadwaita 1.4 in favor of AdwBreakpoint, but that replacement
     // needs a newer libadwaita than this project targets (see the gtk4/libadwaita
     // feature-flag gotcha elsewhere in this codebase) -- ViewSwitcherTitle/Bar still
@@ -321,6 +341,7 @@ pub fn build_ui(app: &adw::Application) {
 
     let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     content.append(&header);
+    content.append(&banner);
     content.append(&view_stack);
     content.append(&switcher_bar);
     toasts.set_child(Some(&content));
