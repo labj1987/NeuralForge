@@ -285,6 +285,18 @@ pub struct ShmHeader {
     pub frame_mvec_valid: AtomicU32,
     /// Snapshot of units used to encode this request, independent of GUI changes.
     pub frame_mvec_scale_mode: AtomicU32,
+
+    // --- v3: the second, independent request/response slot ---------------------------
+    // Appended after everything else on purpose, same reasoning as `pass` above: a
+    // new field inserted higher up would move every field below it. See
+    // `PROTOCOL_V3_DESIGN.md` for why only these five are duplicated (not, say,
+    // `format`/`hdr_encode`/`answered_w`/`answered_h`, which are dead fields on slot 0
+    // too -- nothing in this workspace reads or writes them today).
+    pub seq_req_b: AtomicU32,
+    pub seq_resp_b: AtomicU32,
+    pub width_b: AtomicU32,
+    pub height_b: AtomicU32,
+    pub proxy_format_b: AtomicU32,
 }
 
 // The whole point of a shared, memory-mapped struct like this is that every writer
@@ -316,7 +328,7 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 1960, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 1980, "the header layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, enabled) == 44, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(
     std::mem::offset_of!(ShmHeader, transfer_strength_bits) == 88,
@@ -326,6 +338,9 @@ const _: () = assert!(std::mem::offset_of!(ShmHeader, helper_state) == 176, "lay
 const _: () = assert!(std::mem::offset_of!(ShmHeader, pass) == 780, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, mvec_enabled) == 1860, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, hdr_mode) == 1932, "layout changed -- bump SHM_VERSION");
+// v3's second slot, appended after everything else -- same reasoning as `pass`'s own
+// comment above about why a new field belongs at the end, not inserted higher up.
+const _: () = assert!(std::mem::offset_of!(ShmHeader, seq_req_b) == 1960, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, frame_mvec_valid) == 1952, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, frame_mvec_scale_mode) == 1956, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::size_of::<PassControl>() == 36, "layout changed -- bump SHM_VERSION");
@@ -444,6 +459,12 @@ impl ShmHeader {
         self.hdr_encode.store(0, Ordering::Relaxed);
         self.frame_mvec_valid.store(0, Ordering::Relaxed);
         self.frame_mvec_scale_mode.store(mvec_scale_mode::PIXELS, Ordering::Relaxed);
+
+        self.seq_req_b.store(0, Ordering::Relaxed);
+        self.seq_resp_b.store(0, Ordering::Relaxed);
+        self.width_b.store(0, Ordering::Relaxed);
+        self.height_b.store(0, Ordering::Relaxed);
+        self.proxy_format_b.store(crate::enums::proxy_format::RGBA8, Ordering::Relaxed);
     }
 
     /// Resets every user-tunable setting -- [`Self::persisted_settings`]'s own list,
@@ -481,6 +502,11 @@ impl ShmHeader {
             snapshot!(proxy_export_seq, proxy_pid, proxy_fd, proxy_gen, answer_export_seq, answer_pid, answer_fd, answer_gen, layer_proxy_seq, layer_answer_seq);
         let (hdr_detected, hdr_active, hdr_encode, proxy_format, frame_mvec_valid, frame_mvec_scale_mode) =
             snapshot!(hdr_detected, hdr_active, hdr_encode, proxy_format, frame_mvec_valid, frame_mvec_scale_mode);
+        // Slot 1 (v3): a live in-flight second request must survive a settings reset
+        // exactly like slot 0's already does -- this is the same class of bug PR #16
+        // (see this function's own doc comment) already burned upstream on once.
+        let (seq_req_b, seq_resp_b, width_b, height_b, proxy_format_b) =
+            snapshot!(seq_req_b, seq_resp_b, width_b, height_b, proxy_format_b);
         let helper_reason = self.helper_reason();
         let layer_reason = self.layer_reason();
         let game_name = self.game_name();
@@ -498,6 +524,7 @@ impl ShmHeader {
         restore!(rebuild_settle_ms, answered_w, answered_h);
         restore!(proxy_export_seq, proxy_pid, proxy_fd, proxy_gen, answer_export_seq, answer_pid, answer_fd, answer_gen, layer_proxy_seq, layer_answer_seq);
         restore!(hdr_detected, hdr_active, hdr_encode, proxy_format, frame_mvec_valid, frame_mvec_scale_mode);
+        restore!(seq_req_b, seq_resp_b, width_b, height_b, proxy_format_b);
         self.set_helper_reason(&helper_reason);
         self.set_layer_reason(&layer_reason);
         self.set_game_name(&game_name);
@@ -781,6 +808,10 @@ mod tests {
         assert_eq!(f32::from_bits(h.intensity_bits.load(Ordering::Relaxed)), 1.0);
         // Bypass is on until the user turns composition on.
         assert_eq!(h.composition_bypass.load(Ordering::Relaxed), 0);
+        // Slot 1 (v3) starts idle, same shape as slot 0.
+        assert_eq!(h.seq_req_b.load(Ordering::Relaxed), 0);
+        assert_eq!(h.seq_resp_b.load(Ordering::Relaxed), 0);
+        assert_eq!(h.proxy_format_b.load(Ordering::Relaxed), crate::enums::proxy_format::RGBA8);
     }
 
     #[test]
@@ -798,6 +829,14 @@ mod tests {
         h.seq_resp.store(40, Ordering::Relaxed);
         h.width.store(2560, Ordering::Relaxed);
         h.height.store(1440, Ordering::Relaxed);
+        // Slot 1 (v3): a settings reset must not wipe a live second in-flight request
+        // out from under a running process either -- the same PR #16 bug class this
+        // test already guards slot 0 against.
+        h.seq_req_b.store(9, Ordering::Relaxed);
+        h.seq_resp_b.store(8, Ordering::Relaxed);
+        h.width_b.store(1920, Ordering::Relaxed);
+        h.height_b.store(1080, Ordering::Relaxed);
+        h.proxy_format_b.store(crate::enums::proxy_format::BGRA8, Ordering::Relaxed);
         h.helper_state.store(crate::enums::helper_state::RUNNING, Ordering::Relaxed);
         h.model_up.store(1, Ordering::Relaxed);
         store64(&h.helper_frames_lo, &h.helper_frames_hi, 12_345);
@@ -821,6 +860,11 @@ mod tests {
         assert_eq!(h.seq_resp.load(Ordering::Relaxed), 40);
         assert_eq!(h.width.load(Ordering::Relaxed), 2560);
         assert_eq!(h.height.load(Ordering::Relaxed), 1440);
+        assert_eq!(h.seq_req_b.load(Ordering::Relaxed), 9);
+        assert_eq!(h.seq_resp_b.load(Ordering::Relaxed), 8);
+        assert_eq!(h.width_b.load(Ordering::Relaxed), 1920);
+        assert_eq!(h.height_b.load(Ordering::Relaxed), 1080);
+        assert_eq!(h.proxy_format_b.load(Ordering::Relaxed), crate::enums::proxy_format::BGRA8);
         assert_eq!(h.helper_state.load(Ordering::Relaxed), crate::enums::helper_state::RUNNING);
         assert_eq!(h.model_up.load(Ordering::Relaxed), 1);
         assert_eq!(load64(&h.helper_frames_lo, &h.helper_frames_hi), 12_345);
