@@ -101,7 +101,8 @@ baseline uses `NEURALFORGE_DMABUF=0`.
 The current host-SHM capture is synchronous and is intentionally being profiled before
 any performance claim. See [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) for the
 recorded live results and [RENDER_TAP_DESIGN.md](RENDER_TAP_DESIGN.md) for the safety
-constraints behind this path.
+constraints behind this path. The next bounded asynchronous capture design is recorded
+in [ASYNC_CAPTURE_DESIGN.md](ASYNC_CAPTURE_DESIGN.md); it is not enabled yet.
 
 ## Building from source
 
