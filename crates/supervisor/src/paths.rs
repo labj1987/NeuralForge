@@ -12,6 +12,15 @@ fn xdg(var: &str, fallback_under_home: &str) -> String {
     std::env::var(var).ok().filter(|s| !s.is_empty()).unwrap_or_else(|| format!("{}/{fallback_under_home}", home()))
 }
 
+/// The raw `XDG_DATA_HOME` itself (not the `neuralforge` subdirectory [`data_dir`]
+/// returns) -- `install.rs` needs it as-is, matching `scripts/install.py`'s own
+/// `data` variable: several installed files (the Vulkan manifest, `.desktop` file,
+/// icon, AppStream metainfo) live under the shared per-user data hierarchy's own
+/// well-known subdirectories, siblings of `neuralforge/` rather than inside it.
+pub fn data_home() -> String {
+    xdg("XDG_DATA_HOME", ".local/share")
+}
+
 pub fn config_dir() -> String {
     format!("{}/neuralforge", xdg("XDG_CONFIG_HOME", ".config"))
 }
@@ -82,20 +91,23 @@ pub fn steam_install_dir() -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    // Guards every test below that mutates `XDG_DATA_HOME` (a real, process-wide
-    // environment variable, not something scoped per-test) -- Rust's default test
-    // harness runs tests in parallel threads within the same process, so two such
-    // tests running concurrently can and did race for real: one test's `assert_eq!`
-    // observing the *other* test's own `XDG_DATA_HOME` value mid-flight. Confirmed
-    // genuinely intermittent, not a one-off: `cargo test` (workspace-wide, different
-    // thread scheduling than running this crate alone) failed roughly 1 run in 3
-    // before this lock existed, 2026-09-11. Every test touching this env var must
-    // acquire this lock for its entire duration, restoring the prior value (or
-    // removing it) before releasing.
-    static XDG_DATA_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Guards every test in this crate that mutates `XDG_DATA_HOME` (a real,
+    // process-wide environment variable, not something scoped per-test) -- Rust's
+    // default test harness runs tests in parallel threads within the same process,
+    // so two such tests running concurrently can and did race for real: one test's
+    // `assert_eq!` observing the *other* test's own `XDG_DATA_HOME` value mid-flight.
+    // Confirmed genuinely intermittent, not a one-off: `cargo test` (workspace-wide,
+    // different thread scheduling than running this crate alone) failed roughly 1 run
+    // in 3 before this lock existed, 2026-09-11. `pub(crate)` (not private to this
+    // module) on purpose: `install::tests` also mutates `XDG_DATA_HOME` and had its
+    // own separate lock racing against this one for the same reason, until both were
+    // unified onto this single instance, 2026-09-15. Every test anywhere in this
+    // crate that touches this env var must acquire this lock for its entire
+    // duration, restoring the prior value (or removing it) before releasing.
+    pub(crate) static XDG_DATA_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Real filesystem, real env var override -- confirms `steam_install_dir` actually
     /// finds a directory that exists (not just "returns some string unconditionally"),

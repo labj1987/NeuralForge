@@ -5,6 +5,7 @@
 //! Linux-only: spawns child processes, reads XDG env vars.
 
 pub mod config;
+pub mod install;
 pub mod install_dir;
 pub mod paths;
 pub mod profiles;

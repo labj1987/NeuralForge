@@ -1,0 +1,394 @@
+//! Installing an extracted AppImage AppDir into persistent user storage, and
+//! uninstalling it again -- the same operation, the same `installation.json`
+//! provenance record format (a flat `path -> sha256` map, refusing to touch any file
+//! that record doesn't say this installer itself last wrote), and the same
+//! atomic-replace-never-truncate file writes as `scripts/install.py`. Reimplemented
+//! in Rust so the GUI's Setup tab can offer an "Install for Steam games" button
+//! without a `python3` dependency; both tools read/write the exact same record on
+//! purpose, so either can pick up after the other left off.
+
+use std::collections::BTreeMap;
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
+
+use crate::paths;
+
+pub const APP_ID: &str = "io.github.labj1987.NeuralForge";
+pub const LAYER: &str = "VK_LAYER_neuralforge_neural";
+
+#[derive(Debug)]
+pub enum InstallError {
+    Io(std::io::Error),
+    Json(serde_json::Error),
+    InvalidManifest(String),
+    RefusedSymlink(PathBuf),
+    RefusedUnowned(PathBuf),
+}
+
+impl std::fmt::Display for InstallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "{e}"),
+            Self::Json(e) => write!(f, "{e}"),
+            Self::InvalidManifest(msg) => write!(f, "{msg}"),
+            Self::RefusedSymlink(path) => write!(f, "refusing symlink destination: {}", path.display()),
+            Self::RefusedUnowned(path) => write!(f, "refusing to overwrite unowned or changed file: {}", path.display()),
+        }
+    }
+}
+
+impl std::error::Error for InstallError {}
+impl From<std::io::Error> for InstallError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+impl From<serde_json::Error> for InstallError {
+    fn from(e: serde_json::Error) -> Self {
+        Self::Json(e)
+    }
+}
+
+#[derive(Debug)]
+pub struct InstallReport {
+    pub root: PathBuf,
+    pub gui_path: PathBuf,
+    pub cli_path: PathBuf,
+}
+
+fn digest(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+fn digest_file(path: &Path) -> std::io::Result<String> {
+    Ok(digest(&std::fs::read(path)?))
+}
+
+fn record_path() -> PathBuf {
+    PathBuf::from(paths::data_dir()).join("installation.json")
+}
+
+fn load_record() -> BTreeMap<String, String> {
+    std::fs::read_to_string(record_path()).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
+}
+
+fn save_record(record: &BTreeMap<String, String>) -> std::io::Result<()> {
+    let text = serde_json::to_string_pretty(record).expect("a string-keyed map always serializes") + "\n";
+    std::fs::write(record_path(), text)
+}
+
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_files(&path, out)?;
+        } else if path.is_file() {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// Writes `content` to `path`, replacing any existing file by renaming a same-directory
+/// staged file over it -- never truncates the destination in place, so an
+/// already-running process that has the old inode mapped (a GUI, a game, a Wine
+/// helper) keeps reading the old content until it reopens the path, exactly like
+/// `install.py`'s own `os.replace` step.
+fn write_atomic(path: &Path, content: &[u8], mode: u32) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| std::io::Error::other(format!("{} has no parent directory", path.display())))?;
+    std::fs::create_dir_all(parent)?;
+    let mut attempt = 0u32;
+    let staged = loop {
+        let candidate = parent.join(format!(".neuralforge-{}-{attempt}.tmp", std::process::id()));
+        match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&candidate) {
+            Ok(mut file) => {
+                file.write_all(content)?;
+                file.sync_all()?;
+                break candidate;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 1000 => attempt += 1,
+            Err(e) => return Err(e),
+        }
+    };
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(mode)).inspect_err(|_| {
+        let _ = std::fs::remove_file(&staged);
+    })?;
+    std::fs::rename(&staged, path)
+}
+
+/// Installs `appdir` (an extracted AppImage's `AppDir`) into persistent user storage.
+/// Refuses (writing nothing at all) if any destination is a symlink, or already
+/// exists with content this installer's own record doesn't recognize as what it last
+/// wrote there -- the same "never touch a file this didn't put there" guarantee
+/// `install.py` makes.
+pub fn install(appdir: &Path) -> Result<InstallReport, InstallError> {
+    let data_home = PathBuf::from(paths::data_home());
+    let root = PathBuf::from(paths::data_dir());
+    let old = load_record();
+    let usr = appdir.join("usr");
+
+    let mut files: BTreeMap<PathBuf, Vec<u8>> = BTreeMap::new();
+
+    let lib_src_root = usr.join("lib/neuralforge");
+    let mut lib_files = Vec::new();
+    collect_files(&lib_src_root, &mut lib_files)?;
+    for src in lib_files {
+        let rel = src.strip_prefix(&lib_src_root).expect("collect_files only yields paths under lib_src_root");
+        files.insert(root.join("lib/neuralforge").join(rel), std::fs::read(&src)?);
+    }
+
+    for binary in ["neuralforge", "neuralforge-cli"] {
+        files.insert(root.join("bin").join(binary), std::fs::read(usr.join("bin").join(binary))?);
+    }
+
+    let manifest_src = usr.join(format!("share/vulkan/implicit_layer.d/{LAYER}.json"));
+    let mut manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&manifest_src)?)?;
+    let layer_name = manifest.get("layer").and_then(|l| l.get("name")).and_then(|n| n.as_str()).map(str::to_owned);
+    if layer_name.as_deref() != Some(LAYER) {
+        return Err(InstallError::InvalidManifest(format!("{}: expected layer.name {LAYER:?}, found {layer_name:?}", manifest_src.display())));
+    }
+    let library_path = root.join("lib/neuralforge/libneuralforge_layer.so");
+    manifest["layer"]["library_path"] = serde_json::Value::String(library_path.to_string_lossy().into_owned());
+    let manifest_out = serde_json::to_string_pretty(&manifest)? + "\n";
+    files.insert(data_home.join(format!("vulkan/implicit_layer.d/{LAYER}.json")), manifest_out.into_bytes());
+
+    let desktop_src = usr.join(format!("share/applications/{APP_ID}.desktop"));
+    let exec_line = format!("Exec=\"{}\"", root.join("bin/neuralforge").display());
+    let desktop_text = std::fs::read_to_string(&desktop_src)?.replace("Exec=neuralforge", &exec_line);
+    files.insert(data_home.join(format!("applications/{APP_ID}.desktop")), desktop_text.into_bytes());
+
+    for (sub, name) in [("icons/hicolor/scalable/apps", "neuralforge.svg".to_string()), ("metainfo", format!("{APP_ID}.appdata.xml"))] {
+        let src = usr.join("share").join(sub).join(&name);
+        files.insert(data_home.join(sub).join(&name), std::fs::read(&src)?);
+    }
+
+    // Validate every destination before writing any of them, exactly like
+    // `install.py`: a failure partway through must leave nothing changed, not a
+    // half-installed mix of old and new files.
+    for path in files.keys() {
+        for ancestor in path.ancestors() {
+            if !ancestor.as_os_str().is_empty() && ancestor.is_symlink() {
+                return Err(InstallError::RefusedSymlink(path.clone()));
+            }
+        }
+        if path.exists() {
+            let current = digest_file(path)?;
+            if old.get(&path.to_string_lossy().into_owned()) != Some(&current) {
+                return Err(InstallError::RefusedUnowned(path.clone()));
+            }
+        }
+    }
+
+    let bin_dir = root.join("bin");
+    let mut new_record = BTreeMap::new();
+    for (path, content) in &files {
+        let mode = if path.parent() == Some(bin_dir.as_path()) { 0o755 } else { 0o644 };
+        write_atomic(path, content, mode)?;
+        new_record.insert(path.to_string_lossy().into_owned(), digest(content));
+    }
+    save_record(&new_record)?;
+
+    Ok(InstallReport { root: root.clone(), gui_path: root.join("bin/neuralforge"), cli_path: root.join("bin/neuralforge-cli") })
+}
+
+/// Removes every tracked file whose on-disk content still matches this installer's
+/// own record (a file the user or another program has since changed is left alone,
+/// reported as preserved rather than silently deleted), then clears the record.
+pub fn uninstall() -> std::io::Result<Vec<PathBuf>> {
+    let old = load_record();
+    let mut preserved = Vec::new();
+    for (name, expected) in &old {
+        let path = PathBuf::from(name);
+        let matches = path.is_file() && !path.is_symlink() && digest_file(&path).ok().as_ref() == Some(expected);
+        if matches {
+            std::fs::remove_file(&path)?;
+        } else {
+            preserved.push(path);
+        }
+    }
+    let record = record_path();
+    if record.exists() {
+        std::fs::remove_file(record)?;
+    }
+    Ok(preserved)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ScratchDataHome {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        prev: Option<String>,
+        dir: PathBuf,
+    }
+
+    impl ScratchDataHome {
+        fn new(tag: &str) -> Self {
+            // Shares `paths::tests`' own lock, not a separate one -- both mutate the
+            // same process-wide `XDG_DATA_HOME`, and two independent locks around one
+            // env var don't actually exclude each other. See that lock's own doc
+            // comment for the real race this guards against.
+            let guard = crate::paths::tests::XDG_DATA_HOME_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let dir = std::env::temp_dir().join(format!("neuralforge-install-test-{tag}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let prev = std::env::var("XDG_DATA_HOME").ok();
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            Self { _guard: guard, prev, dir }
+        }
+    }
+
+    impl Drop for ScratchDataHome {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+            std::fs::remove_dir_all(&self.dir).ok();
+        }
+    }
+
+    /// Builds the same minimal fixture `scripts/test_install.py` uses, so both
+    /// implementations are exercised against the same shape of AppDir.
+    fn write_fixture_appdir(appdir: &Path) {
+        let files = [
+            ("usr/bin/neuralforge", "gui"),
+            ("usr/bin/neuralforge-cli", "cli"),
+            ("usr/lib/neuralforge/libneuralforge_layer.so", "layer"),
+            ("usr/lib/neuralforge/helper/neuralforge-helper.exe", "helper"),
+            (&format!("usr/share/applications/{APP_ID}.desktop"), "[Desktop Entry]\nExec=neuralforge\n"),
+            ("usr/share/icons/hicolor/scalable/apps/neuralforge.svg", "<svg/>"),
+            (&format!("usr/share/metainfo/{APP_ID}.appdata.xml"), "<component/>"),
+            (&format!("usr/share/vulkan/implicit_layer.d/{LAYER}.json"), r#"{"layer": {"name": "VK_LAYER_neuralforge_neural"}}"#),
+        ];
+        for (rel, content) in files {
+            let path = appdir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+    }
+
+    #[test]
+    fn install_writes_every_expected_destination_and_rewrites_the_manifest_path() {
+        let scratch = ScratchDataHome::new("basic");
+        let appdir = scratch.dir.join("AppDir");
+        write_fixture_appdir(&appdir);
+
+        let report = install(&appdir).expect("install should succeed against a well-formed AppDir");
+        let root = PathBuf::from(paths::data_dir());
+        assert_eq!(report.root, root);
+        assert_eq!(std::fs::read_to_string(root.join("bin/neuralforge")).unwrap(), "gui");
+        assert_eq!(std::fs::read_to_string(root.join("bin/neuralforge-cli")).unwrap(), "cli");
+        assert_eq!(std::fs::read_to_string(root.join("lib/neuralforge/libneuralforge_layer.so")).unwrap(), "layer");
+        assert_eq!(std::fs::read_to_string(root.join("lib/neuralforge/helper/neuralforge-helper.exe")).unwrap(), "helper");
+
+        let manifest_path = PathBuf::from(paths::data_home()).join(format!("vulkan/implicit_layer.d/{LAYER}.json"));
+        let manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest["layer"]["name"], LAYER);
+        assert_eq!(manifest["layer"]["library_path"], root.join("lib/neuralforge/libneuralforge_layer.so").to_string_lossy().into_owned());
+
+        let desktop_path = PathBuf::from(paths::data_home()).join(format!("applications/{APP_ID}.desktop"));
+        let desktop = std::fs::read_to_string(desktop_path).unwrap();
+        assert!(desktop.contains(&format!("Exec=\"{}\"", root.join("bin/neuralforge").display())));
+
+        assert!(record_path().exists());
+    }
+
+    #[test]
+    fn install_is_idempotent() {
+        let scratch = ScratchDataHome::new("idempotent");
+        let appdir = scratch.dir.join("AppDir");
+        write_fixture_appdir(&appdir);
+        install(&appdir).unwrap();
+        install(&appdir).expect("reinstalling the exact same AppDir should succeed");
+    }
+
+    #[test]
+    fn reinstall_replaces_by_rename_not_in_place_truncation() {
+        let scratch = ScratchDataHome::new("rename-replace");
+        let appdir = scratch.dir.join("AppDir");
+        write_fixture_appdir(&appdir);
+        install(&appdir).unwrap();
+
+        let binary = PathBuf::from(paths::data_dir()).join("bin/neuralforge");
+        // Stands in for an already-running process with the old inode mapped --
+        // opening it for read before the reinstall, then confirming it still reads
+        // the pre-update bytes after the reinstall's write lands.
+        let running = std::fs::File::open(&binary).unwrap();
+        std::fs::write(appdir.join("usr/bin/neuralforge"), "updated gui").unwrap();
+        install(&appdir).unwrap();
+
+        use std::io::Read;
+        let mut still_mapped = String::new();
+        (&running).read_to_string(&mut still_mapped).unwrap();
+        assert_eq!(still_mapped, "gui");
+        assert_eq!(std::fs::read_to_string(&binary).unwrap(), "updated gui");
+    }
+
+    #[test]
+    fn install_refuses_to_overwrite_a_file_the_user_changed_by_hand() {
+        let scratch = ScratchDataHome::new("refuse-unowned");
+        let appdir = scratch.dir.join("AppDir");
+        write_fixture_appdir(&appdir);
+        install(&appdir).unwrap();
+
+        let binary = PathBuf::from(paths::data_dir()).join("bin/neuralforge");
+        std::fs::write(&binary, "user changed").unwrap();
+
+        let err = install(&appdir).expect_err("install must refuse once a tracked file no longer matches its record");
+        assert!(matches!(err, InstallError::RefusedUnowned(ref path) if path == &binary), "unexpected error: {err}");
+        // Refusal must not have touched anything else either.
+        assert_eq!(std::fs::read_to_string(&binary).unwrap(), "user changed");
+    }
+
+    #[test]
+    fn install_never_touches_an_unrelated_upstream_file() {
+        let scratch = ScratchDataHome::new("upstream-untouched");
+        let appdir = scratch.dir.join("AppDir");
+        write_fixture_appdir(&appdir);
+        let upstream = PathBuf::from(paths::data_home()).join("vulkan/implicit_layer.d/VkLayer_DLSS5.json");
+        std::fs::create_dir_all(upstream.parent().unwrap()).unwrap();
+        std::fs::write(&upstream, "upstream sentinel").unwrap();
+
+        install(&appdir).unwrap();
+        assert_eq!(std::fs::read_to_string(&upstream).unwrap(), "upstream sentinel");
+    }
+
+    #[test]
+    fn uninstall_removes_only_unchanged_tracked_files() {
+        let scratch = ScratchDataHome::new("uninstall");
+        let appdir = scratch.dir.join("AppDir");
+        write_fixture_appdir(&appdir);
+        install(&appdir).unwrap();
+
+        let cli = PathBuf::from(paths::data_dir()).join("bin/neuralforge-cli");
+        let binary = PathBuf::from(paths::data_dir()).join("bin/neuralforge");
+        std::fs::write(&binary, "user changed").unwrap();
+
+        let preserved = uninstall().unwrap();
+        assert!(!cli.exists(), "an unchanged tracked file should be removed");
+        assert!(binary.exists(), "a changed tracked file should be preserved");
+        assert_eq!(std::fs::read_to_string(&binary).unwrap(), "user changed");
+        assert_eq!(preserved, vec![binary]);
+        assert!(!record_path().exists());
+    }
+
+    #[test]
+    fn install_rejects_a_manifest_with_the_wrong_layer_name() {
+        let scratch = ScratchDataHome::new("wrong-layer-name");
+        let appdir = scratch.dir.join("AppDir");
+        write_fixture_appdir(&appdir);
+        std::fs::write(appdir.join(format!("usr/share/vulkan/implicit_layer.d/{LAYER}.json")), r#"{"layer": {"name": "VK_LAYER_something_else"}}"#).unwrap();
+
+        let err = install(&appdir).expect_err("a manifest with the wrong layer name must be rejected");
+        assert!(matches!(err, InstallError::InvalidManifest(_)), "unexpected error: {err}");
+    }
+}

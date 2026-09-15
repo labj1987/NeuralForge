@@ -27,6 +27,10 @@ fn usage() {
          \x20 runners              list discovered custom compatibility tool runners\n\
          \x20 detect-gpu           print detected NVIDIA PCI vendor/device\n\
          \x20 import-binaries DIR  copy NVIDIA NGX DLLs into user data dir\n\
+         \x20 install --appdir DIR install an extracted AppImage AppDir into\n\
+         \x20                     persistent user storage (see scripts/install.py --\n\
+         \x20                     same operation, same record, either tool works)\n\
+         \x20 uninstall            remove only unchanged tracked installed files\n\
          \x20 shmctl <sub>         raw status/set/toggle/capture against a running\n\
          \x20                     instance's live SHM header (see `shmctl help`)\n\
          \x20 profile <sub>        save/load/list/delete named settings profiles\n\
@@ -346,6 +350,38 @@ fn cmd_stop() -> ExitCode {
     }
 }
 
+fn cmd_install(appdir: Option<&String>) -> ExitCode {
+    let Some(appdir) = appdir else {
+        eprintln!("usage: neuralforge-cli install --appdir DIR");
+        return ExitCode::FAILURE;
+    };
+    match neuralforge_supervisor::install::install(std::path::Path::new(appdir)) {
+        Ok(report) => {
+            println!("Installed NeuralForge. CLI: {}", report.cli_path.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("install failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_uninstall() -> ExitCode {
+    match neuralforge_supervisor::install::uninstall() {
+        Ok(preserved) => {
+            for path in &preserved {
+                println!("preserved changed/missing file: {}", path.display());
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("uninstall failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn cmd_import_binaries(dir: Option<&String>) -> ExitCode {
     let Some(dir) = dir else {
         eprintln!("usage: neuralforge-cli import-binaries DIR");
@@ -398,6 +434,11 @@ fn main() -> ExitCode {
         "runners" => cmd_runners(),
         "detect-gpu" => cmd_detect_gpu(),
         "import-binaries" => cmd_import_binaries(args.get(2)),
+        "install" => {
+            let appdir = args.iter().position(|a| a == "--appdir").and_then(|i| args.get(i + 1));
+            cmd_install(appdir)
+        }
+        "uninstall" => cmd_uninstall(),
         "shmctl" => shmctl::run(&args[2..]),
         "profile" => cmd_profile(&args[2..]),
         "help" | "--help" | "-h" => {
