@@ -141,6 +141,18 @@
   when triggered concurrently, repeatedly, in well under a second total. GTA fps
   against this change is not measured as part of this work.
 
+## Unreleased — NeuralForge Phase 4
+
+- Investigated DMA-BUF transport (see `DMABUF_TRANSPORT_DESIGN.md`): real hardware
+  evidence (`lordnikon`, RTX 5070, driver 615.71.09) that a Wine-hosted Windows guest's
+  `vkGetMemoryWin32HandleKHR` handle cannot be converted to a real Unix fd via Wine's
+  own `wine_server_handle_to_fd` -- a well-formed `STATUS_OBJECT_TYPE_MISMATCH`, not a
+  crash or a wrong-signature guess. This blocks the specific mechanism the protocol's
+  already-reserved `proxy_pid`/`proxy_fd`/`answer_pid`/`answer_fd` fields imply, on a
+  real Wine/NVIDIA-driver constraint, not a gap in this project's own code. No
+  production code changed; `crates/helper/examples/dmabuf_probe.rs` (the diagnostic
+  that found this) is kept for whatever's tried next.
+
 ## Historical releases before the NeuralForge rename
 
 > Historical record: pre-NeuralForge names and deployment instructions below are

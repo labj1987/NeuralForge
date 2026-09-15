@@ -406,3 +406,38 @@ alone. Re-confirmed clean immediately after pulling. Worth remembering the next 
 real-hardware result looks like a race: diff the deployed *source* against what was
 actually pushed, not just re-run the same (possibly stale) deployed binary, before
 concluding anything about the code itself.
+
+## 2026-09-15 (later still) -- Phase 4: DMA-BUF transport, blocked on a real
+## Wine/NVIDIA constraint, not an implementation gap
+
+See `DMABUF_TRANSPORT_DESIGN.md` for the full writeup; this entry is the real-hardware
+evidence. `lordnikon`, RTX 5070, driver 615.71.09, Proton-CachyOS:
+
+`crates/helper/examples/dmabuf_probe.rs` built a real exportable Vulkan buffer inside
+the Wine-hosted helper (`VkExportMemoryAllocateInfo`/`VkExternalMemoryBufferCreateInfo`
+requesting `OPAQUE_WIN32`), got a real, non-null win32 handle from
+`vkGetMemoryWin32HandleKHR` (resolved by hand, not via `ash`'s panicking `::load()`
+convenience wrapper -- same fix class as `EXTERNAL_MEMORY_HOST_DESIGN.md`'s own), then
+called Wine's `ntdll.dll` export `wine_server_handle_to_fd` (confirmed present in this
+exact Proton build via `objdump -p ntdll.dll` before writing any code) against it,
+wrapped in `guard::guarded`.
+
+Result: no fault (`seh=0` -- the guessed Wine ABI is correct), but a real
+`STATUS_OBJECT_TYPE_MISMATCH` (`0xC0000024`) NTSTATUS. Every step up to that call
+succeeded; this is not a crash or a wrong-signature guess, it's Wine's own fd/handle
+bridge telling this probe the handle's underlying object isn't one it can unwrap to a
+Unix fd -- because a Vulkan external-memory win32 handle was never a wineserver-opened
+object to begin with (see the design doc for the fuller reasoning, including the
+likely NVIDIA-internal-shared-surface explanation for why there may be no real
+`dma_buf` behind this handle type on this driver at all).
+
+**Real process lesson from this session, worth remembering**: plain `println!`/stdout
+from a Wine process launched via `proton run` did not reach the invoking shell at all,
+even piped to a file, across 20+ real seconds of the process legitimately running
+(confirmed via `user`/`sys` time in the shell's own `time` output) -- switching the
+probe to this crate's own `log!`/`logging::flush()` (writing through `NEURALFORGE_LOG`
+instead of stdout) fixed it immediately. This project's own `logging.rs` module
+already exists for exactly this class of problem ("whenever this binary's stdout/
+stderr isn't a real terminal... Proton/Steam has redirected it") -- use it for any
+future Wine-side diagnostic tool from the start, don't lose time to a silent process
+assuming `println!` is good enough first.

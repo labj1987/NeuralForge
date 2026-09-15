@@ -26,8 +26,10 @@ shared memory, or Wine prefixes. Import DLLs explicitly into NeuralForge's data 
 Target-process filtering and the kernel ownership lease must remain effective before
 any process can resize or write a channel. Preserve the GTA baseline: helper enabled,
 passes=1, model_resolution=1, motion disabled/quality 0, host SHM transport.
-DMA-BUF remains experimental. Do not lower model resolution or disable the helper
-without explicit user authorization.
+DMA-BUF remains experimental, and is currently blocked on a real Wine/NVIDIA-driver
+constraint, not just unimplemented -- see `DMABUF_TRANSPORT_DESIGN.md` before touching
+it again. Do not lower model resolution or disable the helper without explicit user
+authorization.
 
 Do not reapply the reverted capture/composition fence changes. Validate actual GPU
 operations and establish matched upstream/NeuralForge measurements before performance

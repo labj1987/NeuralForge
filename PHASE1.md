@@ -93,8 +93,11 @@ NEURALFORGE_ENABLE=1 NEURALFORGE_DMABUF=0 NEURALFORGE_TARGET_EXE=GTA5_Enhanced.e
 ```
 
 NeuralForge currently uses host SHM transport; `NEURALFORGE_DMABUF` is reserved and
-has no zero-copy implementation. DMA-BUF remains experimental and requires a separate
-explicit retest because upstream hung at 4K. Never enable both activation flags for
+has no zero-copy implementation -- and, per `DMABUF_TRANSPORT_DESIGN.md`, real
+hardware evidence this session says the underlying mechanism the current Wine-hosted
+helper would need is blocked at the driver/Wine level, not just unbuilt. DMA-BUF
+remains experimental and requires a separate explicit retest because upstream hung at
+4K. Never enable both activation flags for
 one benchmark process. Co-installation does not mean double injection is useful.
 
 Keep helper enabled, passes=1, model_resolution=1, motion_enabled=0,
