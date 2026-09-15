@@ -9,6 +9,14 @@ pub fn dir() -> std::path::PathBuf {
     std::path::PathBuf::from(neuralforge_supervisor::paths::binaries_dir())
 }
 
+/// Every known NGX file, and whether it's currently present in [`dir`] -- the
+/// per-file status the Setup tab's binaries group shows, the same list `import_from`
+/// itself copies from.
+pub fn status() -> Vec<(&'static str, bool)> {
+    let dest = dir();
+    NGX_FILES.iter().map(|&name| (name, dest.join(name).is_file())).collect()
+}
+
 /// Copies whichever of the known NGX DLLs are present in `src` into [`dir`]. Returns
 /// how many were copied.
 pub fn import_from(src: &std::path::Path) -> std::io::Result<usize> {

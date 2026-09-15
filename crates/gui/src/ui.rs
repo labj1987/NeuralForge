@@ -296,6 +296,9 @@ pub fn build_ui(app: &adw::Application) {
     status_page.add(&build_status_group(&shm, &toasts));
     view_stack.add_titled_with_icon(&status_page, Some("status"), "Status", "network-transmit-receive-symbolic");
 
+    let setup_page = build_setup_page(&toasts);
+    view_stack.add_titled_with_icon(&setup_page, Some("setup"), "Setup", "preferences-system-symbolic");
+
     // Deprecated since libadwaita 1.4 in favor of AdwBreakpoint, but that replacement
     // needs a newer libadwaita than this project targets (see the gtk4/libadwaita
     // feature-flag gotcha elsewhere in this codebase) -- ViewSwitcherTitle/Bar still
@@ -376,6 +379,210 @@ fn refresh_profile_combo(combo: &adw::ComboRow) {
         combo.set_model(Some(&gtk4::StringList::new(&refs)));
         combo.set_sensitive(true);
     }
+}
+
+fn build_ngx_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::new();
+    group.set_title("NVIDIA NGX binaries");
+    group.set_description(Some("From your own NVIDIA driver/SDK install -- this project doesn't and can't ship them"));
+
+    let mut status_rows: Vec<(String, adw::ActionRow, gtk4::Image)> = Vec::new();
+    for (name, present) in crate::binaries::status() {
+        let row = adw::ActionRow::new();
+        row.set_title(name);
+        row.set_subtitle(if present { "present" } else { "missing" });
+        let icon = gtk4::Image::from_icon_name(if present { "emblem-ok-symbolic" } else { "dialog-warning-symbolic" });
+        row.add_prefix(&icon);
+        group.add(&row);
+        status_rows.push((name.to_string(), row, icon));
+    }
+
+    let import_row = adw::ActionRow::new();
+    import_row.set_title("Import");
+    import_row.set_subtitle("Copy the DLLs above from a folder (an extracted NVIDIA driver/SDK) in one step");
+    let import_button = gtk4::Button::with_label("Import…");
+    import_button.set_valign(gtk4::Align::Center);
+    import_row.add_suffix(&import_button);
+    import_row.set_activatable_widget(Some(&import_button));
+    group.add(&import_row);
+
+    {
+        let toasts = toasts.clone();
+        import_button.connect_clicked(move |button| {
+            let toasts = toasts.clone();
+            let status_rows = status_rows.clone();
+            let parent = button.root().and_downcast::<gtk4::Window>();
+            let dialog = gtk4::FileDialog::builder().title("Select folder containing NVIDIA NGX DLLs").build();
+            dialog.select_folder(parent.as_ref(), None::<&gio::Cancellable>, move |result| {
+                let Ok(folder) = result else { return };
+                let Some(path) = folder.path() else { return };
+                match crate::binaries::import_from(&path) {
+                    Ok(0) => toasts.add_toast(adw::Toast::new("No matching DLLs found in that folder")),
+                    Ok(n) => {
+                        toasts.add_toast(adw::Toast::new(&format!("Imported {n} file(s) -- restart the helper to load them")));
+                        for (name, row, icon) in &status_rows {
+                            let present = crate::binaries::dir().join(name).is_file();
+                            row.set_subtitle(if present { "present" } else { "missing" });
+                            icon.set_icon_name(Some(if present { "emblem-ok-symbolic" } else { "dialog-warning-symbolic" }));
+                        }
+                    }
+                    Err(e) => toasts.add_toast(adw::Toast::new(&format!("Import failed: {e}"))),
+                }
+            });
+        });
+    }
+
+    group
+}
+
+fn build_runner_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::new();
+    group.set_title("Compatibility tool");
+    group.set_description(Some("Needs DXVK-NVAPI (Proton-CachyOS, Proton-GE) or a system Wine with it installed -- \
+                            Valve's stock Proton builds don't bundle it"));
+
+    let mut options: Vec<(String, String)> = neuralforge_supervisor::runners::discover_proton()
+        .into_iter()
+        .map(|runner| (runner.name, runner.path.to_string_lossy().into_owned()))
+        .collect();
+    if let Some(wine) = neuralforge_supervisor::runners::find_wine() {
+        options.push(("System Wine".to_string(), wine.to_string_lossy().into_owned()));
+    }
+
+    let combo = adw::ComboRow::new();
+    combo.set_title("Runner");
+    if options.is_empty() {
+        combo.set_model(Some(&gtk4::StringList::new(&["No compatibility tool found"])));
+        combo.set_sensitive(false);
+    } else {
+        let cfg = neuralforge_supervisor::Config::load();
+        let names: Vec<&str> = options.iter().map(|(name, _)| name.as_str()).collect();
+        combo.set_model(Some(&gtk4::StringList::new(&names)));
+        let selected = options.iter().position(|(_, path)| *path == cfg.runner_path).unwrap_or(0);
+        combo.set_selected(selected as u32);
+    }
+    group.add(&combo);
+
+    if !options.is_empty() {
+        let toasts = toasts.clone();
+        combo.connect_selected_notify(move |combo| {
+            let Some((name, path)) = options.get(combo.selected() as usize) else { return };
+            let mut cfg = neuralforge_supervisor::Config::load();
+            cfg.runner_type = if name == "System Wine" { "wine".to_string() } else { "proton".to_string() };
+            cfg.runner_path = path.clone();
+            match cfg.save() {
+                Ok(()) => toasts.add_toast(adw::Toast::new(&format!("Runner set to {name} -- restart the helper to use it"))),
+                Err(e) => toasts.add_toast(adw::Toast::new(&format!("Failed to save: {e}"))),
+            }
+        });
+    }
+
+    group
+}
+
+fn build_install_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::new();
+    group.set_title("Steam games");
+    group.set_description(Some("Copies this AppImage's own layer and binaries into persistent user storage, so Vulkan \
+                            can still find them once the AppImage itself isn't running"));
+
+    let row = adw::ActionRow::new();
+    row.set_title("Install layer for Steam games");
+    let install_button = gtk4::Button::with_label("Install…");
+    install_button.set_valign(gtk4::Align::Center);
+    install_button.add_css_class("suggested-action");
+
+    // `APPDIR` is the AppImage runtime's own env var for the live mounted AppDir --
+    // only set when this GUI is actually running from inside an AppImage, which is
+    // also the only case this button makes sense in (a `cargo run` dev build has no
+    // AppDir to install from).
+    let appdir = std::env::var("APPDIR").ok();
+    row.set_subtitle(match &appdir {
+        Some(dir) => dir.as_str(),
+        None => "Only available when running from the AppImage",
+    });
+    if appdir.is_none() {
+        install_button.set_sensitive(false);
+    }
+    row.add_suffix(&install_button);
+    group.add(&row);
+
+    if let Some(dir) = appdir {
+        let toasts = toasts.clone();
+        install_button.connect_clicked(move |_| match neuralforge_supervisor::install::install(std::path::Path::new(&dir)) {
+            Ok(report) => toasts.add_toast(adw::Toast::new(&format!("Installed to {}", report.root.display()))),
+            Err(e) => toasts.add_toast(adw::Toast::new(&format!("Install failed: {e}"))),
+        });
+    }
+
+    group
+}
+
+/// The exact Steam launch-option string for these settings -- pulled out of the
+/// closure below so it's a plain, unit-testable function instead of only ever being
+/// exercised live through GTK signal handlers.
+fn launch_option(target_exe: &str, dmabuf: bool) -> String {
+    let dmabuf = u32::from(dmabuf);
+    let target_exe = target_exe.trim();
+    if target_exe.is_empty() {
+        format!("NEURALFORGE_ENABLE=1 NEURALFORGE_DMABUF={dmabuf} %command%")
+    } else {
+        format!("NEURALFORGE_ENABLE=1 NEURALFORGE_DMABUF={dmabuf} NEURALFORGE_TARGET_EXE={target_exe} %command%")
+    }
+}
+
+fn build_launch_option_group() -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::new();
+    group.set_title("Steam launch option");
+    group.set_description(Some("Paste this into the game's Properties -> Launch Options in Steam"));
+
+    let exe_row = adw::EntryRow::new();
+    exe_row.set_title("Target executable (optional, for a multi-process game)");
+    group.add(&exe_row);
+
+    let dmabuf_row = adw::SwitchRow::new();
+    dmabuf_row.set_title("DMA-BUF transport");
+    dmabuf_row.set_subtitle("Off is the known-good baseline");
+    group.add(&dmabuf_row);
+
+    let preview_row = adw::ActionRow::new();
+    preview_row.set_title("Launch option");
+    preview_row.add_css_class("property");
+    let copy_button = gtk4::Button::with_label("Copy");
+    copy_button.set_valign(gtk4::Align::Center);
+    preview_row.add_suffix(&copy_button);
+    group.add(&preview_row);
+
+    let exe_row_for_build = exe_row.clone();
+    let dmabuf_row_for_build = dmabuf_row.clone();
+    let build_option = std::rc::Rc::new(move || launch_option(&exe_row_for_build.text(), dmabuf_row_for_build.is_active()));
+
+    preview_row.set_subtitle(&build_option());
+
+    {
+        let preview_row = preview_row.clone();
+        let build_option = std::rc::Rc::clone(&build_option);
+        exe_row.connect_changed(move |_| preview_row.set_subtitle(&build_option()));
+    }
+    {
+        let preview_row = preview_row.clone();
+        let build_option = std::rc::Rc::clone(&build_option);
+        dmabuf_row.connect_active_notify(move |_| preview_row.set_subtitle(&build_option()));
+    }
+    copy_button.connect_clicked(move |button| {
+        button.display().clipboard().set_text(&build_option());
+    });
+
+    group
+}
+
+fn build_setup_page(toasts: &adw::ToastOverlay) -> adw::PreferencesPage {
+    let page = adw::PreferencesPage::new();
+    page.add(&build_ngx_group(toasts));
+    page.add(&build_runner_group(toasts));
+    page.add(&build_install_group(toasts));
+    page.add(&build_launch_option_group());
+    page
 }
 
 fn build_status_group(shm: &std::sync::Arc<neuralforge_protocol::mapping::Mapping>, toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
@@ -645,5 +852,35 @@ fn build_error_window(app: &adw::Application) {
         assert_eq!(evdev_keycode(0),None);
         assert_eq!(evdev_keycode(8),None);
         assert_eq!(evdev_keycode(u32::MAX),None);
+    }
+}
+
+#[cfg(test)]
+mod launch_option_tests {
+    use super::*;
+
+    #[test]
+    fn matches_the_documented_baseline_with_no_target_exe() {
+        assert_eq!(launch_option("", false), "NEURALFORGE_ENABLE=1 NEURALFORGE_DMABUF=0 %command%");
+    }
+
+    #[test]
+    fn includes_target_exe_when_given() {
+        assert_eq!(launch_option("GTA5_Enhanced.exe", false), "NEURALFORGE_ENABLE=1 NEURALFORGE_DMABUF=0 NEURALFORGE_TARGET_EXE=GTA5_Enhanced.exe %command%");
+    }
+
+    #[test]
+    fn dmabuf_toggle_changes_only_that_field() {
+        assert_eq!(launch_option("", true), "NEURALFORGE_ENABLE=1 NEURALFORGE_DMABUF=1 %command%");
+    }
+
+    #[test]
+    fn trims_whitespace_around_target_exe() {
+        assert_eq!(launch_option("  GTA5_Enhanced.exe  ", false), "NEURALFORGE_ENABLE=1 NEURALFORGE_DMABUF=0 NEURALFORGE_TARGET_EXE=GTA5_Enhanced.exe %command%");
+    }
+
+    #[test]
+    fn whitespace_only_target_exe_is_treated_as_empty() {
+        assert_eq!(launch_option("   ", false), "NEURALFORGE_ENABLE=1 NEURALFORGE_DMABUF=0 %command%");
     }
 }
