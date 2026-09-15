@@ -87,6 +87,9 @@
   silently fail-open app that never says why neural rendering isn't doing anything.
 - Refresh `screenshots/` for the new Setup tab and update the README screenshot table
   and AppStream metainfo to match.
+- Add a Telemetry group to the Status tab: model/game/frame-rate rows and a live
+  sparkline (last 5s of layer/helper-round-trip/model-eval time), all from fields
+  already on `ShmHeader` -- no layer/Vulkan changes.
 
 ## Unreleased — NeuralForge Phase 3
 
