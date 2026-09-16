@@ -851,6 +851,30 @@ fn build_status_group(shm: &std::sync::Arc<neuralforge_protocol::mapping::Mappin
         glib::ControlFlow::Continue
     });
 
+    // Auto-start the helper on launch when neural rendering is already enabled and
+    // it isn't running yet, instead of leaving that to a separate, easy-to-miss
+    // manual "Start" click.
+    //
+    // Real bug, found 2026-09-16: Alex reported NeuralForge "on" doing nothing (no
+    // visible enhancement) and feeling sluggish after a session where `lordnikon` had
+    // been rebooted. Traced to: `enabled=1` was already persisted in `config.ini` (so
+    // the layer's own capture path kept trying every frame), but the *helper* --
+    // always a separate, manually-launched process this GUI never started on its own
+    // -- had simply never been relaunched after the reboot. The layer paid real
+    // per-frame capture-submission overhead (the "sluggish" part) chasing a helper
+    // that could never answer (the "no enhancement" part), and nothing about that
+    // state was visible without opening the Status tab and noticing the button still
+    // said "Start". `enabled=1` meaning "the layer should try" without the helper
+    // that makes trying meaningful actually running is exactly the gap this closes.
+    if shm.header().enabled.load(Ordering::Relaxed) != 0 && neuralforge_supervisor::is_running().is_none() {
+        let cfg = neuralforge_supervisor::Config::load();
+        let toasts = toasts.clone();
+        match neuralforge_supervisor::start(&cfg) {
+            Ok(started) => toasts.add_toast(adw::Toast::new(&format!("Helper auto-started (pid {})", started.pid))),
+            Err(e) => toasts.add_toast(adw::Toast::new(&format!("Neural rendering is on, but the helper failed to auto-start: {e}"))),
+        }
+    }
+
     {
         let toasts = toasts.clone();
         start_stop_button.connect_clicked(move |button| {

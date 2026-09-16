@@ -163,8 +163,45 @@ struct State {
     /// Passive transfer observations for swapchains which could not be admitted at
     /// creation.  This is diagnostic-only: it never changes a game command buffer.
     observed_swapchain_writes: HashSet<vk::Image>,
+    /// Keyed by the *source* image (the game's own internal render target the render
+    /// tap reads from), never by a swapchain image -- see `prune_orphaned_tap_source`'s
+    /// doc comment for why every insertion here has to be paired with eventual removal,
+    /// not left to grow for the process's whole lifetime.
     tapped_source_layouts: HashMap<vk::Image, vk::ImageLayout>,
     tap_sources_by_destination: HashMap<vk::Image, vk::Image>,
+}
+
+/// Removes `source`'s `tapped_source_layouts` entry once nothing in
+/// `tap_sources_by_destination` still points at it.
+///
+/// Real bug, found 2026-09-16 after a live GTA session ran into a GPU-level hang
+/// (`Xid 109 CTX_SWITCH_TIMEOUT`) during genuinely long real play, never reproduced by
+/// any short test: `tapped_source_layouts` was insert-only -- `observe_swapchain_write`
+/// added an entry for every distinct source image the render tap ever observed, for
+/// the whole life of the process, and nothing ever removed one. `destroy_swapchain_khr`
+/// already cleaned up `tap_sources_by_destination` (keyed by the *destination*
+/// swapchain image, which really is bounded by swapchain lifetime), but never touched
+/// `tapped_source_layouts` at all.
+///
+/// The real danger isn't just unbounded growth: Vulkan explicitly allows a destroyed
+/// image's handle value to be reused for a later, completely unrelated image. Once the
+/// game frees one of its own internal render targets and a new allocation happens to
+/// reuse that same handle, `cmd_pipeline_barrier`/`cmd_pipeline_barrier2` (which check
+/// every barrier's image against this map, for every image in the whole process, not
+/// just ones this layer cares about) would silently start updating *our* stale entry
+/// to track the new, unrelated resource's layout -- and if `tap_sources_by_destination`
+/// still pointed some live swapchain's destination at that same stale handle, the
+/// present hook could then issue capture/composition GPU commands against an image the
+/// game is concurrently using for something else entirely, under completely wrong
+/// layout assumptions. That kind of concurrent, layout-incoherent access is exactly the
+/// class of thing that can wedge a GPU's scheduler -- a plausible, concrete mechanism
+/// for a real hang, not merely a memory leak, and one that only needed enough real
+/// playtime for a handle to actually get reused, which is why it never showed up in
+/// `vkcube` or any short synthetic test.
+fn prune_orphaned_tap_source(state: &mut State, source: vk::Image) {
+    if !state.tap_sources_by_destination.values().any(|&src| src == source) {
+        state.tapped_source_layouts.remove(&source);
+    }
 }
 
 type CleanupState = (Arc<ash::Device>, Arc<Mutex<State>>);
@@ -322,7 +359,18 @@ impl NeuralForgeDeviceInfo {
         }
         if known {
             state.tapped_source_layouts.insert(src, src_layout);
-            state.tap_sources_by_destination.insert(dst, src);
+            // A destination normally keeps the same source for its whole life (the
+            // game doesn't usually re-target its own blit/copy calls frame to frame),
+            // but if it ever does, the old source needs the same orphan check
+            // `destroy_swapchain_khr` already does -- otherwise a source that's no
+            // longer referenced by anything would sit in `tapped_source_layouts`
+            // forever, the same unbounded-growth/stale-handle hazard
+            // `prune_orphaned_tap_source`'s own doc comment explains.
+            if let Some(previous_source) = state.tap_sources_by_destination.insert(dst, src) {
+                if previous_source != src {
+                    prune_orphaned_tap_source(&mut state, previous_source);
+                }
+            }
         }
     }
 }
@@ -508,7 +556,12 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         {
             let mut state = self.state.lock().unwrap();
             if let Some(old) = state.swapchains.remove(&swapchain) {
-                for image in &old.images { state.tap_sources_by_destination.remove(image); }
+                for image in &old.images {
+                    state.observed_swapchain_writes.remove(image);
+                    if let Some(source) = state.tap_sources_by_destination.remove(image) {
+                        prune_orphaned_tap_source(&mut state, source);
+                    }
+                }
                 if let Some(gpu) = &mut state.gpu_compose { gpu.retire_present_images(&old.images); }
             }
         }
@@ -654,5 +707,108 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             unsafe { next_present(queue, present_info) }
         };
         LayerResult::Handled(result.result())
+    }
+}
+
+#[cfg(test)]
+mod tap_source_lifetime_tests {
+    use super::*;
+    use ash::vk::Handle;
+
+    fn image(raw: u64) -> vk::Image {
+        vk::Image::from_raw(raw)
+    }
+
+    /// The exact scenario `prune_orphaned_tap_source`'s own doc comment describes:
+    /// once nothing in `tap_sources_by_destination` points at a source any more, its
+    /// `tapped_source_layouts` entry must actually go, not sit there for the rest of
+    /// the process's life -- real 2026-09-16 bug, this guards against reintroducing it.
+    #[test]
+    fn prune_orphaned_tap_source_removes_a_truly_unreferenced_source() {
+        let mut state = State::default();
+        let source = image(1);
+        state.tapped_source_layouts.insert(source, vk::ImageLayout::GENERAL);
+        // No entry in `tap_sources_by_destination` points at `source` at all.
+        prune_orphaned_tap_source(&mut state, source);
+        assert!(!state.tapped_source_layouts.contains_key(&source));
+    }
+
+    #[test]
+    fn prune_orphaned_tap_source_keeps_a_source_still_referenced_elsewhere() {
+        let mut state = State::default();
+        let source = image(1);
+        state.tapped_source_layouts.insert(source, vk::ImageLayout::GENERAL);
+        // A second, still-live destination also reads from this same source image --
+        // pruning must not remove it out from under that live reference.
+        state.tap_sources_by_destination.insert(image(2), source);
+        prune_orphaned_tap_source(&mut state, source);
+        assert!(state.tapped_source_layouts.contains_key(&source));
+    }
+
+    /// Simulates `destroy_swapchain_khr`'s own cleanup loop directly against `State`
+    /// (its real trait method needs a live Vulkan device this test has no reason to
+    /// stand up) -- proves a destroyed swapchain's own destination images no longer
+    /// leave their source orphaned in `tapped_source_layouts` once nothing else
+    /// references it, the actual leak this session found via a real GPU hang.
+    #[test]
+    fn destroying_the_only_swapchain_referencing_a_source_prunes_it() {
+        let mut state = State::default();
+        let source = image(10);
+        let destination = image(20);
+        state.tapped_source_layouts.insert(source, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        state.tap_sources_by_destination.insert(destination, source);
+
+        // What `destroy_swapchain_khr` does for each of the destroyed swapchain's own
+        // images.
+        if let Some(removed_source) = state.tap_sources_by_destination.remove(&destination) {
+            prune_orphaned_tap_source(&mut state, removed_source);
+        }
+
+        assert!(!state.tap_sources_by_destination.contains_key(&destination));
+        assert!(!state.tapped_source_layouts.contains_key(&source));
+    }
+
+    /// Two live swapchains sharing one source image (a real, normal case -- e.g. the
+    /// same off-screen render target blitted into two different swapchains): only
+    /// destroying *both* destinations should prune the shared source.
+    #[test]
+    fn a_source_shared_by_two_destinations_survives_until_both_are_gone() {
+        let mut state = State::default();
+        let source = image(10);
+        state.tapped_source_layouts.insert(source, vk::ImageLayout::GENERAL);
+        state.tap_sources_by_destination.insert(image(20), source);
+        state.tap_sources_by_destination.insert(image(21), source);
+
+        state.tap_sources_by_destination.remove(&image(20));
+        prune_orphaned_tap_source(&mut state, source);
+        assert!(state.tapped_source_layouts.contains_key(&source), "still referenced by image(21)");
+
+        state.tap_sources_by_destination.remove(&image(21));
+        prune_orphaned_tap_source(&mut state, source);
+        assert!(!state.tapped_source_layouts.contains_key(&source));
+    }
+
+    /// `observe_swapchain_write`'s own re-target case: a destination that starts
+    /// pointing at one source and later points at a different one must orphan-check
+    /// the *old* source, the same way losing the destination entirely does.
+    #[test]
+    fn retargeting_a_destination_to_a_new_source_prunes_the_old_one_if_unreferenced() {
+        let mut state = State::default();
+        let destination = image(20);
+        let old_source = image(1);
+        let new_source = image(2);
+        state.tapped_source_layouts.insert(old_source, vk::ImageLayout::GENERAL);
+        state.tap_sources_by_destination.insert(destination, old_source);
+
+        // What `observe_swapchain_write` does when a destination's source changes.
+        state.tapped_source_layouts.insert(new_source, vk::ImageLayout::GENERAL);
+        if let Some(previous_source) = state.tap_sources_by_destination.insert(destination, new_source) {
+            if previous_source != new_source {
+                prune_orphaned_tap_source(&mut state, previous_source);
+            }
+        }
+
+        assert!(!state.tapped_source_layouts.contains_key(&old_source));
+        assert!(state.tapped_source_layouts.contains_key(&new_source));
     }
 }
