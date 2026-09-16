@@ -467,8 +467,9 @@ what a working transport would actually need (`SCM_RIGHTS`, not `/proc/pid/fd`).
 Test processes/prefix wineserver cleaned up afterward; no leftover state on
 `lordnikon`.
 
-## 2026-09-16 -- Phase 2 item 6, first real GTA data: fps collapse confirmed, likely
-## explained by the documented motion-vectors-off default, not yet re-tested
+## 2026-09-16 -- Phase 2 item 6, first real GTA data: fps collapse confirmed. (The
+## motion-vector explanation this entry originally offered was wrong -- see the
+## correction at the end of it.)
 
 Alex ran the first real GTA session against this exact codebase (v0.1.59, confirmed:
 the AppImage Alex's desktop launcher runs, `~/AppImages/neuralforge.appimage`, hashes
@@ -517,6 +518,51 @@ pipeline actually helping perceived smoothness at a real, lower fps) has real,
 first-hand positive evidence now ("not laggy... like with testing before"); the raw
 fps number itself is Phase 1's gate, not Phase 2's, and stays open pending a
 motion-vectors-on retest.
+
+**Correction, later the same day -- the motion-vector explanation above is wrong, and
+so is the "not laggy" read.** Two things this entry got wrong, kept here rather than
+rewritten so the reasoning trail stays honest:
+
+1. `mvec_enabled` was never a live variable. `crates/layer/src/shm.rs::
+   prepare_motion_resources` has had an unconditional early `return` in front of all
+   of its real logic since 2026-09-14 (commit `72d7a55` -- a deliberate stub after a
+   real NVIDIA driver crash when the private optical-flow device is created during a
+   live swapchain transition). Motion-vector estimation has not run in *any* session,
+   whatever the toggle said. Alex re-tested with the switch flipped on: ghosting
+   unchanged, fps unchanged -- as it had to be, the code path is unreachable. The GUI
+   now grays the whole Motion group out and says why (v0.1.62).
+2. The actual mechanism behind the ghosting is documented in this project's own code
+   (`crates/layer/src/capture.rs::run`, the "re-present the most recently retained
+   answer on every call" block): the model cannot evaluate every frame (native ~330fps
+   here vs. a ~25-30ms round trip per answer), so one answer's *delta* against the
+   frame it was computed from gets re-applied, at full strength, to every presented
+   frame until the next answer lands -- roughly 8-10 real frames at this session's
+   rates. During camera or object motion that delta is misaligned with the frame it's
+   applied to, which reads exactly as ghosting. That design was chosen deliberately
+   (per the doc comment there, and Alex's own earlier authorization) to remove the
+   native/processed *flicker* an earlier version had, and the comment already names
+   the fix for the staleness it trades for: motion-vector reprojection -- the exact
+   feature item 1 says is currently stubbed out. The two findings are one story.
+3. On the second, longer session (v0.1.61, after the render-tap leak fix), Alex's own
+   read was "input lag and stuttering", not the smoother feel reported here -- the
+   earlier "feels right" line should not be taken as a settled Phase 2 result. Two
+   other things were true during both sessions and confound the fps/lag numbers
+   specifically: RustDesk *and* GNOME's own remote-desktop daemon were running at the
+   same time (two independent screen-capture/encode pipelines on the same GPU), and
+   the helper had been started by hand (v0.1.61 auto-starts it now). Whether the 30fps
+   figure is the pipeline's real cost or partly that overhead is still not separated.
+
+**Upstream, as of this correction, is still not compared.** Every "upstream" run
+attempted the same day was invalid: the Steam client had never been restarted between
+tests, so it kept the NeuralForge environment from its first launch (exactly the
+`scripts/bench.sh` gotcha this file already documents), and the one properly-isolated
+attempt hit an `Xid 32` (copy-engine/push-buffer fault, a different class from the
+109/119 above; the GPU recovered on its own) before reaching gameplay. Alex's original
+first-hand report -- ghosting present under NeuralForge, absent under upstream with the
+same model -- therefore still stands as the only real upstream data point, and it
+implies upstream handles answer staleness differently (most plausibly by presenting
+only fresh answers at a lower, steadier rate rather than re-applying a held delta).
+That is the next thing worth actually confirming.
 
 ## 2026-09-16 (same day) -- GUI: migrated off deprecated `ViewSwitcherTitle`/`Bar`,
 ## caught a real layout bug via screenshot before it shipped

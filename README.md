@@ -107,8 +107,10 @@ transport work in progress.
 
 ## Known issues
 
-**Your game crashing with an NVIDIA `Xid 109` (`CTX_SWITCH_TIMEOUT`) or `Xid 119`
-error is very likely not caused by NeuralForge.** This is a long-running, widely
+**A GPU hang with an NVIDIA `Xid 109` (`CTX_SWITCH_TIMEOUT`) or `Xid 119` error.**
+Versions before 0.1.61 had a real bug that could plausibly cause exactly this (a
+render-tap bookkeeping leak that could act on a reused image handle) — update first.
+If it still happens on 0.1.61 or later, it may be the separate, long-running, widely
 reported NVIDIA Linux driver bug under Proton — see
 [nvidia forums thread 283722](https://forums.developer.nvidia.com/t/xid109-ctx-switch-timeout-driver-crashes-in-many-applications/283722)
 and [NVIDIA/open-gpu-kernel-modules#1097](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/1097) —

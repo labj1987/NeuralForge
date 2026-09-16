@@ -390,6 +390,7 @@ impl DeviceInfo for NeuralForgeDeviceInfo {
             VulkanCommand::CmdBlitImage,
             VulkanCommand::CmdPipelineBarrier,
             VulkanCommand::CmdPipelineBarrier2,
+            VulkanCommand::DestroyImage,
         ]
     }
 
@@ -569,6 +570,23 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         // SAFETY: same contract as `create_swapchain_khr` above.
         unsafe { next_destroy(self.device.handle(), swapchain, alloc_ptr) };
         LayerResult::Handled(())
+    }
+
+    /// The source-side half of the tap-source lifetime fix -- see
+    /// `prune_orphaned_tap_source`'s doc comment for the destination-side half and the
+    /// real bug behind both. Pruning only when a *destination* mapping goes away leaves
+    /// the most dangerous case open: the game destroys one of its own render targets
+    /// (a tap source) while the swapchain that referenced it lives on, the driver hands
+    /// that same handle value to a later, unrelated image, and both maps here still
+    /// name it as a live source in a known layout. Dropping it the moment the game
+    /// destroys it closes that window at the only point it can actually be closed.
+    /// Purely observational -- the app's own destroy is always forwarded unchanged.
+    fn destroy_image(&self, image: vk::Image, _allocator: Option<&vk::AllocationCallbacks>) -> LayerResult<()> {
+        let mut state = self.state.lock().unwrap();
+        if state.tapped_source_layouts.remove(&image).is_some() {
+            state.tap_sources_by_destination.retain(|_, src| *src != image);
+        }
+        LayerResult::Unhandled
     }
 
     fn queue_present_khr(
@@ -810,5 +828,34 @@ mod tap_source_lifetime_tests {
 
         assert!(!state.tapped_source_layouts.contains_key(&old_source));
         assert!(state.tapped_source_layouts.contains_key(&new_source));
+    }
+
+    /// `destroy_image`'s own logic against `State`: the game destroying a *source*
+    /// image (its own render target) while the swapchain that reads from it is still
+    /// alive must drop both the layout entry and every destination mapping naming it
+    /// -- the handle-reuse hazard `prune_orphaned_tap_source`'s doc comment describes,
+    /// which destination-side pruning alone can never catch.
+    #[test]
+    fn destroying_a_source_image_drops_its_layout_and_every_mapping_to_it() {
+        let mut state = State::default();
+        let source = image(10);
+        let unrelated_source = image(11);
+        state.tapped_source_layouts.insert(source, vk::ImageLayout::GENERAL);
+        state.tapped_source_layouts.insert(unrelated_source, vk::ImageLayout::GENERAL);
+        state.tap_sources_by_destination.insert(image(20), source);
+        state.tap_sources_by_destination.insert(image(21), source);
+        state.tap_sources_by_destination.insert(image(22), unrelated_source);
+
+        // What `destroy_image` does when the game frees `source`.
+        if state.tapped_source_layouts.remove(&source).is_some() {
+            state.tap_sources_by_destination.retain(|_, src| *src != source);
+        }
+
+        assert!(!state.tapped_source_layouts.contains_key(&source));
+        assert!(!state.tap_sources_by_destination.contains_key(&image(20)));
+        assert!(!state.tap_sources_by_destination.contains_key(&image(21)));
+        // The unrelated source and its own destination are untouched.
+        assert!(state.tapped_source_layouts.contains_key(&unrelated_source));
+        assert_eq!(state.tap_sources_by_destination.get(&image(22)), Some(&unrelated_source));
     }
 }

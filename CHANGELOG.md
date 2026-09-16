@@ -38,20 +38,23 @@
   of validation. GTA fps has not yet been measured against this change -- `vkcube`
   cannot exercise the render tap at all (see `HARDWARE_VALIDATION.md`), so this still
   needs a real session before Phase 2 can be called done.
-- First real GTA session against this pipeline (see `HARDWARE_VALIDATION.md`'s
-  2026-09-16 entry): the non-blocking pipeline itself feels right (real fps drop, but
-  not the laggy feel pre-Phase-2 testing had), and real telemetry shows
-  `EvaluateFeature` taking a consistent ~19-22ms/frame -- the model's own eval cost,
-  not transport, dominates. Also surfaced real ghosting, most likely explained by
-  `mvec_enabled=0` (the documented default) rather than a pipeline bug, not yet
-  re-tested with motion vectors on. Phase 1's own "~10% of native" fps gate is not yet
-  met and stays open.
-- A repeat GTA crash traced to a real, external, unresolved NVIDIA Linux driver bug
-  (`Xid 109 CTX_SWITCH_TIMEOUT` -> `Xid 119` GSP firmware timeout -> full-chip GPU
-  reset required), not a NeuralForge regression -- see `HARDWARE_VALIDATION.md`'s
-  2026-09-16 entry and the new "Known issues" section in `README.md`. `lordnikon` is
-  currently down pending a physical restart; do not attempt remote recovery of it in a
-  future session without confirming it's back up first.
+- First real GTA sessions against this pipeline (see `HARDWARE_VALIDATION.md`'s
+  2026-09-16 entries, including the correction at the end of the first): real
+  telemetry shows `EvaluateFeature` taking a consistent ~15-25ms/frame -- the model's
+  own eval cost, not transport, dominates. Real ghosting during motion; its actual
+  mechanism is the deliberate "re-present the held answer every frame" design in
+  `capture::run` (one answer's delta re-applied across ~8-10 real frames at native
+  rate), not the motion-vector default -- motion-vector estimation has been stubbed
+  out in `shm.rs` since 2026-09-14 and never ran. Alex's read of the longer session was
+  "input lag and stuttering". Phase 1's own "~10% of native" fps gate is not met and
+  stays open; upstream is still not validly compared (every same-day attempt was
+  either accidentally still NeuralForge or crashed before gameplay).
+- A repeat GTA crash (`Xid 109 CTX_SWITCH_TIMEOUT` -> `Xid 119` GSP firmware
+  timeout -> full-chip GPU reset required). First read as a purely external NVIDIA
+  driver bug (it is a widely reported one -- see `README.md`'s "Known issues"), but a
+  real NeuralForge bug that could plausibly produce exactly this was then found and
+  fixed in v0.1.61 (the render-tap source-image leak below), and a ~20-minute session
+  on the fix ran clean. Treat the external-bug theory as unproven, not established.
 
 ## Unreleased — NeuralForge Phase 6
 
