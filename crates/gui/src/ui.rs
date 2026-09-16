@@ -157,16 +157,39 @@ pub fn build_ui(app: &adw::Application) {
     // --- Motion --------------------------------------------------------------------
     let motion_group = adw::PreferencesGroup::new();
     motion_group.set_title("Motion");
+    motion_group.set_description(Some(
+        "Disabled: NVIDIA's driver crashes when this feature's private optical-flow \
+         device is created during a live game's swapchain transition \
+         (crates/layer/src/shm.rs::prepare_motion_resources). These controls still \
+         persist a preference, but nothing currently reads real motion data -- \
+         ghosting during motion is not affected by any setting below.",
+    ));
 
+    // Real bug, found 2026-09-16: this whole group's switch/combos kept accepting
+    // input and looked like live, working settings while `prepare_motion_resources`
+    // (crates/layer/src/shm.rs) has had an unconditional early `return` in front of
+    // all of them since 2026-09-14 -- a deliberate stub after a real, documented
+    // NVIDIA driver crash, never reflected here. A real session (Alex, this same day)
+    // spent real time re-testing ghosting with this switch flipped on, believing it
+    // would change behavior, because nothing in the UI said otherwise. Grayed out
+    // rather than removed: the settings still round-trip correctly through
+    // config.ini/the SHM header, in case a future session fixes the underlying driver
+    // crash and re-enables `prepare_motion_resources` for real.
     let (mvec_enabled, set_mvec_enabled) = bind_bool(&shm, Some("mvec_enabled"), |h| &h.mvec_enabled);
-    motion_group.add(&switch_row("Estimate motion vectors", "Off by default", mvec_enabled, set_mvec_enabled));
+    let mvec_switch = switch_row("Estimate motion vectors", "Off by default -- currently non-functional, see group description", mvec_enabled, set_mvec_enabled);
+    mvec_switch.set_sensitive(false);
+    motion_group.add(&mvec_switch);
 
     let (mvec_scale, set_mvec_scale) = bind_u32(&shm, Some("mvec_scale_mode"), |h| &h.mvec_scale_mode);
-    motion_group.add(&combo_row("Motion units", &["Normalised", "Pixels", "UV 0..1"], mvec_scale, set_mvec_scale));
+    let mvec_scale_row = combo_row("Motion units", &["Normalised", "Pixels", "UV 0..1"], mvec_scale, set_mvec_scale);
+    mvec_scale_row.set_sensitive(false);
+    motion_group.add(&mvec_scale_row);
     debug_assert_eq!(mvec_scale_mode::PIXELS, 1);
 
     let (mvec_quality, set_mvec_quality) = bind_u32(&shm, Some("mvec_quality"), |h| &h.mvec_quality);
-    motion_group.add(&combo_row("Motion quality", &["Fast", "Balanced", "Quality"], mvec_quality, set_mvec_quality));
+    let mvec_quality_row = combo_row("Motion quality", &["Fast", "Balanced", "Quality"], mvec_quality, set_mvec_quality);
+    mvec_quality_row.set_sensitive(false);
+    motion_group.add(&mvec_quality_row);
     debug_assert_eq!(mvec_quality::BALANCED, 1);
 
     // --- Composition -----------------------------------------------------------------
