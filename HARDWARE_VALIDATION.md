@@ -552,3 +552,60 @@ pixels here, exactly the range those two results bracket). A plausible-looking f
 based on libadwaita's own docs alone would have shipped the truncated-label bug --
 this is exactly the class of thing `feedback-screenshot-workaround-sandbox` (project
 memory) says to get a real screenshot for before trusting a GTK layout change.
+
+## 2026-09-16 (later) -- a real GTA crash traced to an NVIDIA driver bug external to
+## this project, not a NeuralForge regression; `lordnikon` left down, needs a physical
+## restart
+
+Alex reproduced the previous session's GTA crash a second time (over RustDesk, at
+work). Real evidence this time, not just an absent log:
+
+- `nvidia-smi` returned `ERR!` across every field -- the driver could no longer query
+  the GPU at all.
+- `journalctl -k` (further back than `dmesg`'s own ring buffer, which had already
+  rotated past the real event under a flood of secondary `NV_ERR_RESET_REQUIRED`
+  assertion spam) showed the actual sequence: `NVRM: Xid ... 109, pid=<GTA5_Enhanced.exe's
+  own pid>, ... errorString CTX SWITCH TIMEOUT` repeating every 4-5 seconds for over
+  half a minute against the game's own GPU channels, followed by `Xid 119` -- the
+  GPU's onboard GSP firmware itself timing out on its own internal heartbeat/RPC to
+  the driver ("GSP-RM is slow", 45s timeout) -- which is what actually killed the GPU
+  (`GPU_IN_FULLCHIP_RESET` required from that point on; this is a firmware-level fault,
+  not something recoverable by any userspace/Vulkan-layer code, including this
+  project's own).
+
+**Traced to a known, unresolved, external NVIDIA Linux driver bug, not this
+project**: `Xid 109 CTX_SWITCH_TIMEOUT` under Proton is a long-running, widely
+reported issue (NVIDIA forums, `forums.developer.nvidia.com/t/xid109-ctx-switch-timeout-driver-crashes-in-many-applications/283722`,
+and a matching RTX 5090/Blackwell report at `github.com/NVIDIA/open-gpu-kernel-modules/issues/1097`)
+spanning driver branches from at least 545.x through 595.x (lordnikon runs 615.71.09,
+newer than every version in those reports) and a wide range of GPUs (RTX 2080 through
+5090) and completely unrelated games (CS2, Elden Ring, Apex Legends, Path of Exile,
+Assassin's Creed Shadows, Crimson Desert) -- none of them running any DLSS/neural
+rendering layer at all. NVIDIA staff acknowledged it internally ("bug 5052028") with
+no fix shipped as of the driver versions discussed. This is strong evidence the crash
+is an external, pre-existing driver/firmware bug lordnikon's session happened to hit,
+not something this project's Vulkan hooking introduced -- worth remembering the next
+time a GTA crash gets reported: check `journalctl -k` for a real `Xid` line before
+assuming it's this project's own code, the same "verify below the layer you suspect"
+discipline as the DMA-BUF and native-NGX investigations earlier in this file.
+
+**Workarounds other users report** (none of them applied here yet, no hardware
+access): driver downgrade to the 550.x branch helped some, though with no guarantee it
+still applies to a Blackwell card on 615.71.09; `PROTON_HIDE_NVIDIA_GPU=1
+PROTON_ENABLE_NVAPI=1` combined with Pyroveil (already present in lordnikon's real
+Proton-CachyOS install at `.../files/share/pyroveil/`, so this may just be a launch-option
+change, not a new install); lower in-game resolution reduced frequency for some users,
+consistent with a timing/scheduling-pressure trigger rather than a hard deterministic
+one.
+
+**Machine state**: rebooted via `sudo reboot` over SSH at Alex's explicit request: the
+GPU was already unusable (`ERR!`) and unrecoverable without at least a driver reload,
+so nothing was lost by rebooting that wasn't already gone. The reboot did not
+complete successfully -- `lordnikon` never came back on Tailscale or plain SSH after
+several minutes of polling (genuine connection timeouts, not "connection refused",
+meaning it never even came back on the network, let alone finished booting). Alex
+confirmed it isn't visible in Tailscale from any path and will restart it by hand.
+**Do not attempt further remote recovery of `lordnikon` in a future session without
+Alex confirming it's back up first** -- the machine may be stuck at POST or otherwise
+requires physical presence; blind SSH/reboot attempts against a host in this state
+waste a session's time for no possible benefit.

@@ -105,6 +105,22 @@ constraints, and [ASYNC_CAPTURE_DESIGN.md](ASYNC_CAPTURE_DESIGN.md) and
 [EXTERNAL_MEMORY_HOST_DESIGN.md](EXTERNAL_MEMORY_HOST_DESIGN.md) for the zero-copy
 transport work in progress.
 
+## Known issues
+
+**Your game crashing with an NVIDIA `Xid 109` (`CTX_SWITCH_TIMEOUT`) or `Xid 119`
+error is very likely not caused by NeuralForge.** This is a long-running, widely
+reported NVIDIA Linux driver bug under Proton — see
+[nvidia forums thread 283722](https://forums.developer.nvidia.com/t/xid109-ctx-switch-timeout-driver-crashes-in-many-applications/283722)
+and [NVIDIA/open-gpu-kernel-modules#1097](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/1097) —
+affecting a wide range of GPUs (RTX 2080 through 5090) and a wide range of games with
+no DLSS/neural rendering involved at all (CS2, Elden Ring, Apex Legends, Path of Exile,
+Crimson Desert), across driver branches NVIDIA has not yet fixed. Check `journalctl -k`
+for a real `Xid` line before assuming NeuralForge caused a crash — see
+[HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md)'s 2026-09-16 entry for how this was
+diagnosed and what other users report as partial workarounds (driver downgrade to the
+550.x branch, `PROTON_HIDE_NVIDIA_GPU=1 PROTON_ENABLE_NVAPI=1` with Pyroveil, or a
+lower in-game resolution).
+
 ## Building from source
 
 ```bash

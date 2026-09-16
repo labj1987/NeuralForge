@@ -46,6 +46,12 @@
   `mvec_enabled=0` (the documented default) rather than a pipeline bug, not yet
   re-tested with motion vectors on. Phase 1's own "~10% of native" fps gate is not yet
   met and stays open.
+- A repeat GTA crash traced to a real, external, unresolved NVIDIA Linux driver bug
+  (`Xid 109 CTX_SWITCH_TIMEOUT` -> `Xid 119` GSP firmware timeout -> full-chip GPU
+  reset required), not a NeuralForge regression -- see `HARDWARE_VALIDATION.md`'s
+  2026-09-16 entry and the new "Known issues" section in `README.md`. `lordnikon` is
+  currently down pending a physical restart; do not attempt remote recovery of it in a
+  future session without confirming it's back up first.
 
 ## Unreleased — NeuralForge Phase 6
 
