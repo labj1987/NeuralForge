@@ -552,17 +552,44 @@ rewritten so the reasoning trail stays honest:
    the helper had been started by hand (v0.1.61 auto-starts it now). Whether the 30fps
    figure is the pipeline's real cost or partly that overhead is still not separated.
 
-**Upstream, as of this correction, is still not compared.** Every "upstream" run
-attempted the same day was invalid: the Steam client had never been restarted between
-tests, so it kept the NeuralForge environment from its first launch (exactly the
-`scripts/bench.sh` gotcha this file already documents), and the one properly-isolated
-attempt hit an `Xid 32` (copy-engine/push-buffer fault, a different class from the
-109/119 above; the GPU recovered on its own) before reaching gameplay. Alex's original
-first-hand report -- ghosting present under NeuralForge, absent under upstream with the
-same model -- therefore still stands as the only real upstream data point, and it
-implies upstream handles answer staleness differently (most plausibly by presenting
-only fresh answers at a lower, steadier rate rather than re-applying a held delta).
-That is the next thing worth actually confirming.
+**Upstream comparison, finally done properly (and it overturns the "inherent to the
+model" read above -- item 2 is a real NeuralForge bug, not a law of physics).** Every
+earlier "upstream" run that day was invalid two ways at once: the Steam client was
+never restarted between tests (it kept the first launch's `NEURALFORGE_ENABLE`
+environment -- the `scripts/bench.sh` gotcha this file documents), *and* GTA's saved
+Steam launch options bake in `NEURALFORGE_ENABLE=1 ... %command%`, which Steam applies
+per-game regardless of the client environment. The fix was `NEURALFORGE_DISABLE=1`
+(the layer manifest's own `disable_environment`, honored at the Vulkan-loader level
+over any launch option) plus a genuine full Steam restart. Confirmed isolated via
+Steam's own `console-linux.txt`: `[dlssnr-layer] ... RTX 5070 (inert=0 enabled=1)`,
+zero `[neuralforge-layer]` lines for the whole session.
+
+Real result, Alex's own eyes plus telemetry: **upstream has no ghosting and much
+better fps.** The hard number that explains it -- upstream during real gameplay sat at
+**98% GPU / 227 W** (the GPU saturated, running at native rate), while NeuralForge's
+own earlier sessions sat at **~30-46% GPU / ~90-115 W** (the GPU *starved*, blocked
+~60-70% of the time). And upstream's layer log has **no per-frame work at all** -- only
+setup events -- where NeuralForge logs a barrier-tracking line on essentially every
+frame (41,678 in one session).
+
+That reframes the whole thing. Both NeuralForge symptoms are one root cause, and it is
+NOT the model or the IPC latency (upstream runs the identical NGX model and doesn't
+have either problem): **NeuralForge does expensive full-frame work on the game's own
+queue on every present** -- a full-frame host readback + large `memcpy` to capture a
+new frame whenever no round trip is in flight (most frames once the helper keeps up),
+plus a GPU compose it makes the present wait on -- which throttles the game's rendering
+down to ~30 fps. Upstream evidently leaves the great majority of frames as untouched
+native passthrough (native cost, native fps, no staleness) and only pays capture/
+composite cost on the frames a fresh answer is actually ready for. NeuralForge's
+"re-present the held answer on every frame" design (added in v0.1.49/v0.1.50 to kill an
+alternation *flicker*) is very likely the shared cause of BOTH the fps collapse (per-
+frame cost) AND the ghosting (a stale answer re-applied across ~8-10 moving frames) --
+a trade that upstream demonstrates you do not have to make. This is the real,
+NeuralForge-specific lead to chase; the motion-vector/"inherent latency" framing in
+item 2 above is superseded. The fix lives in `capture::run`/`composition::gpu`'s hot
+path -- historically the most crash-prone area in this project (see
+`docs/history/...`), so it must be built incrementally and validated with real live
+GTA testing, not a blind rewrite.
 
 ## 2026-09-16 (same day) -- GUI: migrated off deprecated `ViewSwitcherTitle`/`Bar`,
 ## caught a real layout bug via screenshot before it shipped
