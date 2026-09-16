@@ -159,7 +159,7 @@ pub fn build_ui(app: &adw::Application) {
     motion_group.set_title("Motion");
 
     let (mvec_enabled, set_mvec_enabled) = bind_bool(&shm, Some("mvec_enabled"), |h| &h.mvec_enabled);
-    motion_group.add(&switch_row("Estimate motion vectors", "On by default", mvec_enabled, set_mvec_enabled));
+    motion_group.add(&switch_row("Estimate motion vectors", "Off by default", mvec_enabled, set_mvec_enabled));
 
     let (mvec_scale, set_mvec_scale) = bind_u32(&shm, Some("mvec_scale_mode"), |h| &h.mvec_scale_mode);
     motion_group.add(&combo_row("Motion units", &["Normalised", "Pixels", "UV 0..1"], mvec_scale, set_mvec_scale));
@@ -320,32 +320,43 @@ pub fn build_ui(app: &adw::Application) {
         });
     }
 
-    // Deprecated since libadwaita 1.4 in favor of AdwBreakpoint, but that replacement
-    // needs a newer libadwaita than this project targets (see the gtk4/libadwaita
-    // feature-flag gotcha elsewhere in this codebase) -- ViewSwitcherTitle/Bar still
-    // work and are the version-compatible choice.
-    let switcher_title = adw::ViewSwitcherTitle::new();
-    switcher_title.set_stack(Some(&view_stack));
-    switcher_title.set_title("NeuralForge");
+    // `AdwViewSwitcherTitle`/`Bar` are deprecated since libadwaita 1.4 in favor of a
+    // plain `AdwViewSwitcher` plus `AdwBreakpoint` -- previously left as the
+    // version-compatible choice because whether CI's own libadwaita was actually new
+    // enough was never confirmed (see CLAUDE.md's now-resolved "Deliberately not done"
+    // item). Confirmed 2026-09-15 directly against a real CI run's own `apt-get
+    // install` log, not assumed: GitHub Actions' `ubuntu-latest` (Ubuntu 24.04
+    // "noble") installs libadwaita 1.5.0, comfortably past the v1_4 this needs, and
+    // that same run's build output was already emitting deprecation warnings for the
+    // old widgets -- both reasons to migrate now rather than keep suppressing the
+    // warning. The header shows the switcher permanently rather than reproducing
+    // `ViewSwitcherTitle`'s separate "plain title text" state (the OS-level window
+    // title still says "NeuralForge"; the common pattern in real Adwaita apps like
+    // GNOME Text Editor omits an in-header title entirely once a view switcher is
+    // present) -- a real, deliberate simplification, not an oversight.
+    let switcher = adw::ViewSwitcher::new();
+    switcher.set_stack(Some(&view_stack));
+    switcher.set_policy(adw::ViewSwitcherPolicy::Wide);
 
     let header = adw::HeaderBar::new();
-    header.set_title_widget(Some(&switcher_title));
+    header.set_title_widget(Some(&switcher));
     let about_btn = gtk4::Button::builder().icon_name("help-about-symbolic").tooltip_text("About").build();
     header.pack_end(&about_btn);
 
-    // Collapses into the header's switcher above when there's room, otherwise
-    // reveals this bar -- the standard adaptive pattern so the window can still be
-    // narrowed without the tab bar becoming unusable.
+    // Reveals this bottom bar and hides the header's own switcher when the window
+    // narrows past the breakpoint below -- the explicit, `AdwBreakpoint`-driven
+    // replacement for what `ViewSwitcherTitle`'s `title-visible` binding did
+    // implicitly, so the window can still be narrowed without the tab bar becoming
+    // unusable.
     let switcher_bar = adw::ViewSwitcherBar::new();
     switcher_bar.set_stack(Some(&view_stack));
-    switcher_title.bind_property("title-visible", &switcher_bar, "reveal").build();
 
-    let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    content.append(&header);
-    content.append(&banner);
-    content.append(&view_stack);
-    content.append(&switcher_bar);
-    toasts.set_child(Some(&content));
+    let toolbar_view = adw::ToolbarView::new();
+    toolbar_view.add_top_bar(&header);
+    toolbar_view.add_top_bar(&banner);
+    toolbar_view.set_content(Some(&view_stack));
+    toolbar_view.add_bottom_bar(&switcher_bar);
+    toasts.set_child(Some(&toolbar_view));
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -354,6 +365,29 @@ pub fn build_ui(app: &adw::Application) {
         .default_height(700)
         .content(&toasts)
         .build();
+
+    // Below 1400sp wide: hide the header's inline switcher, reveal the bottom bar
+    // instead. 1400, not the far narrower value an adaptive/mobile-first app would
+    // use, because this window's own `PreferencesPage` content already wants ~1340px
+    // of natural width (six settings groups with subtitles, spin rows, etc.) -- real
+    // screenshot evidence (2026-09-16, this sandbox's X11 screenshot workaround)
+    // caught a `Wide`-policy header switcher rendering with every tab label truncated
+    // to a single character at that natural size: plenty of *window* width, but not
+    // enough left over for six full icon+label tabs once the header's own symmetric
+    // title-centering and the About button are accounted for. A plain width guess
+    // from docs would have shipped that broken. Confirmed via screenshot both ways
+    // after raising the threshold: fully legible tabs in the header only once the
+    // window is genuinely wide (tested maximized), the bottom bar otherwise.
+    // `add_setters` requires every tuple in one call to share the same concrete
+    // widget type, hence the upcast to the common `gtk4::Widget` -- `switcher` and
+    // `switcher_bar` are otherwise different libadwaita types.
+    let narrow = adw::BreakpointCondition::new_length(adw::BreakpointConditionLengthType::MaxWidth, 1400.0, adw::LengthUnit::Sp);
+    let breakpoint = adw::Breakpoint::new(narrow);
+    breakpoint.add_setters(&[
+        (switcher.upcast_ref::<gtk4::Widget>(), "visible", false),
+        (switcher_bar.upcast_ref::<gtk4::Widget>(), "reveal", true),
+    ]);
+    window.add_breakpoint(breakpoint);
 
     {
         let window = window.clone();

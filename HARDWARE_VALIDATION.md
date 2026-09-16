@@ -466,3 +466,89 @@ what a working transport would actually need (`SCM_RIGHTS`, not `/proc/pid/fd`).
 
 Test processes/prefix wineserver cleaned up afterward; no leftover state on
 `lordnikon`.
+
+## 2026-09-16 -- Phase 2 item 6, first real GTA data: fps collapse confirmed, likely
+## explained by the documented motion-vectors-off default, not yet re-tested
+
+Alex ran the first real GTA session against this exact codebase (v0.1.59, confirmed:
+the AppImage Alex's desktop launcher runs, `~/AppImages/neuralforge.appimage`, hashes
+byte-for-byte identical to the published `v0.1.59` GitHub release asset). FPS capped
+at 120: neural rendering on dropped the game to the mid-to-high 20s, with real,
+noticeable ghosting Alex reports as absent from upstream, alongside a genuinely
+positive signal -- the lower fps itself "feels like it should," not laggy the way
+earlier (pre-Phase-2) testing did, matching Phase 2's own design goal (the two-slot
+non-blocking capture pipeline removing the present-hook's own fence wait).
+
+**Real telemetry from that session** (`~/.local/state/neuralforge/helper.log`, both
+protocol-v3 wire slots actively alternating -- frame numbers in the 1600s, confirming
+Phase 3's double buffering was genuinely live, not just idle): `NVSDK_NGX_VULKAN_
+EvaluateFeature` itself took a very consistent **~19-22ms per frame** end to end
+(upload ~2-3ms, eval ~19-22ms, download ~0.6-3.6ms). This is the first real-gameplay
+confirmation that the model's own evaluation cost, not host-transport, dominates the
+per-frame budget -- directly answers the open question `DMABUF_TRANSPORT_DESIGN.md`'s
+own recommendation left unresolved ("worth reassessing DMA-BUF... once that real
+measurement exists and shows transport cost... is still the dominant cost left to
+cut"): transport (upload+download, ~3-5ms) is small next to eval (~20ms) even before
+any DMA-BUF-style savings, which is exactly why both DMA-BUF directions turning out to
+be dead ends (see the two 2026-09-15 entries above) costs this project less than it
+might have.
+
+**Root-caused the ghosting, not yet re-confirmed live**: `config.ini` on `lordnikon`
+had only ever persisted `set_enabled=1` -- nothing else -- meaning the session ran on
+every other setting's real code default, and `ShmHeader::init_defaults` sets
+`mvec_enabled` to `0` (off), exactly matching `PHASE1.md`'s own documented preserved
+baseline ("motion_enabled=0, motion_quality=0"). No motion-vector input is a
+well-understood, textbook cause of exactly this ghosting/smearing symptom during
+camera or object motion in any temporally-reconstructing neural upscaler. **Not yet
+verified**: whether turning `mvec_enabled` on actually resolves it live -- that's the
+concrete next test, not attempted this session (needs Alex at the keyboard again).
+
+**A real, separate GUI label bug found investigating the config**: the "Estimate
+motion vectors" switch row's subtitle read "On by default" while the actual, documented
+default is off -- fixed (now "Off by default"), see the same commit as the
+`ViewSwitcher`/`ToolbarView` migration below.
+
+**This does not yet satisfy Phase 1's own benchmark gate** ("GTA fps recovers to
+within ~10% of native with neural on") -- a drop from a 120fps cap to the mid-to-high
+20s is a large gap, not a 10% one. Whether that gap closes once motion vectors are on,
+or reflects the real, currently-unoptimized cost of a `passes=1`/full-resolution
+neural pass on this hardware, is still open. Phase 2's own exit gate (non-blocking
+pipeline actually helping perceived smoothness at a real, lower fps) has real,
+first-hand positive evidence now ("not laggy... like with testing before"); the raw
+fps number itself is Phase 1's gate, not Phase 2's, and stays open pending a
+motion-vectors-on retest.
+
+## 2026-09-16 (same day) -- GUI: migrated off deprecated `ViewSwitcherTitle`/`Bar`,
+## caught a real layout bug via screenshot before it shipped
+
+`CLAUDE.md`'s "Deliberately not done" item ("AdwViewSwitcherTitle/Bar, not
+AdwToolbarView + AdwViewSwitcher + AdwBreakpoint... revisit only after checking the
+actual CI-installed libadwaita version") got new information: a real CI run's own
+`apt-get install` log confirmed GitHub Actions' `ubuntu-latest` ships libadwaita
+**1.5.0** (well past the v1.4 minimum), and that same run's build output was already
+emitting real deprecation warnings for `ViewSwitcherTitle`. Migrated
+`crates/gui/src/ui.rs` to a plain `AdwViewSwitcher` in the header, `AdwToolbarView` for
+the top/bottom bar layout, and an `AdwBreakpoint` to swap it for the bottom
+`AdwViewSwitcherBar` below a width threshold -- the explicit replacement for what
+`ViewSwitcherTitle`'s internal auto-collapse used to do implicitly.
+
+**Real screenshot verification (this sandbox's X11 workaround, an isolated
+`NeuralForgeVisualTest`-application-id scratch build) caught a genuine bug the first
+pass shipped**: at the app's own natural default size (1340px wide -- the
+`PreferencesPage` content's own natural width, not the coded 620px hint), the header's
+`Wide`-policy `ViewSwitcher` rendered with all six tab labels truncated to a single
+character each ("M...", "C...", "D..."...) -- plenty of raw window width, but not
+enough left over for six full icon+label tabs once the header's own symmetric
+title-centering and the About button ate into it. The originally-chosen breakpoint
+(550sp) was far too low for this specifically content-heavy, six-tab window, leaving a
+wide "dead zone" where the header switcher showed but had no room to render properly.
+Fixed by raising the breakpoint to 1400sp (just above the content's own natural
+width) and re-verified both states with real screenshots: the bottom `ViewSwitcherBar`
+at the natural default size (all six tabs fully legible), and the header `ViewSwitcher`
+at a genuinely wide size (tested both 1600px, still correctly showing the bottom bar,
+and maximized ~2938px, correctly showing the header switcher -- this sandbox's
+effective 2x display scale, `Xft.dpi=192`, means 1400sp maps to roughly 2800 real
+pixels here, exactly the range those two results bracket). A plausible-looking fix
+based on libadwaita's own docs alone would have shipped the truncated-label bug --
+this is exactly the class of thing `feedback-screenshot-workaround-sandbox` (project
+memory) says to get a real screenshot for before trusting a GTK layout change.

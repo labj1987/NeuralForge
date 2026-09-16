@@ -38,9 +38,27 @@
   of validation. GTA fps has not yet been measured against this change -- `vkcube`
   cannot exercise the render tap at all (see `HARDWARE_VALIDATION.md`), so this still
   needs a real session before Phase 2 can be called done.
+- First real GTA session against this pipeline (see `HARDWARE_VALIDATION.md`'s
+  2026-09-16 entry): the non-blocking pipeline itself feels right (real fps drop, but
+  not the laggy feel pre-Phase-2 testing had), and real telemetry shows
+  `EvaluateFeature` taking a consistent ~19-22ms/frame -- the model's own eval cost,
+  not transport, dominates. Also surfaced real ghosting, most likely explained by
+  `mvec_enabled=0` (the documented default) rather than a pipeline bug, not yet
+  re-tested with motion vectors on. Phase 1's own "~10% of native" fps gate is not yet
+  met and stays open.
 
 ## Unreleased — NeuralForge Phase 6
 
+- Migrated off the deprecated `AdwViewSwitcherTitle`/`AdwViewSwitcherBar` pairing to
+  `AdwViewSwitcher` + `AdwToolbarView` + `AdwBreakpoint`, now that CI's real
+  libadwaita version (1.5.0, confirmed against a real CI run's own build log) is
+  past the v1.4 this needs -- closes the "Deliberately not done" item in `CLAUDE.md`.
+  A real screenshot caught the first pass shipping a genuine layout bug (all six tab
+  labels truncated to one character at the app's own natural window size); fixed by
+  raising the breakpoint threshold, re-verified both states with real screenshots. See
+  `HARDWARE_VALIDATION.md`'s 2026-09-16 entry for the full detail.
+- Fixed a stale GUI label: "Estimate motion vectors" said "On by default", the real
+  default is off (`mvec_enabled=0`), matching `PHASE1.md`'s documented baseline.
 - Release Cargo profile: `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`,
   `strip = true`. Measured on `libneuralforge_layer.so`: 1,774,464 -> 1,184,760 bytes
   (~33% smaller); full test suite still green.

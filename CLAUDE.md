@@ -45,16 +45,9 @@ Current target-machine evidence and unresolved Vulkan errors are in
 
 ## Deliberately not done
 
-Two items from the completion plan's Phase 6 were considered and intentionally left
-as-is; don't re-raise either without new information:
+One item from the completion plan's Phase 6 was considered and intentionally left
+as-is; don't re-raise it without new information:
 
-- **AdwViewSwitcherTitle/Bar, not AdwToolbarView + AdwViewSwitcher + AdwBreakpoint.**
-  The newer widgets need libadwaita 1.4+; this project's own feature flags
-  (`crates/gui/Cargo.toml`, `v1_4`/`v1_5`) already claim that, but whether GitHub
-  Actions' `ubuntu-latest` `libadwaita-1-dev` package actually provides it was never
-  confirmed (see the in-code comment at the header construction in
-  `crates/gui/src/ui.rs`). Revisit only after checking the actual CI-installed
-  libadwaita version, not this dev machine's.
 - **Hotkey capture does not filter non-keyboard evdev devices** (Phase 6 item 6, as
   literally worded). Investigated 2026-09-15: neither the layer's in-game hotkey
   polling (`crates/layer/src/hotkey.rs`, X11 `XQueryKeymap`) nor the GUI's
