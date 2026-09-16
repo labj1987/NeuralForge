@@ -143,13 +143,36 @@ fn build_capture_buffer(device: &ash::Device, instance: &ash::Instance, physical
     // SAFETY: `physical_device` is the device this capture serves; `instance` is its
     // owning instance (stored once at `vkCreateInstance`, see `crate::CURRENT_INSTANCE`).
     let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-    let wanted = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-    // The Vulkan spec guarantees at least one memory type with both bits set, so this
-    // failing would mean a spec-non-compliant driver, not a real device limitation --
-    // still handled as a plain "skip capture" rather than assumed impossible.
-    let Some(type_index) = (0..mem_props.memory_type_count)
-        .find(|&i| (reqs.memory_type_bits & (1 << i)) != 0 && mem_props.memory_types[i as usize].property_flags.contains(wanted))
-    else {
+    // This buffer is written by the GPU and then *read back by the CPU* on the game's
+    // own present thread every capture. The memory type chosen for it dominates that
+    // read cost, and getting it wrong is the single biggest cause of the fps collapse
+    // measured at 2560x1440 (see `capture_hot_path_cost_per_present`): the naive "first
+    // HOST_VISIBLE|HOST_COHERENT type" picks NVIDIA's small device-local BAR region,
+    // whose CPU reads go uncached over PCIe at well under 1 GB/s -- ~87 ms to read one
+    // 1440p frame, on the present thread, tanking the game to ~11-30 fps. What a
+    // readback buffer actually wants is HOST_CACHED system memory (fast CPU reads) that
+    // is *not* DEVICE_LOCAL (not the BAR). Preference: (1) HOST_VISIBLE|HOST_CACHED|
+    // HOST_COHERENT and not DEVICE_LOCAL -- fast cached CPU reads, and coherent so the
+    // existing plain-`memcpy` read path stays correct with no `vkInvalidateMappedMemory`
+    // added; then (2) the original any-HOST_VISIBLE|HOST_COHERENT, only if no cached
+    // system-memory type exists. Deliberately no non-coherent tier: that would need a
+    // manual invalidate before every read this crate doesn't currently do, a real
+    // correctness risk not worth taking for a fallback that almost never triggers.
+    let host_visible = vk::MemoryPropertyFlags::HOST_VISIBLE;
+    let cached = vk::MemoryPropertyFlags::HOST_CACHED;
+    let coherent = vk::MemoryPropertyFlags::HOST_COHERENT;
+    let device_local = vk::MemoryPropertyFlags::DEVICE_LOCAL;
+    let usable = |i: u32| reqs.memory_type_bits & (1 << i) != 0;
+    let flags = |i: u32| mem_props.memory_types[i as usize].property_flags;
+    let pick = |pred: &dyn Fn(vk::MemoryPropertyFlags) -> bool| {
+        (0..mem_props.memory_type_count).find(|&i| usable(i) && pred(flags(i)))
+    };
+    let type_index = pick(&|f| f.contains(host_visible | cached | coherent) && !f.contains(device_local))
+        .or_else(|| pick(&|f| f.contains(host_visible | coherent)));
+    // The Vulkan spec guarantees at least one HOST_VISIBLE|HOST_COHERENT type, so the
+    // last fallback failing would mean a spec-non-compliant driver, not a real device
+    // limitation -- still handled as a plain "skip capture" rather than assumed away.
+    let Some(type_index) = type_index else {
         // SAFETY: `buffer` has no memory bound yet; nothing else owns `fence`/`pool`.
         unsafe {
             device.destroy_buffer(buffer, None);
@@ -2208,6 +2231,153 @@ mod tests {
         // fence behind it (the explicit wait above); the idle wait just above
         // confirms every capture-pipeline slot's own fence too; nothing else touched
         // `image`.
+        unsafe {
+            device.destroy_image(image, None);
+            device.free_memory(image_memory, None);
+            device.destroy_command_pool(pool, None);
+            destroy(resources, &device);
+            destroy_pipeline(pipeline, &device);
+            for slot in direct {
+                destroy_direct_capture(slot, &device);
+            }
+            if let Some(gpu) = gpu_compose {
+                gpu.destroy(&device);
+            }
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+        }
+    }
+
+    /// Measures, at a real GTA resolution, how much GPU-queue time one present's worth
+    /// of `run`'s injected work actually costs -- the number behind the fps collapse.
+    ///
+    /// Not an assertion test and not a CI test: it needs a real GPU (a software ICD
+    /// would report meaningless numbers) and is a benchmark, so it only runs when
+    /// `NEURALFORGE_BENCH` is set in the environment, and only prints. The established
+    /// way to use it (see `HARDWARE_VALIDATION.md`) is to build the release test binary,
+    /// copy it to `lordnikon`, and run it there with `NEURALFORGE_BENCH=1
+    /// <bin> capture_hot_path_cost_per_present --nocapture --exact`.
+    ///
+    /// Why this is the right metric: `run` submits its capture copy and its compose onto
+    /// the *game's own present queue* (see `submit_pipeline_capture`/
+    /// `present_temporal_delta_async`), so every present drags that work through the same
+    /// queue timeline as the game's real rendering. Timing a `device_wait_idle` right
+    /// after each `run` call drains exactly that injected work and nothing else (this
+    /// harness submits no competing "game" workload), so the reported per-present drain
+    /// time is a clean lower bound on what the layer steals from the game every frame.
+    /// At the 8x8 size the correctness test above uses this is microseconds and invisible;
+    /// at 2560x1440 it is the real cost the hot-path fix has to bring down.
+    #[test]
+    fn capture_hot_path_cost_per_present() {
+        if std::env::var_os("NEURALFORGE_BENCH").is_none() {
+            eprintln!("capture_hot_path_cost_per_present: set NEURALFORGE_BENCH=1 to run this GPU benchmark, skipping");
+            return;
+        }
+        let Some((_entry, instance, physical_device, device, queue, queue_family)) = test_device() else {
+            eprintln!("capture_hot_path_cost_per_present: no Vulkan loader/ICD, skipping");
+            return;
+        };
+
+        let path = scratch_path("bench");
+        let mut shm = ShmClient::default();
+        assert!(shm.test_open_at(&path));
+        let hdr_ptr = shm.test_header_ptr();
+        unsafe { &*(hdr_ptr as *mut neuralforge_protocol::ShmHeader) }.helper_state.store(neuralforge_protocol::enums::helper_state::RUNNING, AtomicOrdering::Relaxed);
+
+        // A fake helper that answers as fast as it can see the request -- the real
+        // steady state, where the layer has a fresh answer nearly every present and so
+        // submits capture+compose work on nearly every call. That is the worst case for
+        // per-present cost, which is exactly what we want to measure.
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+        let helper = std::thread::spawn(move || {
+            let hdr = unsafe { &*(hdr_ptr as *mut neuralforge_protocol::ShmHeader) };
+            let mut last = [0u32; 2];
+            while !stop_clone.load(AtomicOrdering::Relaxed) {
+                for slot in 0..2 {
+                    let req = hdr.seq_req_slot(slot).load(AtomicOrdering::Relaxed);
+                    if req != 0 && req != last[slot] {
+                        last[slot] = req;
+                        hdr.seq_resp_slot(slot).store(req, AtomicOrdering::Relaxed);
+                    }
+                }
+                std::thread::sleep(Duration::from_micros(200));
+            }
+        });
+
+        let (width, height) = (2560u32, 1440u32);
+        let proxy_format = neuralforge_protocol::enums::proxy_format::BGRA8;
+        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool = unsafe { device.create_command_pool(&pool_info, None) }.expect("bench command pool");
+        let (image, image_memory) = make_present_src_image(&device, &mem_props, queue, pool, width, height);
+
+        let mut resources: Option<CaptureResources> = None;
+        let mut pipeline: Option<CapturePipeline> = None;
+        let mut direct: [Option<DirectCapture>; 2] = [None, None];
+        let mut gpu_compose: Option<crate::composition::gpu::GpuCompose> = None;
+        let mut original_scratch = Vec::new();
+        let mut answer_scratch = Vec::new();
+        let mut raw_answer_base = Vec::new();
+        let mut raw_answer_generation = 0u64;
+        let mut last_answer = Vec::new();
+        let mut inflight: [Inflight; 2] = Default::default();
+        let mut bootstrap_complete = false;
+
+        let warmup = 30u32;
+        let measured = 200u32;
+        // Two separate costs the layer imposes per present, measured apart so the fix
+        // targets the right one: `cpu` is the wall time of the `run` call itself (the
+        // work done synchronously on the game's own present thread -- full-frame host
+        // readback/`memcpy`s and command recording), `gpu` is the drain of the work
+        // `run` submitted onto the game's queue. The game's real per-present budget
+        // pays for both.
+        let mut cpu: Vec<Duration> = Vec::with_capacity(measured as usize);
+        let mut gpu: Vec<Duration> = Vec::with_capacity(measured as usize);
+        let mut submitted = 0u32;
+        for iteration in 0..(warmup + measured) {
+            let c = Instant::now();
+            // SAFETY: `image` is this harness's own, treated as `PRESENT_SRC_KHR`;
+            // `queue` is used from this one thread only, exactly `run`'s contract.
+            let sem = unsafe {
+                run(&device, &instance, physical_device, queue, queue_family, image,
+                    vk::ImageLayout::PRESENT_SRC_KHR, image, width, height, proxy_format, false,
+                    &mut resources, &mut pipeline, &mut direct, false, &mut gpu_compose, &mut shm,
+                    &mut original_scratch, &mut inflight, &mut bootstrap_complete, &mut answer_scratch,
+                    &mut raw_answer_base, &mut raw_answer_generation, &mut last_answer)
+            };
+            let cpu_cost = c.elapsed();
+            if sem.is_some() {
+                submitted += 1;
+            }
+            // Drain exactly the work `run` just submitted onto the game's queue.
+            let t = Instant::now();
+            unsafe { device.device_wait_idle() }.unwrap();
+            let gpu_cost = t.elapsed();
+            if iteration >= warmup {
+                cpu.push(cpu_cost);
+                gpu.push(gpu_cost);
+            }
+            // A touch of spacing so the fake helper reliably flips a fresh answer
+            // between presents, matching the steady state rather than starving itself.
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let report = |label: &str, v: &mut Vec<Duration>| {
+            v.sort_unstable();
+            let mean = v.iter().sum::<Duration>() / v.len() as u32;
+            println!(
+                "  {label}: mean={mean:?} p50={:?} p95={:?} max={:?}",
+                v[v.len() / 2], v[v.len() * 95 / 100], *v.last().unwrap()
+            );
+        };
+        println!("capture_hot_path_cost_per_present @ {width}x{height} ({} samples, {submitted} composited a fresh answer):", cpu.len());
+        report("cpu (run() on present thread)", &mut cpu);
+        report("gpu (queue drain after run())", &mut gpu);
+
+        stop.store(true, AtomicOrdering::Relaxed);
+        helper.join().unwrap();
+        unsafe { device.device_wait_idle() }.unwrap();
         unsafe {
             device.destroy_image(image, None);
             device.free_memory(image_memory, None);

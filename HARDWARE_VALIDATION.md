@@ -586,10 +586,41 @@ alternation *flicker*) is very likely the shared cause of BOTH the fps collapse 
 frame cost) AND the ghosting (a stale answer re-applied across ~8-10 moving frames) --
 a trade that upstream demonstrates you do not have to make. This is the real,
 NeuralForge-specific lead to chase; the motion-vector/"inherent latency" framing in
-item 2 above is superseded. The fix lives in `capture::run`/`composition::gpu`'s hot
-path -- historically the most crash-prone area in this project (see
-`docs/history/...`), so it must be built incrementally and validated with real live
-GTA testing, not a blind rewrite.
+item 2 above is superseded.
+
+**Measured it, found the real culprit, and fixed most of it (v0.1.64).** Added a
+resolution-realistic benchmark (`capture::tests::capture_hot_path_cost_per_present`,
+env-gated behind `NEURALFORGE_BENCH`, runs on real hardware via the release test
+binary) that drives `capture::run` at 2560x1440 with a keeping-up fake helper and
+separately times the CPU cost (the `run` call on the game's present thread) and the GPU
+cost (queue drain). Baseline on `lordnikon`:
+
+- **CPU (run() on the present thread): p50 = 87 ms.**
+- GPU (queue drain): p50 = 1.7 ms.
+
+So the earlier "expensive work on the game's *queue*" read was wrong too -- the GPU
+work is a rounding error. The ~87 ms is CPU-side, on the game's own present thread:
+`run` reads the freshly-captured full frame back from a HOST_VISIBLE|HOST_COHERENT
+staging buffer, and `build_capture_buffer` was picking the *first* such memory type,
+which on NVIDIA is the small device-local BAR region -- CPU reads of it go uncached
+over PCIe at well under 1 GB/s, ~87 ms for one 1440p frame. That single stall on the
+present thread is the fps collapse: ~87 ms/present is an ~11 fps ceiling, and
+interleaved with cheaper frames lands right at the ~30 fps observed in-game.
+
+The fix is one memory-type preference in `build_capture_buffer`: prefer
+HOST_VISIBLE|HOST_CACHED|HOST_COHERENT that is *not* DEVICE_LOCAL (cached system RAM,
+fast CPU reads, still coherent so no invalidate needed), falling back to the old
+selection only if no such type exists. Re-measured with the same benchmark:
+
+- **CPU: p50 = 87 ms -> 5.7 ms (~15x).**
+- GPU: unchanged (~1.6 ms).
+
+Total per-present layer cost ~89 ms -> ~7 ms, i.e. an ~11 fps ceiling -> ~140 fps
+ceiling from this alone. Full layer suite (54 tests) and the real-loader smoke test
+still pass. **Still needs live GTA validation for the actual in-game fps and whether
+ghosting improves** (the held-answer re-presentation is a separate axis this does not
+touch) -- but the dominant cost is now measured and gone, not theorised. The benchmark
+stays in the tree as the objective metric for any further hot-path work.
 
 ## 2026-09-16 (same day) -- GUI: migrated off deprecated `ViewSwitcherTitle`/`Bar`,
 ## caught a real layout bug via screenshot before it shipped
