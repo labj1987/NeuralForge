@@ -464,8 +464,29 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         let mut swapchain = vk::SwapchainKHR::null();
         let alloc_ptr = allocator.map_or(std::ptr::null(), std::ptr::from_ref);
         // SAFETY: only image_usage changes in a private copy with verified support.
-        // Forward exactly once: failed creation also retires oldSwapchain.
-        let result = unsafe { next_create(self.device.handle(), adjusted.as_ref().unwrap_or(create_info), alloc_ptr, &mut swapchain) };
+        let mut result = unsafe { next_create(self.device.handle(), adjusted.as_ref().unwrap_or(create_info), alloc_ptr, &mut swapchain) };
+        let mut pass_through = pass_through;
+        if result != vk::Result::SUCCESS && adjusted.is_some() {
+            // The enlarged usage was rejected even though the surface and the format
+            // both claimed to support it. Admission is a best-effort enhancement and
+            // must never be the reason a game loses its swapchain, so the application's
+            // own unmodified creation is tried once more -- with `oldSwapchain` cleared,
+            // because the failed attempt above already retired it and passing a retired
+            // handle again is invalid. This frame (and this swapchain) simply go
+            // un-enhanced, which is the same outcome as declining admission outright.
+            let mut fallback = *create_info;
+            fallback.old_swapchain = vk::SwapchainKHR::null();
+            crate::log!(
+                "[layer] adjusted swapchain creation failed ({result:?}); retrying with the application's own usage -- \
+                 this swapchain will be pass-through"
+            );
+            crate::logging::flush();
+            swapchain = vk::SwapchainKHR::null();
+            // SAFETY: `fallback` is the application's own create info with a cleared
+            // `oldSwapchain`; the chain it carries is untouched and still valid.
+            result = unsafe { next_create(self.device.handle(), &fallback, alloc_ptr, &mut swapchain) };
+            pass_through = true;
+        }
         if result != vk::Result::SUCCESS {
             return LayerResult::Handled(Err(result));
         }
