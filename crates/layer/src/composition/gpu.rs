@@ -41,6 +41,21 @@ const SPV: &[u8] = include_bytes!("../../shaders/compose.spv");
 const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 const ASYNC_SLOTS: usize = 2;
 
+/// The live composition settings the async present path needs, plus whether the
+/// capture leg actually encoded the proxy for this answer (which decides the mode --
+/// see `compose.comp`). Grouped so threading them does not add four positional
+/// parameters to every function between `capture::run` and the dispatch.
+#[derive(Clone, Copy)]
+pub struct ComposeParams {
+    pub colour_strength: f32,
+    pub transfer_strength: f32,
+    pub max_ratio: f32,
+    /// True when the proxy that produced this answer went through
+    /// [`crate::composition::encode_pass`]. False means the proxy is a bit-identical
+    /// copy of the frame and the ratio transfer would self-cancel on it.
+    pub proxy_encoded: bool,
+}
+
 #[repr(C)]
 struct PushConstants {
     colour_strength: f32,
@@ -651,7 +666,7 @@ impl ComposeSlot {
     /// `s.model_answer` exactly as it always has, completely unaware scaling
     /// happened at all.
     #[allow(clippy::too_many_arguments)]
-    unsafe fn record_temporal_delta_into_image(&self, device: &ash::Device, pipeline: vk::Pipeline, pipeline_layout: vk::PipelineLayout, width: u32, height: u32, answer_width: u32, answer_height: u32, frame_bytes: u64, update_cache: bool, bgr_order: bool, target_image: vk::Image) {
+    unsafe fn record_temporal_delta_into_image(&self, device: &ash::Device, pipeline: vk::Pipeline, pipeline_layout: vk::PipelineLayout, width: u32, height: u32, answer_width: u32, answer_height: u32, frame_bytes: u64, update_cache: bool, bgr_order: bool, target_image: vk::Image, compose: ComposeParams) {
         let s = self.sized.as_ref().expect("caller already ensured this");
         let cached_before = self.cached_generation != 0;
         let scaled_answer = answer_width != width || answer_height != height;
@@ -714,12 +729,25 @@ impl ComposeSlot {
             device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[], &[], &[original_general]);
             device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline_layout, 0, std::slice::from_ref(&self.descriptor_set), &[]);
-            // mode: 1 -- the guarded-additive formula; see compose.comp's own doc
-            // comment on why the classic ratio-transfer (mode 0) self-cancels here.
-            // transfer_strength/max_ratio are hardcoded defaults, not yet threaded
-            // from live settings the way the mode-0 call site's are -- a reasonable
-            // follow-up, not attempted tonight.
-            let push = PushConstants { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, bgr_order: bgr_order as u32, mode: 1 };
+            // Mode 2 when the capture leg encoded the proxy, mode 1 when it could not
+            // (see `compose.comp`'s own comments on both). Mode 2 is the encoded-proxy
+            // ratio transfer -- the formula upstream uses, which needs no motion mask
+            // because only a dimensionless relighting factor is carried across the
+            // round trip rather than spatially-fixed additive detail. Mode 1 remains
+            // the fallback for devices where the proxy cannot be encoded, since
+            // feeding an unencoded proxy to mode 2 would make its ratio identically
+            // one (proxy == original) and discard the answer.
+            //
+            // The live settings are threaded now rather than hardcoded: mode 2 reads
+            // transfer_strength as a power on the ratio and max_ratio as the guard, so
+            // both genuinely decide the picture here.
+            let push = PushConstants {
+                colour_strength: compose.colour_strength,
+                transfer_strength: compose.transfer_strength,
+                max_ratio: compose.max_ratio,
+                bgr_order: bgr_order as u32,
+                mode: if compose.proxy_encoded { 2 } else { 1 },
+            };
             let push_bytes = std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<PushConstants>());
             device.cmd_push_constants(self.cmd, pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, push_bytes);
             device.cmd_dispatch(self.cmd, width.div_ceil(8), height.div_ceil(8), 1);
@@ -1138,7 +1166,7 @@ impl GpuCompose {
     #[allow(clippy::too_many_arguments)]
     pub fn present_temporal_delta_async(
         &mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, queue: vk::Queue,
-        width: u32, height: u32, answer_width: u32, answer_height: u32, base: &[u8], answer: &[u8], generation: u64, bgr_order: bool, target_image: vk::Image,
+        width: u32, height: u32, answer_width: u32, answer_height: u32, base: &[u8], answer: &[u8], generation: u64, bgr_order: bool, target_image: vk::Image, compose: ComposeParams,
     ) -> Option<vk::Semaphore> {
         let semaphore = self.present_semaphores.get(target_image, || unsafe {
             device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).ok()
@@ -1161,7 +1189,7 @@ impl GpuCompose {
         if unsafe { device.reset_command_buffer(slot.slot.cmd, vk::CommandBufferResetFlags::empty()) }.is_err() { return None; }
         let begin = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         if unsafe { device.begin_command_buffer(slot.slot.cmd, &begin) }.is_err() { return None; }
-        unsafe { slot.slot.record_temporal_delta_into_image(device, self.pipeline, self.pipeline_layout, width, height, answer_width, answer_height, bytes as u64, update, bgr_order, target_image); }
+        unsafe { slot.slot.record_temporal_delta_into_image(device, self.pipeline, self.pipeline_layout, width, height, answer_width, answer_height, bytes as u64, update, bgr_order, target_image, compose); }
         if unsafe { device.end_command_buffer(slot.slot.cmd) }.is_err() || unsafe { device.reset_fences(&[slot.slot.fence]) }.is_err() { return None; }
         let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&slot.slot.cmd)).signal_semaphores(std::slice::from_ref(&semaphore)).build();
         if unsafe { device.queue_submit(queue, &[submit], slot.slot.fence) }.is_err() { return None; }
@@ -1661,7 +1689,7 @@ mod tests {
         }
 
         // (1) A smaller answer must still be accepted and actually change the output.
-        let sem = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, answer_width, answer_height, &base, &answer, 1, false, target.image);
+        let sem = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, answer_width, answer_height, &base, &answer, 1, false, target.image, crate::composition::gpu::ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, proxy_encoded: false });
         assert!(sem.is_some(), "a genuinely smaller answer must still be composited, not rejected");
         let sem = sem.unwrap();
         let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
@@ -1687,7 +1715,7 @@ mod tests {
         // for this function -- see its own doc comment) must be rejected, not
         // overflow the shared staging buffer.
         let big_answer = vec![200u8; ((width + 8) * (height + 8) * 4) as usize];
-        let oversized = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width + 8, height + 8, &base, &big_answer, 2, false, target.image);
+        let oversized = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width + 8, height + 8, &base, &big_answer, 2, false, target.image, crate::composition::gpu::ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, proxy_encoded: false });
         assert!(oversized.is_none(), "an answer larger than the frame must be safely rejected, not overflow the staging buffer");
 
         unsafe {

@@ -52,6 +52,13 @@ pub struct CompositionSettings {
     pub working_scale: f32,
     #[allow(dead_code)]
     pub scaling_downscaler: u32,
+    /// What the model should treat as white, as the encode divides by it (see
+    /// [`crate::composition::encode`]). The three header fields are one number here:
+    /// the manual value times the scale, times the trim when the reading came from a
+    /// meter rather than the slider. Clamped away from zero so the divide is safe.
+    pub white_point: f32,
+    /// Which curve the encode uses -- [`neuralforge_protocol::enums::reversible_mode`].
+    pub reversible_mode: u32,
 }
 
 /// One process's connection to the mapping. Not `Clone` — there is exactly one of these
@@ -219,6 +226,17 @@ impl ShmClient {
             neural_enabled: hdr.neural_enabled(),
             working_scale: f32::from_bits(hdr.working_scale_bits.load(Ordering::Relaxed)),
             scaling_downscaler: hdr.scaling_downscaler.load(Ordering::Relaxed),
+            white_point: {
+                let manual = f32::from_bits(hdr.white_point_bits.load(Ordering::Relaxed));
+                let scale = f32::from_bits(hdr.white_point_scale_bits.load(Ordering::Relaxed));
+                let trim = f32::from_bits(hdr.white_point_trim_bits.load(Ordering::Relaxed));
+                // The trim belongs to a measured reading, not to the slider -- keeping
+                // them apart is upstream's own fix for sharing one stored value.
+                let measured = hdr.white_point_source.load(Ordering::Relaxed) != neuralforge_protocol::enums::white_point_source::MANUAL;
+                let combined = manual * scale * if measured { trim } else { 1.0 };
+                if combined.is_finite() && combined > 1e-4 { combined } else { 1.0 }
+            },
+            reversible_mode: hdr.reversible_mode.load(Ordering::Relaxed),
         })
     }
 

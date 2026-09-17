@@ -119,6 +119,18 @@ struct ModelScratch {
     width: u32,
     height: u32,
     capacity: vk::DeviceSize,
+    /// The encode's storage-image view and its descriptor set, both `None` when the
+    /// encode isn't available on this device/format (see
+    /// [`crate::composition::encode_pass::supports_storage`]) -- in which case the
+    /// proxy crosses to the helper unencoded, exactly as it did before the encode
+    /// existed, and the resolve is told so.
+    ///
+    /// The view is always `R8G8B8A8_UNORM` even when `image` is `B8G8R8A8_UNORM`: the
+    /// image carries `MUTABLE_FORMAT` and the two are format-compatible (same 32-bit
+    /// class), which makes `encode.comp`'s `rgba8` layout qualifier correct against
+    /// the view while `bgr_order` carries what the channels actually mean.
+    encode_view: Option<vk::ImageView>,
+    encode_set: Option<vk::DescriptorSet>,
 }
 
 // SAFETY: same reasoning as `CaptureBuffer`'s own impl -- plain Vulkan handles plus a
@@ -129,9 +141,18 @@ impl ModelScratch {
     /// # Safety
     /// Same contract as [`CaptureBuffer::destroy`]: no submitted work referencing
     /// `image`/`buffer` may still be in flight.
-    unsafe fn destroy(&self, device: &ash::Device) {
+    unsafe fn destroy(&self, device: &ash::Device, encode: Option<&crate::composition::encode_pass::EncodePass>) {
         // SAFETY: forwarded from this function's own contract.
         unsafe {
+            // The set first: freeing it while the view it points at still exists is
+            // the only valid order, and both must outlive any submission using them
+            // (this function's own contract).
+            if let (Some(set), Some(pass)) = (self.encode_set, encode) {
+                pass.free_set(device, set);
+            }
+            if let Some(view) = self.encode_view {
+                device.destroy_image_view(view, None);
+            }
             device.destroy_image(self.image, None);
             device.free_memory(self.image_memory, None);
             device.destroy_buffer(self.buffer, None);
@@ -140,8 +161,32 @@ impl ModelScratch {
     }
 }
 
-fn build_model_scratch(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, width: u32, height: u32, format: vk::Format) -> Option<ModelScratch> {
+fn build_model_scratch(
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+    encode: Option<&crate::composition::encode_pass::EncodePass>,
+) -> Option<ModelScratch> {
+    // The encode needs this image to be dispatchable over in place, which needs
+    // `STORAGE` usage -- not guaranteed for `B8G8R8A8_UNORM`, so it is asked rather
+    // than assumed. When it isn't available the image is built exactly as it was
+    // before the encode existed and the proxy crosses unencoded; nothing fails.
+    //
+    // `MUTABLE_FORMAT` is what lets the view below be `R8G8B8A8_UNORM` over a BGRA
+    // image (same 32-bit compatibility class), so `encode.comp`'s `rgba8` qualifier is
+    // correct against the view rather than relying on a driver tolerating a mismatch.
+    let want_encode = encode.is_some() && crate::composition::encode_pass::supports_storage(instance, physical_device, format);
+    let mut usage = vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC;
+    let mut create_flags = vk::ImageCreateFlags::empty();
+    if want_encode {
+        usage |= vk::ImageUsageFlags::STORAGE;
+        create_flags |= vk::ImageCreateFlags::MUTABLE_FORMAT;
+    }
     let image_info = vk::ImageCreateInfo::builder()
+        .flags(create_flags)
         .image_type(vk::ImageType::TYPE_2D)
         .format(format)
         .extent(vk::Extent3D { width, height, depth: 1 })
@@ -149,7 +194,7 @@ fn build_model_scratch(device: &ash::Device, instance: &ash::Instance, physical_
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
         .tiling(vk::ImageTiling::OPTIMAL)
-        .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC)
+        .usage(usage)
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .initial_layout(vk::ImageLayout::UNDEFINED);
     // SAFETY: `image_info` is a valid `VkImageCreateInfo`.
@@ -239,7 +284,54 @@ fn build_model_scratch(device: &ash::Device, instance: &ash::Instance, physical_
         return None;
     };
 
-    Some(ModelScratch { image, image_memory, buffer, buffer_memory, ptr: ptr.cast(), width, height, capacity: buf_reqs.size })
+    // The encode's view and descriptor set, last so every earlier failure path stays
+    // exactly as it was. Both are optional: if either step fails the scratch is still
+    // perfectly usable for the blit/download it existed for before the encode, so the
+    // proxy simply crosses unencoded rather than the whole capture failing.
+    let (encode_view, encode_set) = if want_encode {
+        let view_info = vk::ImageViewCreateInfo::builder()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .subresource_range(
+                vk::ImageSubresourceRange::builder()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .base_mip_level(0)
+                    .level_count(1)
+                    .base_array_layer(0)
+                    .layer_count(1)
+                    .build(),
+            );
+        // SAFETY: `image` is bound and was created with `MUTABLE_FORMAT` plus
+        // `STORAGE` usage (both gated on `want_encode`); `R8G8B8A8_UNORM` is in the
+        // same format-compatibility class as the image's own format.
+        match unsafe { device.create_image_view(&view_info, None) } {
+            Ok(view) => match encode.and_then(|e| e.allocate_set(device, view)) {
+                Some(set) => (Some(view), Some(set)),
+                None => {
+                    // SAFETY: nothing was submitted against `view`; no set references it.
+                    unsafe { device.destroy_image_view(view, None) };
+                    (None, None)
+                }
+            },
+            Err(_) => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+
+    Some(ModelScratch {
+        image,
+        image_memory,
+        buffer,
+        buffer_memory,
+        ptr: ptr.cast(),
+        width,
+        height,
+        capacity: buf_reqs.size,
+        encode_view,
+        encode_set,
+    })
 }
 
 /// Picks the best `HOST_VISIBLE` memory type for a buffer the GPU writes and the CPU
@@ -590,6 +682,7 @@ fn poll_or_submit_capture(
     proxy_format: u32,
     frame_bytes: u64,
     model: Option<(u32, u32, vk::Format)>,
+    encode_push: crate::composition::encode_pass::EncodePush,
     shm: &mut ShmClient,
     original_scratch: &mut Vec<u8>,
     model_scratch: &mut Vec<u8>,
@@ -640,7 +733,21 @@ fn poll_or_submit_capture(
             shm.write_proxy(slot, original_scratch);
             return Some((width, height));
         }
-        submit_pipeline_capture(p, slot, device, instance, physical_device, queue, capture_image, capture_layout, width, height, proxy_format, model);
+        submit_pipeline_capture(
+            p,
+            slot,
+            device,
+            instance,
+            physical_device,
+            queue,
+            capture_image,
+            capture_layout,
+            width,
+            height,
+            proxy_format,
+            model,
+            encode_push,
+        );
         None
     }
 }
@@ -798,7 +905,13 @@ pub unsafe fn run(
         // eventual real resolution correctly to do that.
         if poll_or_submit_capture(
             SLOT, use_direct, pipeline, direct, device, instance, physical_device, queue, queue_family,
-            capture_image, capture_layout, width, height, proxy_format, frame_bytes, None, shm, original_scratch, model_scratch,
+            capture_image, capture_layout, width, height, proxy_format, frame_bytes, None,
+            crate::composition::encode_pass::EncodePush {
+                white_point: settings.white_point,
+                bgr_order: u32::from(bgr_order),
+                reversible_mode: settings.reversible_mode,
+            },
+            shm, original_scratch, model_scratch,
         ).is_some() {
             shm.prepare_motion(instance, physical_device, width, height, proxy_format, original_scratch);
             if shm.begin_async_request(SLOT) {
@@ -816,10 +929,13 @@ pub unsafe fn run(
     // existed. Computed once per call, shared by every slot below (the swapchain's
     // resolution and the settings are the same for all of them this frame).
     let (model_width, model_height) = scaled_dims(width, height, settings.working_scale);
-    let model_request = (model_width != width || model_height != height)
-        .then(|| model_scratch_format(proxy_format, bgr_order))
-        .flatten()
-        .map(|format| (model_width, model_height, format));
+    // Requested unconditionally, not only when the scale actually reduces the raster:
+    // the scratch is now also where the proxy encode runs (leg 1's `ENCODE`), and the
+    // encode has to happen at every working scale, including exactly 1.0. At 1.0 the
+    // blit into it is 1:1 -- a device-local full-rate blit, which is what buys the
+    // encode a storage image to dispatch over. `None` only when the proxy format
+    // itself cannot be scratched at all, which is the same condition as before.
+    let model_request = model_scratch_format(proxy_format, bgr_order).map(|format| (model_width, model_height, format));
 
     // Protocol v3 (`PROTOCOL_V3_DESIGN.md`): the same poll-then-maybe-submit sequence
     // as before, just run once per wire slot instead of once total. Each slot is
@@ -882,7 +998,13 @@ pub unsafe fn run(
         if !shm.has_pending_request(slot) {
             if let Some((sent_w, sent_h)) = poll_or_submit_capture(
                 slot, use_direct, pipeline, direct, device, instance, physical_device, queue, queue_family,
-                capture_image, capture_layout, width, height, proxy_format, frame_bytes, model_request, shm, original_scratch, model_scratch,
+                capture_image, capture_layout, width, height, proxy_format, frame_bytes, model_request,
+            crate::composition::encode_pass::EncodePush {
+                white_point: settings.white_point,
+                bgr_order: u32::from(bgr_order),
+                reversible_mode: settings.reversible_mode,
+            },
+            shm, original_scratch, model_scratch,
             ) {
                 shm.prepare_motion(instance, physical_device, width, height, proxy_format, original_scratch);
                 if shm.begin_async_request(slot) {
@@ -943,6 +1065,10 @@ pub unsafe fn run(
     if last_answer.is_empty() {
         return None;
     }
+    // Which composition formula the answer below is eligible for: mode 2 (the
+    // encoded-proxy ratio transfer) only when the capture leg really did encode the
+    // proxy this answer came from, mode 1 otherwise. See `compose.comp`.
+    let proxy_encoded = pipeline.as_ref().is_some_and(CapturePipeline::proxy_encoded);
     // Cache each helper answer in device-local memory once, then copy that cached
     // frame to every presented swapchain image.  The prior path re-uploaded two 4K
     // CPU buffers and ran the compose shader on every present, which made the counter
@@ -967,6 +1093,12 @@ pub unsafe fn run(
             *raw_answer_generation,
             bgr_order,
             image,
+            crate::composition::gpu::ComposeParams {
+                colour_strength: settings.colour_strength,
+                transfer_strength: settings.transfer_strength,
+                max_ratio: settings.max_ratio,
+                proxy_encoded,
+            },
         ) {
             shm.publish_frame_timing(pipeline_start.elapsed(), true);
             return Some(sem);
@@ -1009,6 +1141,11 @@ fn record_capture_commands(
     width: u32,
     height: u32,
     model: Option<(vk::Image, vk::Buffer, u32, u32)>,
+    encode: Option<(
+        &crate::composition::encode_pass::EncodePass,
+        vk::DescriptorSet,
+        crate::composition::encode_pass::EncodePush,
+    )>,
 ) -> bool {
     // SAFETY: `cmd` was allocated from a pool created with `RESET_COMMAND_BUFFER`.
     if unsafe { device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()) }.is_err() {
@@ -1078,9 +1215,66 @@ fn record_capture_commands(
         // SAFETY: `image` is `TRANSFER_SRC_OPTIMAL`; `scratch_image` was just
         // transitioned to `TRANSFER_DST_OPTIMAL`; both are 2D, single-mip, single-layer.
         unsafe { device.cmd_blit_image(cmd, image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, scratch_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[blit], vk::Filter::LINEAR) };
-        let scratch_to_src = barrier(scratch_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::TRANSFER_READ);
-        // SAFETY: `cmd` is recording; `scratch_image` was just written by the blit above.
-        unsafe { device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[scratch_to_src]) };
+        // The encode, in place over the scratch the blit just filled and before the
+        // download below reads it -- this is leg 1's `ENCODE` step, and it is the whole
+        // reason the proxy the model sees is not a bit-identical copy of the frame any
+        // more (see `composition::encode`'s module doc comment).
+        //
+        // `GENERAL` is the only layout a storage image may be written through, so the
+        // scratch goes `TRANSFER_DST -> GENERAL` for the dispatch and `GENERAL ->
+        // TRANSFER_SRC` for the copy, rather than straight from one transfer layout to
+        // the other. Both barriers carry the real stage/access pair for the direction
+        // they guard, so the dispatch cannot start before the blit's writes are visible
+        // and the copy cannot start before the dispatch's are.
+        if let Some((pass, set, push)) = encode {
+            let to_general = barrier(
+                scratch_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::GENERAL,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+            );
+            // SAFETY: `cmd` is recording; `scratch_image` was just written by the blit
+            // and is this slot's own, not aliased.
+            unsafe {
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_general],
+                );
+            }
+            // SAFETY: `cmd` is recording; `set` was allocated by this same `pass` and
+            // points at exactly this `scratch_image`, whose extent is
+            // `model_width`x`model_height`.
+            unsafe { pass.record(device, cmd, set, model_width, model_height, push) };
+            let to_src = barrier(
+                scratch_image,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::TRANSFER_READ,
+            );
+            // SAFETY: `cmd` is recording; the dispatch above wrote `scratch_image`.
+            unsafe {
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_src],
+                );
+            }
+        } else {
+            let scratch_to_src = barrier(scratch_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::TRANSFER_READ);
+            // SAFETY: `cmd` is recording; `scratch_image` was just written by the blit above.
+            unsafe { device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[scratch_to_src]) };
+        }
         let scratch_region = vk::BufferImageCopy::builder()
             .buffer_offset(0)
             .buffer_row_length(0)
@@ -1129,6 +1323,23 @@ fn record_capture_commands(
 pub struct CapturePipeline {
     queue_family: u32,
     slots: [PipelineSlot; 2],
+    /// The proxy encode's pipeline (see [`crate::composition::encode_pass`]), built
+    /// once on first use and shared by both slots -- each slot owns only its own
+    /// descriptor set, allocated from this pass's pool. `None` means the encode is
+    /// unavailable on this device, in which case every proxy crosses to the helper
+    /// unencoded exactly as it did before the encode existed.
+    encode: Option<crate::composition::encode_pass::EncodePass>,
+}
+
+impl CapturePipeline {
+    /// Whether the proxies this pipeline produces actually go through the encode --
+    /// which decides the composition mode (see `compose.comp`). Device- and
+    /// format-stable in practice (it depends on `STORAGE` support for the proxy
+    /// format, not on anything per-frame), so reading it from whichever slot has
+    /// already built its scratch is enough.
+    fn proxy_encoded(&self) -> bool {
+        self.slots.iter().any(|s| s.model.as_ref().is_some_and(|m| m.encode_set.is_some()))
+    }
 }
 
 struct PipelineSlot {
@@ -1191,14 +1402,20 @@ fn ensure_pipeline(
     let p = existing.take().expect("checked above");
     for slot in &p.slots {
         // SAFETY: every slot's fence was just confirmed signaled above -- that same
-        // fence also guards any blit/copy this slot's `model` scratch was involved in,
-        // since both are recorded into and submitted on the same command buffer.
+        // fence also guards any blit/copy/dispatch this slot's `model` scratch was
+        // involved in, since all of them are recorded into and submitted on the same
+        // command buffer.
         unsafe {
             slot.buf.destroy(device);
             if let Some(model) = &slot.model {
-                model.destroy(device);
+                model.destroy(device, p.encode.as_ref());
             }
         }
+    }
+    // After every set allocated from it has been freed above.
+    // SAFETY: same fence reasoning as the slots themselves.
+    if let Some(pass) = &p.encode {
+        unsafe { pass.destroy(device) };
     }
     build_pipeline(existing, device, instance, physical_device, queue_family, bytes)
 }
@@ -1220,6 +1437,8 @@ fn build_pipeline(
     *existing = Some(CapturePipeline {
         queue_family,
         slots: [PipelineSlot { buf: a, model: None, pending: None }, PipelineSlot { buf: b, model: None, pending: None }],
+        // Fail-open: `None` just means no encode, and the composition is told.
+        encode: crate::composition::encode_pass::EncodePass::new(device),
     });
     true
 }
@@ -1326,8 +1545,13 @@ fn submit_pipeline_capture(
     height: u32,
     proxy_format: u32,
     model: Option<(u32, u32, vk::Format)>,
+    encode_push: crate::composition::encode_pass::EncodePush,
 ) -> bool {
-    let slot = &mut pipeline.slots[slot];
+    // Split borrow: the slot is taken mutably while `encode` is read immutably, and
+    // they are disjoint fields of the same struct.
+    let CapturePipeline { slots, encode, .. } = pipeline;
+    let encode = encode.as_ref();
+    let slot = &mut slots[slot];
     if slot.pending.is_some() {
         return false;
     }
@@ -1339,15 +1563,32 @@ fn submit_pipeline_capture(
                 // previous submission, if any, already had its fence confirmed
                 // signaled by `poll_pipeline_capture` before `pending` was cleared, so
                 // nothing submitted against the old scratch can still be in flight.
-                unsafe { old.destroy(device) };
+                unsafe { old.destroy(device, encode) };
             }
-            slot.model = build_model_scratch(device, instance, physical_device, model_width, model_height, format);
+            slot.model = build_model_scratch(device, instance, physical_device, model_width, model_height, format, encode);
         }
         slot.model.as_ref().map(|m| (m.image, m.buffer, model_width, model_height))
     } else {
         None
     };
-    if !record_capture_commands(device, slot.buf.cmd, image, initial_layout, slot.buf.buffer, width, height, model_dims) {
+    // The encode runs only when this submission actually has a scratch with a set on
+    // it; `encode_dispatch` is `None` otherwise and the proxy crosses unencoded.
+    let encode_dispatch = slot
+        .model
+        .as_ref()
+        .filter(|_| model_dims.is_some())
+        .and_then(|m| m.encode_set.map(|set| (set, encode.expect("a set only exists when the pass does"))));
+    if !record_capture_commands(
+        device,
+        slot.buf.cmd,
+        image,
+        initial_layout,
+        slot.buf.buffer,
+        width,
+        height,
+        model_dims,
+        encode_dispatch.map(|(set, pass)| (pass, set, encode_push)),
+    ) {
         return false;
     }
     // SAFETY: `slot.buf.fence` is `pending: None` here -- either never used yet
@@ -1381,9 +1622,14 @@ pub unsafe fn destroy_pipeline(pipeline: Option<CapturePipeline>, device: &ash::
             unsafe {
                 slot.buf.destroy(device);
                 if let Some(model) = &slot.model {
-                    model.destroy(device);
+                    model.destroy(device, p.encode.as_ref());
                 }
             }
+        }
+        // After every set allocated from it was freed by the loop above.
+        // SAFETY: forwarded from this function's own contract.
+        if let Some(pass) = &p.encode {
+            unsafe { pass.destroy(device) };
         }
     }
 }
@@ -1508,7 +1754,7 @@ fn submit_direct_capture(
     }
     // `working_scale` is not wired into the dma-buf path -- see `poll_or_submit_capture`'s
     // own doc comment on why.
-    if !record_capture_commands(device, direct.buf.cmd, image, initial_layout, direct.buf.buffer, width, height, None) {
+    if !record_capture_commands(device, direct.buf.cmd, image, initial_layout, direct.buf.buffer, width, height, None, None) {
         return false;
     }
     // SAFETY: `direct.buf.fence` is `pending: None` here -- either never used yet
