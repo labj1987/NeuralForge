@@ -431,9 +431,19 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         } else { None };
         let pass_through = adjusted.is_none();
         if pass_through && eligible {
-            crate::log!("[layer] capture admission declined for {}x{} fmt={:?} usage={:?}",
+            // Distinguishes *why* `prepare` returned `None`: `!candidate` means the
+            // swapchain has an extension in `pNext`, non-empty `flags`, more than one
+            // array layer, or an exotic present mode (most commonly `pNext` carrying
+            // `VkSurfaceFullScreenExclusiveInfoEXT` under exclusive fullscreen) --
+            // `prepare` never even queried surface capabilities in that case. `false`
+            // means `candidate` passed but the surface itself doesn't support adding
+            // TRANSFER_SRC/TRANSFER_DST, or the format/extent/sample-count combination
+            // doesn't survive `vkGetPhysicalDeviceImageFormatProperties` with the
+            // enlarged usage -- a real surface limitation, not a display-mode artifact.
+            crate::log!("[layer] capture admission declined for {}x{} fmt={:?} usage={:?} present_mode={:?} extended_semantics={}",
                 create_info.image_extent.width, create_info.image_extent.height,
-                create_info.image_format, create_info.image_usage);
+                create_info.image_format, create_info.image_usage, create_info.present_mode,
+                !crate::surface_usage::candidate(create_info));
         }
         let mut swapchain = vk::SwapchainKHR::null();
         let alloc_ptr = allocator.map_or(std::ptr::null(), std::ptr::from_ref);
