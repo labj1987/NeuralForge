@@ -243,6 +243,45 @@ Next step, once lordnikon is back: deploy, set `NEURALFORGE_MVEC_HELPER=1`, watc
 project has, and check the helper log for `[mvec]` lines confirming a real session
 came up (`optical flow queue: available`, no `session unavailable` line).
 
+## 4b. The gate above was wrong -- real hang on real hardware, fixed (2026-09-17,
+same day, live during Alex's testing)
+
+The "nothing changes for anyone who doesn't set the variable" claim in §4a was false.
+`NEURALFORGE_MVEC_HELPER` only gated the *runtime* `estimate_motion()` call inside
+`process_request`. It did not gate `find_flow_family()`, the second
+`DeviceQueueCreateInfo`, or the `VkPhysicalDeviceOpticalFlowFeaturesNV`/
+`Synchronization2Features` chain in `create_vulkan_context()` -- all of that ran
+unconditionally, on every helper launch, whenever the driver genuinely exposed an
+optical-flow queue. Wine never exercises this path (its Vulkan implementation always
+reports the extension unavailable), so this ran fully untested until it hit real
+hardware.
+
+It hit real hardware the same day: lordnikon's RTX 5070 does expose optical flow
+(`[mvec] optical flow queue: available` in the helper log), a WIP build with this
+code had already been manually deployed there for testing, and during a live test run
+with the enhancement toggled off (to get a native-performance baseline) the helper
+hung silently at frame ~1017 -- no panic, no Vulkan error, log just stops. Confirmed
+via SSH: GPU idle (8% util, 750MHz, no Xid in `journalctl -k`, so *not* the Xid
+109/119/154 class from §1d/§3), `GTA5_Enhanced.exe` still alive and burning 143% CPU.
+Because the layer calls the helper synchronously on every present (the architecture
+adopted from upstream in §1d), a hung helper freezes the whole game on its last
+composited frame -- which is exactly what Alex saw: ~10fps and a static ghost image
+that didn't respond to movement, identical whether the enhancement was on or off,
+since the synchronous per-frame call happens either way.
+
+Fixed by moving the `NEURALFORGE_MVEC_HELPER` check to wrap `find_flow_family()`
+itself, so `flow_family` is unconditionally `None` without the opt-in and device
+creation takes the exact pre-v0.1.69 shape regardless of what the driver supports.
+Cross-compiled (release), re-ran the Wine test suite (can't exercise the real hang
+path there, for the same reason it was missed originally -- Wine has no NVOF-capable
+driver), deployed over the WIP build already on lordnikon, killed the hung game
+process. Not yet re-tested live with a fresh launch as of this writing.
+
+The still-open item from §4a (whether real NVOF execution helps ghosting once
+someone deliberately opts in) remains exactly as untested as before -- this fix only
+restores the "no opt-in, no behavior change" invariant that was supposed to hold
+already.
+
 ## 5a. Updated recommendation for Alex
 
 Both step 1 and step 4, done properly, are real Vulkan/cross-process features in the

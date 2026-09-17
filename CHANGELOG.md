@@ -215,6 +215,25 @@
 
 # Changelog
 
+- **v0.1.70 — fix: real motion-vector device setup was NOT actually gated behind
+  `NEURALFORGE_MVEC_HELPER`, and it hung the helper on real NVOF hardware.** v0.1.69
+  claimed device creation was a no-op without the opt-in env var; it wasn't. Only the
+  runtime `estimate_motion()` call checked the env var --
+  `create_vulkan_context()`'s `find_flow_family()` probe, second-queue request, and
+  `VkPhysicalDeviceOpticalFlowFeaturesNV`/`Synchronization2Features` chaining into
+  `vkCreateDevice` ran unconditionally whenever the driver exposed an optical-flow
+  queue, regardless of the env var. On real NVOF-capable hardware (confirmed live on
+  an RTX 5070) this hung the helper silently after roughly a thousand frames with no
+  error output, which -- because the layer calls the helper synchronously on every
+  present, matching the upstream architecture this project adopted -- froze the game
+  on the last composited frame at a crawl, whether the enhancement itself was toggled
+  on or off. Never caught earlier because Wine (used for all pre-release testing of
+  this feature) has no real NVOF-capable Vulkan driver and always reports the
+  extension unavailable, so this exact code path never actually ran under test.
+  Fixed in `crates/helper/src/main.rs` by gating `find_flow_family()` itself behind
+  `NEURALFORGE_MVEC_HELPER`, so device creation is now genuinely byte-identical to
+  pre-v0.1.69 behavior for anyone who hasn't opted in. See `GHOSTING_PLAN.md` §4a.
+
 - **v0.1.69 — real motion vectors, built and cross-compiled, opt-in pending real-hardware
   validation.** New `crates/helper/src/optical_flow.rs`: `VK_NV_optical_flow` estimated
   between consecutive proxy frames, on the helper's own already-created device (never a
@@ -223,16 +242,13 @@
   session (CPU luma delta, independently reimplementing the same technique upstream's
   `DetectSceneCut` uses) instead of carrying a flow field across them. Feeds
   `frame::evaluate`'s existing `motion`/`reset_history` parameters, which have been wired
-  and unused since before this module existed. Gated behind an explicit
-  `NEURALFORGE_MVEC_HELPER=1` environment variable on top of the existing `mvec_enabled`
-  toggle -- nothing changes for anyone who doesn't set it, deliberately, since this is
-  genuinely unvalidated on real optical-flow hardware as of this release. Compiles clean
-  (native and the real `x86_64-pc-windows-gnu` cross build, dev and release); 8 real unit
-  tests pass under Wine; the actual `neuralforge-helper.exe`, run under Wine without a
-  real NVIDIA GPU, starts cleanly and correctly falls back with zero effect on NGX. Real
-  optical-flow execution, driver-crash risk, and any actual ghosting improvement remain
-  unmeasured until tested live -- see `GHOSTING_PLAN.md` §4a for the honest account of
-  what is and isn't validated.
+  and unused since before this module existed. **Correction (see v0.1.70 above): the
+  claim below that device setup was fully gated behind the env var was wrong** --
+  only the runtime estimation call was. Compiles clean (native and the real
+  `x86_64-pc-windows-gnu` cross build, dev and release); 8 real unit tests pass under
+  Wine; the actual `neuralforge-helper.exe`, run under Wine without a real NVIDIA GPU,
+  starts cleanly and correctly falls back with zero effect on NGX -- which is exactly
+  why Wine testing didn't catch the device-creation gap.
 
 - **v0.1.67 — `working_scale` is wired in, real: run the model at a fraction of the
   frame's resolution.** The earlier CPU-resample attempt (below) was measured too slow

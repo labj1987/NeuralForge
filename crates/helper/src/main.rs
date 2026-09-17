@@ -543,7 +543,23 @@ fn create_vulkan_context() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDev
     // the Vulkan spec, so family 0 doubling as the flow family (common -- many
     // NVIDIA parts expose optical flow on their main graphics/compute family) is
     // handled by not adding a second entry for it, only chaining the extra features.
-    let flow_family = find_flow_family(&instance, physical_device, &enabled);
+    //
+    // Gated on `NEURALFORGE_MVEC_HELPER` here, not just in `estimate_motion`'s caller:
+    // this is device-creation time, before any per-frame opt-in check runs, so on
+    // hardware that genuinely exposes an optical-flow queue (real NVOF-capable
+    // GPUs) this used to run unconditionally regardless of the env var -- silently
+    // requesting a second queue and chaining `VkPhysicalDeviceOpticalFlowFeaturesNV`/
+    // `Synchronization2Features` into `vkCreateDevice` on every launch, on real
+    // hardware, never exercised under Wine (which always reports the extension
+    // unavailable). Found 2026-09-17 after this caused a live hang on real
+    // hardware. Checking the env var here makes device creation byte-identical to
+    // pre-optical-flow behavior for anyone who hasn't explicitly opted in, which is
+    // the actual invariant this feature was supposed to guarantee from the start.
+    let flow_family = if std::env::var_os("NEURALFORGE_MVEC_HELPER").is_some() {
+        find_flow_family(&instance, physical_device, &enabled)
+    } else {
+        None
+    };
     let mut queue_infos = vec![vk::DeviceQueueCreateInfo::builder().queue_family_index(0).queue_priorities(&[1.0]).build()];
     if let Some(family) = flow_family {
         if family != 0 {
