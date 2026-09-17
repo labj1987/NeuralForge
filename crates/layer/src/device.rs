@@ -150,6 +150,11 @@ struct State {
     /// Reused across frames the same way `original_scratch` is, for the answer bytes
     /// `capture::run` reads back once a round trip resolves.
     answer_scratch: Vec<u8>,
+    /// `working_scale`'s scaled proxy bytes -- reused across frames the same way
+    /// `original_scratch` is, but at the (usually much smaller) model resolution
+    /// rather than the swapchain's own. Empty and unused whenever `working_scale`
+    /// is left at its default `1.0`.
+    model_scratch: Vec<u8>,
     /// The original frame paired with whichever wire slot most recently produced the
     /// answer currently held in `last_answer` -- not per-slot, since only one answer
     /// is ever the "currently presented" one at a time (see `capture::Inflight`'s own
@@ -159,6 +164,10 @@ struct State {
     /// composition uploads only when this changes.
     raw_answer_generation: u64,
     last_answer: Vec<u8>,
+    /// `last_answer`'s own resolution -- see `capture::Inflight::proxy_dims`'s own
+    /// doc comment. Meaningless while `last_answer` is empty; always set together
+    /// with it otherwise.
+    last_answer_dims: (u32, u32),
     hotkey: crate::hotkey::Poller,
     /// Passive transfer observations for swapchains which could not be admitted at
     /// creation.  This is diagnostic-only: it never changes a game command buffer.
@@ -638,7 +647,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 let proxy_format = swapchain::proxy_format_for(sw.format);
                 let bgr_order = swapchain::is_bgr_order(sw.format);
                 let (capture_image, capture_layout) = tap.unwrap_or((image, vk::ImageLayout::PRESENT_SRC_KHR));
-                let State { shm, capture, capture_pipeline, direct_capture, external_memory_host, gpu_compose, original_scratch, inflight, bootstrap_complete, answer_scratch, raw_answer_base, raw_answer_generation, last_answer, hotkey, .. } = &mut *state;
+                let State { shm, capture, capture_pipeline, direct_capture, external_memory_host, gpu_compose, original_scratch, model_scratch, inflight, bootstrap_complete, answer_scratch, raw_answer_base, raw_answer_generation, last_answer, last_answer_dims, hotkey, .. } = &mut *state;
                 shm.poll_toggle_hotkey(hotkey);
                 if shm.model_known_unavailable() {
                     // The helper has permanently disabled itself for this session
@@ -679,12 +688,14 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                             gpu_compose,
                             shm,
                             original_scratch,
+                            model_scratch,
                             inflight,
                             bootstrap_complete,
                             answer_scratch,
                             raw_answer_base,
                             raw_answer_generation,
                             last_answer,
+                            last_answer_dims,
                         );
                     }
                 }

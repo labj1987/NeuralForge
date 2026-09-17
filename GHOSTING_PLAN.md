@@ -1,13 +1,14 @@
 # Ghosting: what upstream does differently, and the plan to fix it
 
-Status: **in progress** (last updated 2026-09-17, overnight session). Alex reviewed and
-approved: order 1→2→3→5→4, Quality as the default mode, `working_scale` 0.75, attempt
-step 4. Step 1 was attempted and hit a real, measured obstacle (§1a) that changes its
-scope; step 4 was investigated and also turned out larger than estimated (§1b). Nothing
-new was deployed to lordnikon this session beyond what v0.1.65 already had — seeing both
-steps 1 and 4 need real Vulkan/cross-process surgery in the project's most crash-prone
-area, with Alex asleep and unable to catch a live problem, the call was to stop and hand
-back a corrected, evidence-based plan rather than gamble on lordnikon overnight.
+Status: **step 1 done and measured live on real hardware** (2026-09-17, second
+session, Alex live). Step 4 remains a larger, deferred feature (§1b unchanged). See
+§1c for the real, measured result.
+
+Earlier the same day (overnight, Alex asleep): the first attempt at step 1 used a CPU
+resample, measured non-viable (§1a), and both steps were deliberately left unshipped
+rather than risk unsupervised Vulkan surgery. With Alex back and available to test
+live, the GPU-blit version §1a called for was built, tested at three levels (unit,
+real-Vulkan integration, and live on `lordnikon`), and deployed.
 
 ### 1a. Step 1 (`working_scale`) — the CPU approach is measured non-viable
 
@@ -78,6 +79,57 @@ experience with. Correctly identifying *why* the existing code crashes (a same-p
 mid-transition second device — not "motion vectors are inherently unsafe") is the real
 deliverable from tonight's look at this: it means the helper-side design is still the
 right target, now for a verified reason instead of an assumed one.
+
+### 1c. Step 1, done: the GPU-blit version, measured live on `lordnikon`
+
+Built exactly what §1a called for, with Alex live to test:
+
+- **Capture side** (`capture.rs`): `CapturePipeline`'s existing full-resolution
+  image→buffer copy is untouched. A new, optional per-slot `ModelScratch` (a small
+  GPU image + its own small CPU-readable buffer, using the same PCIe-BAR-avoiding
+  memory-type fix as the main capture buffer) is built only when `working_scale != 1.0`.
+  `record_capture_commands` additionally blits (`vkCmdBlitImage`, `VK_FILTER_LINEAR`)
+  the full-res source down into it, then copies *that* into the small buffer -- which
+  becomes the SHM proxy sent to the helper, at the scaled resolution. The full-res
+  capture that becomes `inflight[slot].original`/the compositor's motion-mask
+  reference is completely unaffected.
+- **Compose side** (`composition/gpu.rs`): `ComposeSlot` gained an independent
+  `small_answer` scratch (same blit mechanism, reversed) that grows the helper's
+  smaller answer back up to the frame's own resolution *before* the existing,
+  unmodified `compose.comp` compute shader ever reads it. `present_temporal_delta_async`
+  now takes the answer's own `(answer_width, answer_height)`, separate from the
+  frame's; a scale-up above `1.0` (supersampling) is deliberately rejected rather than
+  risking a staging-buffer overflow -- only `working_scale <= 1.0` is wired end to end
+  tonight.
+- `Inflight` (capture.rs) and `State` (device.rs) each gained a small field to track
+  what resolution an in-flight request/held answer is actually at, since it is no
+  longer always the swapchain's own -- getting this right (not just re-deriving it
+  from the *current* frame's settings, which can be stale for the request the
+  answer/dims actually belong to) was the main correctness risk in this change.
+- **Tests**: a new real-Vulkan integration test
+  (`capture::tests::working_scale_sends_a_genuinely_smaller_proxy_and_still_composites`)
+  confirms the proxy that reaches the wire really is smaller and the pipeline still
+  composites; a new `composition::gpu::tests` test confirms the upscale blit actually
+  reaches the compute shader (a stale/uninitialized target would silently suppress the
+  whole delta via the motion mask -- caught and fixed while writing this test) and
+  that an oversized answer is safely rejected. 61 layer tests pass, zero warnings, in
+  both the dev and release (LTO) profiles.
+
+**Measured live on `lordnikon`, `working_scale=0.75`, real GTA session:**
+
+| | before (v0.1.65) | after (this build) |
+|---|---|---|
+| Model eval resolution | 2560×1440 | **1920×1080** |
+| Helper `eval=` time (p50, 200 samples) | ~26 ms | **~11.3 ms** |
+| Xid / driver errors | -- | none (`dmesg`/`journalctl` clean) |
+| Vulkan validation errors / panics | -- | none (`console-linux.txt` clean) |
+| Layer mapped into real game process | -- | confirmed (5 segments) |
+
+~2.3x faster model evaluation, exactly the number this whole step existed to get.
+Layer stayed mapped, GPU stayed loaded (92%/154W), nothing crashed. **Not yet
+confirmed**: the visual result (does the enhancement still look correct at the
+now-blit-upscaled resolution, any softness from the linear-only filter) -- that needs
+Alex's own eyes, same as every visual check this project has ever needed.
 
 ## 5a. Updated recommendation for Alex
 

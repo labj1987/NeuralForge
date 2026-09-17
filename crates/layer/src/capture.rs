@@ -90,6 +90,178 @@ impl CaptureBuffer {
     }
 }
 
+/// `working_scale`'s capture-side machinery: a small GPU image plus its own small
+/// CPU-readable buffer, built only when the model's resolution differs from the
+/// capture's own. [`submit_pipeline_capture`] blits the full-resolution `capture_image`
+/// down into `image` -- a hardware resize unit (`vkCmdBlitImage`, `VK_FILTER_LINEAR`),
+/// sub-millisecond, unlike the CPU resample this replaces (measured 315-546ms at GTA's
+/// resolution on 2026-09-17, unusable on the present thread; see `GHOSTING_PLAN.md`
+/// step 1). `image` then copies into `buffer`, which is what actually crosses SHM as
+/// the proxy -- smaller proxy, smaller `DLSSNR.Width`/`Height` at `CreateFeature`,
+/// faster model evaluation, the whole point of `working_scale`.
+///
+/// Deliberately only `VK_FILTER_LINEAR`: a hardware blit has no concept of the
+/// Lanczos/Catmull-Rom/Mitchell-Netravali/Kaiser kernels `scaling_downscaler` selects
+/// (that field stays meaningful only for a hypothetical future compute-shader
+/// implementation, not this one) -- a real, honest quality/speed tradeoff, not an
+/// oversight.
+///
+/// Never touches [`CaptureBuffer`]'s own full-resolution buffer/copy at all: the
+/// full-resolution bytes this slot always still produces are what `run` swaps into
+/// `inflight[slot].original`, the compositor's motion-mask reference, which must stay
+/// full-resolution (see `run`'s own doc comment on `raw_answer_base`).
+struct ModelScratch {
+    image: vk::Image,
+    image_memory: vk::DeviceMemory,
+    buffer: vk::Buffer,
+    buffer_memory: vk::DeviceMemory,
+    ptr: *mut u8,
+    width: u32,
+    height: u32,
+    capacity: vk::DeviceSize,
+}
+
+// SAFETY: same reasoning as `CaptureBuffer`'s own impl -- plain Vulkan handles plus a
+// `vkMapMemory` pointer into memory this struct owns exclusively.
+unsafe impl Send for ModelScratch {}
+
+impl ModelScratch {
+    /// # Safety
+    /// Same contract as [`CaptureBuffer::destroy`]: no submitted work referencing
+    /// `image`/`buffer` may still be in flight.
+    unsafe fn destroy(&self, device: &ash::Device) {
+        // SAFETY: forwarded from this function's own contract.
+        unsafe {
+            device.destroy_image(self.image, None);
+            device.free_memory(self.image_memory, None);
+            device.destroy_buffer(self.buffer, None);
+            device.free_memory(self.buffer_memory, None);
+        }
+    }
+}
+
+fn build_model_scratch(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, width: u32, height: u32, format: vk::Format) -> Option<ModelScratch> {
+    let image_info = vk::ImageCreateInfo::builder()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(format)
+        .extent(vk::Extent3D { width, height, depth: 1 })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+    // SAFETY: `image_info` is a valid `VkImageCreateInfo`.
+    let Ok(image) = (unsafe { device.create_image(&image_info, None) }) else { return None };
+    // SAFETY: `image` was just created, no memory bound yet.
+    let image_reqs = unsafe { device.get_image_memory_requirements(image) };
+    let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+    let image_type = (0..mem_props.memory_type_count)
+        .find(|&i| image_reqs.memory_type_bits & (1 << i) != 0 && mem_props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL))
+        .or_else(|| (0..mem_props.memory_type_count).find(|&i| image_reqs.memory_type_bits & (1 << i) != 0));
+    let Some(image_type) = image_type else {
+        // SAFETY: `image` has no memory bound; nothing else references it.
+        unsafe { device.destroy_image(image, None) };
+        return None;
+    };
+    let image_alloc = vk::MemoryAllocateInfo::builder().allocation_size(image_reqs.size).memory_type_index(image_type);
+    // SAFETY: `image_alloc` is valid; `image_type` satisfies `image_reqs`.
+    let Ok(image_memory) = (unsafe { device.allocate_memory(&image_alloc, None) }) else {
+        // SAFETY: same reasoning as above.
+        unsafe { device.destroy_image(image, None) };
+        return None;
+    };
+    // SAFETY: `image`/`image_memory` were each just created, sized/typed for each other.
+    if unsafe { device.bind_image_memory(image, image_memory, 0) }.is_err() {
+        // SAFETY: neither is aliased anywhere else yet.
+        unsafe {
+            device.free_memory(image_memory, None);
+            device.destroy_image(image, None);
+        }
+        return None;
+    }
+
+    let bytes = vk::DeviceSize::from(width) * vk::DeviceSize::from(height) * 4;
+    let buf_info = vk::BufferCreateInfo::builder().size(bytes).usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST).sharing_mode(vk::SharingMode::EXCLUSIVE);
+    // SAFETY: `buf_info` is valid.
+    let Ok(buffer) = (unsafe { device.create_buffer(&buf_info, None) }) else {
+        // SAFETY: `image`/`image_memory` are bound to each other, own nothing else yet.
+        unsafe {
+            device.destroy_image(image, None);
+            device.free_memory(image_memory, None);
+        }
+        return None;
+    };
+    // SAFETY: `buffer` was just created, no memory bound yet.
+    let buf_reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
+    let Some(buf_type) = pick_readback_memory_type(buf_reqs, &mem_props) else {
+        // SAFETY: `buffer` has no memory bound; `image`/`image_memory` own nothing else.
+        unsafe {
+            device.destroy_buffer(buffer, None);
+            device.destroy_image(image, None);
+            device.free_memory(image_memory, None);
+        }
+        return None;
+    };
+    let buf_alloc = vk::MemoryAllocateInfo::builder().allocation_size(buf_reqs.size).memory_type_index(buf_type);
+    // SAFETY: `buf_alloc` is valid; `buf_type` satisfies `buf_reqs`.
+    let Ok(buffer_memory) = (unsafe { device.allocate_memory(&buf_alloc, None) }) else {
+        // SAFETY: same reasoning as above.
+        unsafe {
+            device.destroy_buffer(buffer, None);
+            device.destroy_image(image, None);
+            device.free_memory(image_memory, None);
+        }
+        return None;
+    };
+    // SAFETY: `buffer`/`buffer_memory` were each just created, sized/typed for each other.
+    if unsafe { device.bind_buffer_memory(buffer, buffer_memory, 0) }.is_err() {
+        // SAFETY: neither is aliased anywhere else yet.
+        unsafe {
+            device.free_memory(buffer_memory, None);
+            device.destroy_buffer(buffer, None);
+            device.destroy_image(image, None);
+            device.free_memory(image_memory, None);
+        }
+        return None;
+    }
+    // SAFETY: `buffer_memory` is `HOST_VISIBLE` (`pick_readback_memory_type`'s own
+    // contract); mapping the whole allocation is always in bounds.
+    let Ok(ptr) = (unsafe { device.map_memory(buffer_memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }) else {
+        // SAFETY: same reasoning as the bind-failure branch above.
+        unsafe {
+            device.free_memory(buffer_memory, None);
+            device.destroy_buffer(buffer, None);
+            device.destroy_image(image, None);
+            device.free_memory(image_memory, None);
+        }
+        return None;
+    };
+
+    Some(ModelScratch { image, image_memory, buffer, buffer_memory, ptr: ptr.cast(), width, height, capacity: buf_reqs.size })
+}
+
+/// Picks the best `HOST_VISIBLE` memory type for a buffer the GPU writes and the CPU
+/// then reads back on the present thread -- the exact readback-cost fix from
+/// `capture_hot_path_cost_per_present` (87ms -> 5.7ms/present at 1440p): prefer
+/// `HOST_CACHED` system memory that is *not* `DEVICE_LOCAL` (not NVIDIA's small PCIe
+/// BAR, whose CPU reads are uncached and brutally slow), falling back to any
+/// `HOST_VISIBLE|HOST_COHERENT` type only if no cached system-memory type exists.
+/// Pulled out of [`build_capture_buffer`] so [`build_model_scratch`]'s own small
+/// readback buffer (`working_scale`'s scaled proxy) gets the identical fix rather than
+/// a copy that could quietly regress on its own.
+fn pick_readback_memory_type(reqs: vk::MemoryRequirements, mem_props: &vk::PhysicalDeviceMemoryProperties) -> Option<u32> {
+    let host_visible = vk::MemoryPropertyFlags::HOST_VISIBLE;
+    let cached = vk::MemoryPropertyFlags::HOST_CACHED;
+    let coherent = vk::MemoryPropertyFlags::HOST_COHERENT;
+    let device_local = vk::MemoryPropertyFlags::DEVICE_LOCAL;
+    let usable = |i: u32| reqs.memory_type_bits & (1 << i) != 0;
+    let flags = |i: u32| mem_props.memory_types[i as usize].property_flags;
+    let pick = |pred: &dyn Fn(vk::MemoryPropertyFlags) -> bool| (0..mem_props.memory_type_count).find(|&i| usable(i) && pred(flags(i)));
+    pick(&|f| f.contains(host_visible | cached | coherent) && !f.contains(device_local)).or_else(|| pick(&|f| f.contains(host_visible | coherent)))
+}
+
 fn build_capture_buffer(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, queue_family: u32, bytes: vk::DeviceSize) -> Option<CaptureBuffer> {
     let pool_info =
         vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
@@ -144,35 +316,13 @@ fn build_capture_buffer(device: &ash::Device, instance: &ash::Instance, physical
     // owning instance (stored once at `vkCreateInstance`, see `crate::CURRENT_INSTANCE`).
     let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
     // This buffer is written by the GPU and then *read back by the CPU* on the game's
-    // own present thread every capture. The memory type chosen for it dominates that
-    // read cost, and getting it wrong is the single biggest cause of the fps collapse
-    // measured at 2560x1440 (see `capture_hot_path_cost_per_present`): the naive "first
-    // HOST_VISIBLE|HOST_COHERENT type" picks NVIDIA's small device-local BAR region,
-    // whose CPU reads go uncached over PCIe at well under 1 GB/s -- ~87 ms to read one
-    // 1440p frame, on the present thread, tanking the game to ~11-30 fps. What a
-    // readback buffer actually wants is HOST_CACHED system memory (fast CPU reads) that
-    // is *not* DEVICE_LOCAL (not the BAR). Preference: (1) HOST_VISIBLE|HOST_CACHED|
-    // HOST_COHERENT and not DEVICE_LOCAL -- fast cached CPU reads, and coherent so the
-    // existing plain-`memcpy` read path stays correct with no `vkInvalidateMappedMemory`
-    // added; then (2) the original any-HOST_VISIBLE|HOST_COHERENT, only if no cached
-    // system-memory type exists. Deliberately no non-coherent tier: that would need a
-    // manual invalidate before every read this crate doesn't currently do, a real
-    // correctness risk not worth taking for a fallback that almost never triggers.
-    let host_visible = vk::MemoryPropertyFlags::HOST_VISIBLE;
-    let cached = vk::MemoryPropertyFlags::HOST_CACHED;
-    let coherent = vk::MemoryPropertyFlags::HOST_COHERENT;
-    let device_local = vk::MemoryPropertyFlags::DEVICE_LOCAL;
-    let usable = |i: u32| reqs.memory_type_bits & (1 << i) != 0;
-    let flags = |i: u32| mem_props.memory_types[i as usize].property_flags;
-    let pick = |pred: &dyn Fn(vk::MemoryPropertyFlags) -> bool| {
-        (0..mem_props.memory_type_count).find(|&i| usable(i) && pred(flags(i)))
-    };
-    let type_index = pick(&|f| f.contains(host_visible | cached | coherent) && !f.contains(device_local))
-        .or_else(|| pick(&|f| f.contains(host_visible | coherent)));
-    // The Vulkan spec guarantees at least one HOST_VISIBLE|HOST_COHERENT type, so the
-    // last fallback failing would mean a spec-non-compliant driver, not a real device
-    // limitation -- still handled as a plain "skip capture" rather than assumed away.
-    let Some(type_index) = type_index else {
+    // own present thread every capture -- see `pick_readback_memory_type`'s own doc
+    // comment for why the memory type chosen for it dominates that cost (the
+    // 87ms->5.7ms/present fix). The Vulkan spec guarantees at least one
+    // HOST_VISIBLE|HOST_COHERENT type, so that helper returning `None` would mean a
+    // spec-non-compliant driver, not a real device limitation -- still handled as a
+    // plain "skip capture" rather than assumed away.
+    let Some(type_index) = pick_readback_memory_type(reqs, &mem_props) else {
         // SAFETY: `buffer` has no memory bound yet; nothing else owns `fence`/`pool`.
         unsafe {
             device.destroy_buffer(buffer, None);
@@ -298,6 +448,51 @@ fn barrier(image: vk::Image, old: vk::ImageLayout, new: vk::ImageLayout, src: vk
 pub struct Inflight {
     original: Vec<u8>,
     dims: Option<(u32, u32, u32)>,
+    /// The proxy's own `(width, height)` at the moment this slot's outstanding request
+    /// was actually sent -- `working_scale`'s answer comes back at whatever resolution
+    /// the request was sent at, which is no longer always `dims`' own `(width,
+    /// height)` once scaling is active. `None` means "sent at the swapchain's own
+    /// resolution", the only possibility before `working_scale` existed -- callers
+    /// resizing the answer buffer fall back to `dims` in that case, unchanged old
+    /// behavior. Kept as a wholly separate field from `dims` rather than folding into
+    /// it: `dims` also drives the swapchain-resize-detection comparison in `run`,
+    /// which must keep comparing against the swapchain's own resolution regardless of
+    /// what the proxy itself was scaled to.
+    proxy_dims: Option<(u32, u32)>,
+}
+
+/// `working_scale × (width, height)`, rounded to the nearest even number (several
+/// paths in this crate and the helper implicitly assume even dimensions are safe, not
+/// a hazard) and floored at 64px per axis -- upstream (DLSS5VKLayer) hit and fixed a
+/// real GPU hang from a smaller probe swapchain (`0.2.6-3`'s changelog), and this
+/// project has no reason to retest a smaller floor itself. Returns `(width, height)`
+/// unchanged whenever `scale` is not a real, useful value (non-finite, non-positive,
+/// or close enough to `1.0` that scaling would buy nothing) -- callers comparing the
+/// result against `(width, height)` for equality get exactly the "skip the entire
+/// `working_scale` code path" behavior every caller had before it existed.
+fn scaled_dims(width: u32, height: u32, scale: f32) -> (u32, u32) {
+    if !scale.is_finite() || scale <= 0.0 || (scale - 1.0).abs() < 0.01 {
+        return (width, height);
+    }
+    let axis = |v: u32| {
+        let scaled = ((v as f32 * scale).round()).max(64.0) as u32;
+        (scaled / 2) * 2 // force even
+    };
+    (axis(width), axis(height))
+}
+
+/// The `vk::Format` [`build_model_scratch`] should create its scratch image as, for a
+/// given `proxy_format`/`bgr_order` pair -- `None` when `working_scale`'s GPU-blit
+/// mechanism does not (yet) support this proxy format at all. Restricted to the two
+/// 8-bit formats: an HDR float16 proxy's blit-filtering and byte-layout behavior
+/// differ enough from the 8-bit case that this first cut deliberately does not attempt
+/// it (matches the same `is_8bit` gate several other advanced paths in this crate and
+/// the helper already use).
+fn model_scratch_format(proxy_format: u32, bgr_order: bool) -> Option<vk::Format> {
+    if !neuralforge_protocol::enums::proxy_format::is_8bit(proxy_format) {
+        return None;
+    }
+    Some(if bgr_order { vk::Format::B8G8R8A8_UNORM } else { vk::Format::R8G8B8A8_UNORM })
 }
 
 /// Real per-frame NR compute (a helper round trip through a Wine-hosted process, plus
@@ -354,6 +549,29 @@ pub struct Inflight {
 /// need bytes that survive whatever capture starts next and overwrites that region,
 /// which the live proxy region itself can't provide once it's shared, imported memory.
 #[allow(clippy::too_many_arguments)]
+/// `model`, when `Some((model_width, model_height, format))`, additionally requests a
+/// scaled proxy at that resolution (`working_scale`) -- see [`ModelScratch`]'s own doc
+/// comment for the mechanism. Only the [`CapturePipeline`] (non-`use_direct`) branch
+/// implements it; `use_direct` (the `VK_EXT_external_memory_host` zero-copy path)
+/// ignores `model` and always sends the full-resolution proxy, same as before
+/// `working_scale` existed -- that path is unverified to even be live on real hardware
+/// (alignment checks fail it back to `CapturePipeline` on every device tested so far,
+/// see `HARDWARE_VALIDATION.md`), so it is not worth the same surgery until it is.
+/// `original_scratch` is always the full-resolution capture regardless of `model` --
+/// callers still swap it into `inflight[slot].original` unchanged; `model_scratch`
+/// receives the scaled bytes only when `model` was requested and actually available
+/// this poll (a rebuild-in-progress or first-ever call can still miss a poll, in which
+/// case this falls back to sending the full-resolution proxy that frame, same
+/// bounded-staleness fail-open discipline as everywhere else in this module).
+///
+/// Returns `Some((sent_width, sent_height))` -- the proxy's *actual* resolution, which
+/// the caller must record (`Inflight::proxy_dims`) to size the eventual answer
+/// correctly -- on a successful capture+send this call, `None` on "nothing to do this
+/// frame". This is `model`'s own request dims only when a scaled send genuinely
+/// happened; every fallback above (an unavailable/failed scratch, `use_direct`, no
+/// `model` requested at all) correctly reports the full-resolution `(width, height)`
+/// instead, because it actually sent that -- callers must not re-derive this from
+/// `model` themselves, only ever trust this return value.
 #[allow(clippy::too_many_arguments)]
 fn poll_or_submit_capture(
     slot: usize,
@@ -371,11 +589,13 @@ fn poll_or_submit_capture(
     height: u32,
     proxy_format: u32,
     frame_bytes: u64,
+    model: Option<(u32, u32, vk::Format)>,
     shm: &mut ShmClient,
     original_scratch: &mut Vec<u8>,
-) -> bool {
+    model_scratch: &mut Vec<u8>,
+) -> Option<(u32, u32)> {
     if use_direct {
-        let Some((host_ptr, capacity)) = shm.proxy_region(slot) else { return false };
+        let (host_ptr, capacity) = shm.proxy_region(slot)?;
         // SAFETY: `host_ptr`/`capacity` describe `shm`'s own live proxy region for
         // this slot, valid for as long as `shm` stays open (the life of this process,
         // since the mapping is never unmapped -- see
@@ -387,7 +607,7 @@ fn poll_or_submit_capture(
         if !unsafe {
             ensure_direct_capture(&mut direct[slot], device, instance, physical_device, queue_family, host_ptr, capacity as vk::DeviceSize)
         } {
-            return false;
+            return None;
         }
         let d = direct[slot].as_mut().expect("just ensured above");
         if let Some(_dims) = poll_direct_capture(d, device) {
@@ -400,22 +620,28 @@ fn poll_or_submit_capture(
             // imported or not).
             original_scratch.extend_from_slice(unsafe { std::slice::from_raw_parts(host_ptr, n) });
             shm.set_frame_info(slot, width, height, proxy_format);
-            return true;
+            return Some((width, height));
         }
         submit_direct_capture(d, device, queue, capture_image, capture_layout, width, height, proxy_format);
-        false
+        None
     } else {
         if !ensure_pipeline(pipeline, device, instance, physical_device, queue_family, frame_bytes) {
-            return false;
+            return None;
         }
         let p = pipeline.as_mut().expect("just ensured above");
-        if poll_pipeline_capture(p, slot, device, original_scratch).is_some() {
+        let (full, model_dims) = poll_pipeline_capture(p, slot, device, original_scratch, model_scratch);
+        if full.is_some() {
+            if let Some((mw, mh)) = model_dims {
+                shm.set_frame_info(slot, mw, mh, proxy_format);
+                shm.write_proxy(slot, model_scratch);
+                return Some((mw, mh));
+            }
             shm.set_frame_info(slot, width, height, proxy_format);
             shm.write_proxy(slot, original_scratch);
-            return true;
+            return Some((width, height));
         }
-        submit_pipeline_capture(p, slot, device, queue, capture_image, capture_layout, width, height, proxy_format);
-        false
+        submit_pipeline_capture(p, slot, device, instance, physical_device, queue, capture_image, capture_layout, width, height, proxy_format, model);
+        None
     }
 }
 
@@ -444,12 +670,14 @@ pub unsafe fn run(
     gpu_compose: &mut Option<crate::composition::gpu::GpuCompose>,
     shm: &mut ShmClient,
     original_scratch: &mut Vec<u8>,
+    model_scratch: &mut Vec<u8>,
     inflight: &mut [Inflight; 2],
     bootstrap_complete: &mut bool,
     answer_scratch: &mut Vec<u8>,
     raw_answer_base: &mut Vec<u8>,
     raw_answer_generation: &mut u64,
     last_answer: &mut Vec<u8>,
+    last_answer_dims: &mut (u32, u32),
 ) -> Option<vk::Semaphore> {
     let pipeline_start = std::time::Instant::now();
     // `composition_settings()` (and everything else below) only ever reads through an
@@ -562,18 +790,36 @@ pub unsafe fn run(
         // Same non-blocking capture strategy as the enabled path below, used here too
         // so this one-shot warm-up capture never costs a blocking fence wait either --
         // it just takes a call or two longer to land (irrelevant for a once-per-process
-        // bootstrap) instead of stalling the present it happens on.
+        // bootstrap) instead of stalling the present it happens on. Deliberately always
+        // full-resolution, `model: None`, regardless of `working_scale`: its answer is
+        // discarded either way, and if scaling is active the first *real* request will
+        // still need its own `CreateFeature` at the scaled resolution -- this bootstrap
+        // only helps avoid the VRAM-full failure mode, it does not need to guess the
+        // eventual real resolution correctly to do that.
         if poll_or_submit_capture(
             SLOT, use_direct, pipeline, direct, device, instance, physical_device, queue, queue_family,
-            capture_image, capture_layout, width, height, proxy_format, frame_bytes, shm, original_scratch,
-        ) {
+            capture_image, capture_layout, width, height, proxy_format, frame_bytes, None, shm, original_scratch, model_scratch,
+        ).is_some() {
             shm.prepare_motion(instance, physical_device, width, height, proxy_format, original_scratch);
             if shm.begin_async_request(SLOT) {
                 inflight[SLOT].dims = Some((width, height, proxy_format));
+                inflight[SLOT].proxy_dims = None;
             }
         }
         return None;
     }
+
+    // `working_scale`: `(model_width, model_height)` equals `(width, height)` whenever
+    // scaling is off or the current proxy format can't be scaled (see
+    // `model_scratch_format`'s own doc comment) -- `model_request` is `None` in either
+    // case, and every path below behaves exactly as it did before `working_scale`
+    // existed. Computed once per call, shared by every slot below (the swapchain's
+    // resolution and the settings are the same for all of them this frame).
+    let (model_width, model_height) = scaled_dims(width, height, settings.working_scale);
+    let model_request = (model_width != width || model_height != height)
+        .then(|| model_scratch_format(proxy_format, bgr_order))
+        .flatten()
+        .map(|format| (model_width, model_height, format));
 
     // Protocol v3 (`PROTOCOL_V3_DESIGN.md`): the same poll-then-maybe-submit sequence
     // as before, just run once per wire slot instead of once total. Each slot is
@@ -589,9 +835,25 @@ pub unsafe fn run(
         // read (below) before a new capture this same frame (if one happens) is
         // allowed to replace them.
         let mut have_answer = false;
+        // Captured *before* the submit branch below can overwrite
+        // `inflight[slot].proxy_dims` with a brand-new request's own dims -- reading
+        // it again after that point would describe the wrong request. `(width,
+        // height)` is a safe placeholder while `have_answer` is `false`; nothing below
+        // reads `answer_dims` unless `have_answer` is `true`, at which point it was
+        // always actually set from the branch just below.
+        let mut answer_dims = (width, height);
         if shm.has_pending_request(slot) {
             if shm.poll_async_request(slot) == Some(true) {
-                answer_scratch.resize(frame_bytes as usize, 0);
+                // The answer comes back at whatever resolution *this outstanding
+                // request* was actually sent at (`inflight[slot].proxy_dims`), not
+                // necessarily this frame's own `(width, height)` -- see
+                // `Inflight::proxy_dims`'s own doc comment. Falls back to the
+                // swapchain's own `frame_bytes` when `proxy_dims` is `None`, the only
+                // possibility before `working_scale` existed.
+                answer_dims = inflight[slot].proxy_dims.unwrap_or((width, height));
+                let (aw, ah) = answer_dims;
+                let answer_bytes = (u64::from(aw) * u64::from(ah) * bytes_per_pixel) as usize;
+                answer_scratch.resize(answer_bytes, 0);
                 shm.read_answer(slot, answer_scratch);
                 // Preserve the exact game frame supplied to the model before the next
                 // request replaces `inflight[slot].original`; the temporal GPU path
@@ -618,14 +880,20 @@ pub unsafe fn run(
         // skips submitting a redundant capture on the same call a round trip just
         // started.
         if !shm.has_pending_request(slot) {
-            if poll_or_submit_capture(
+            if let Some((sent_w, sent_h)) = poll_or_submit_capture(
                 slot, use_direct, pipeline, direct, device, instance, physical_device, queue, queue_family,
-                capture_image, capture_layout, width, height, proxy_format, frame_bytes, shm, original_scratch,
+                capture_image, capture_layout, width, height, proxy_format, frame_bytes, model_request, shm, original_scratch, model_scratch,
             ) {
                 shm.prepare_motion(instance, physical_device, width, height, proxy_format, original_scratch);
                 if shm.begin_async_request(slot) {
                     std::mem::swap(&mut inflight[slot].original, original_scratch);
                     inflight[slot].dims = Some((width, height, proxy_format));
+                    // The proxy's *actual* sent dims, straight from
+                    // `poll_or_submit_capture`'s own return -- not re-derived from
+                    // `model_request` here, which would be wrong whenever that
+                    // function fell back to full-resolution (a scratch build/resize
+                    // failure, or `use_direct`) despite scaling being requested.
+                    inflight[slot].proxy_dims = (sent_w != width || sent_h != height).then_some((sent_w, sent_h));
                 }
             }
         }
@@ -646,6 +914,7 @@ pub unsafe fn run(
             // against the model's answer, not merely muting it.
             last_answer.clear();
             last_answer.extend_from_slice(answer_scratch);
+            *last_answer_dims = answer_dims;
             *raw_answer_generation = raw_answer_generation.wrapping_add(1).max(1);
         }
     }
@@ -684,6 +953,8 @@ pub unsafe fn run(
             queue,
             width,
             height,
+            last_answer_dims.0,
+            last_answer_dims.1,
             raw_answer_base,
             last_answer,
             *raw_answer_generation,
@@ -713,7 +984,25 @@ pub unsafe fn run(
 /// itself, deliberately without waiting. Pulled out on its own so a future second
 /// caller shares the exact same recorded commands rather than a copy that could
 /// drift apart -- not, today, because there already is one.
-fn record_capture_commands(device: &ash::Device, cmd: vk::CommandBuffer, image: vk::Image, initial_layout: vk::ImageLayout, buffer: vk::Buffer, width: u32, height: u32) -> bool {
+/// `model`, when `Some((scratch_image, scratch_buffer, model_width, model_height))`,
+/// additionally blits `image` (already `TRANSFER_SRC_OPTIMAL` for the main copy below)
+/// down into `scratch_image` at `(model_width, model_height)` -- `VK_FILTER_LINEAR`, a
+/// hardware resize unit, not the CPU resample `working_scale` originally tried and
+/// measured too slow for this thread (see `ModelScratch`'s own doc comment) -- then
+/// copies `scratch_image` into `scratch_buffer`. That buffer's bytes become the SHM
+/// proxy in place of `buffer`'s full-resolution ones; `buffer` is still always filled
+/// at `(width, height)` exactly as before `working_scale` existed, since the
+/// compositor's motion-mask reference must stay full-resolution.
+fn record_capture_commands(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+    initial_layout: vk::ImageLayout,
+    buffer: vk::Buffer,
+    width: u32,
+    height: u32,
+    model: Option<(vk::Image, vk::Buffer, u32, u32)>,
+) -> bool {
     // SAFETY: `cmd` was allocated from a pool created with `RESET_COMMAND_BUFFER`.
     if unsafe { device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()) }.is_err() {
         return false;
@@ -763,6 +1052,40 @@ fn record_capture_commands(device: &ash::Device, cmd: vk::CommandBuffer, image: 
     unsafe {
         device.cmd_copy_image_to_buffer(cmd, image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, buffer, &[region]);
     }
+    if let Some((scratch_image, scratch_buffer, model_width, model_height)) = model {
+        // `image` is still `TRANSFER_SRC_OPTIMAL` from the copy above -- read from it
+        // again for the blit, same source, no extra barrier needed on this side.
+        // `scratch_image` starts from `UNDEFINED` every call: a blit fully overwrites
+        // the whole image, so there is never any prior content worth preserving, and
+        // `UNDEFINED` as `oldLayout` is valid regardless of the image's actual current
+        // layout (the exact property that lets this skip tracking it across frames).
+        let scratch_to_dst = barrier(scratch_image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE);
+        // SAFETY: `cmd` is recording; `scratch_image` is this slot's own, not aliased.
+        unsafe { device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[scratch_to_dst]) };
+        let blit = vk::ImageBlit::builder()
+            .src_subresource(vk::ImageSubresourceLayers::builder().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1).build())
+            .src_offsets([vk::Offset3D::default(), vk::Offset3D { x: width as i32, y: height as i32, z: 1 }])
+            .dst_subresource(vk::ImageSubresourceLayers::builder().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1).build())
+            .dst_offsets([vk::Offset3D::default(), vk::Offset3D { x: model_width as i32, y: model_height as i32, z: 1 }])
+            .build();
+        // SAFETY: `image` is `TRANSFER_SRC_OPTIMAL`; `scratch_image` was just
+        // transitioned to `TRANSFER_DST_OPTIMAL`; both are 2D, single-mip, single-layer.
+        unsafe { device.cmd_blit_image(cmd, image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, scratch_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[blit], vk::Filter::LINEAR) };
+        let scratch_to_src = barrier(scratch_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::TRANSFER_READ);
+        // SAFETY: `cmd` is recording; `scratch_image` was just written by the blit above.
+        unsafe { device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[scratch_to_src]) };
+        let scratch_region = vk::BufferImageCopy::builder()
+            .buffer_offset(0)
+            .buffer_row_length(0)
+            .buffer_image_height(0)
+            .image_subresource(vk::ImageSubresourceLayers::builder().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1).build())
+            .image_offset(vk::Offset3D::default())
+            .image_extent(vk::Extent3D { width: model_width, height: model_height, depth: 1 })
+            .build();
+        // SAFETY: `scratch_image` is `TRANSFER_SRC_OPTIMAL`; `scratch_buffer` was sized
+        // for exactly `model_width*model_height*4` bytes by `build_model_scratch`.
+        unsafe { device.cmd_copy_image_to_buffer(cmd, scratch_image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, scratch_buffer, &[scratch_region]) };
+    }
     // Restore `image` to exactly the layout this function found it in -- nothing is
     // guaranteed to touch `image` again this same frame, so leaving it in
     // `TRANSFER_DST_OPTIMAL` (a layout only valid mid-way through an image<->buffer
@@ -803,12 +1126,18 @@ pub struct CapturePipeline {
 
 struct PipelineSlot {
     buf: CaptureBuffer,
-    /// `Some((width, height, proxy_format))` for a submission whose fence has not yet
-    /// been confirmed signaled by [`poll_pipeline_capture`]. Nothing may reset or
-    /// reuse `buf.cmd`/`buf.buffer`/`buf.memory` while this is `Some` -- the exact
+    /// `working_scale`'s scratch (see [`ModelScratch`]), built and resized lazily by
+    /// [`submit_pipeline_capture`] -- `None` until the first scaled request, same
+    /// "only pay for what's used" discipline as everything else lazy in this module.
+    model: Option<ModelScratch>,
+    /// `Some((width, height, proxy_format, model_dims))` for a submission whose fence
+    /// has not yet been confirmed signaled by [`poll_pipeline_capture`]; `model_dims`
+    /// is `Some((model_width, model_height))` exactly when that submission also
+    /// recorded a scaled blit into `model`. Nothing may reset or reuse
+    /// `buf.cmd`/`buf.buffer`/`buf.memory`/`model` while this is `Some` -- the exact
     /// invariant whose violation caused the 2026-09-12 UB regression documented in
     /// this project's history (`docs/history/development-before-neuralforge.md`).
-    pending: Option<(u32, u32, u32)>,
+    pending: Option<(u32, u32, u32, Option<(u32, u32)>)>,
 }
 
 /// Builds both slots if `existing` is `None`; rebuilds both (same capacity/queue-
@@ -854,8 +1183,15 @@ fn ensure_pipeline(
     }
     let p = existing.take().expect("checked above");
     for slot in &p.slots {
-        // SAFETY: every slot's fence was just confirmed signaled above.
-        unsafe { slot.buf.destroy(device) };
+        // SAFETY: every slot's fence was just confirmed signaled above -- that same
+        // fence also guards any blit/copy this slot's `model` scratch was involved in,
+        // since both are recorded into and submitted on the same command buffer.
+        unsafe {
+            slot.buf.destroy(device);
+            if let Some(model) = &slot.model {
+                model.destroy(device);
+            }
+        }
     }
     build_pipeline(existing, device, instance, physical_device, queue_family, bytes)
 }
@@ -876,17 +1212,20 @@ fn build_pipeline(
     };
     *existing = Some(CapturePipeline {
         queue_family,
-        slots: [PipelineSlot { buf: a, pending: None }, PipelineSlot { buf: b, pending: None }],
+        slots: [PipelineSlot { buf: a, model: None, pending: None }, PipelineSlot { buf: b, model: None, pending: None }],
     });
     true
 }
 
 /// Non-blocking: checks the given slot for a submission whose fence has actually
 /// signaled (`vkGetFenceStatus`, never `vkWaitForFences`) and, if so, copies its bytes
-/// into `out` and frees the slot. Returns that submission's own
-/// `(width, height, proxy_format)` -- the caller needs it to detect a resolution
-/// change against whatever it was expecting, same as every other dims check in this
-/// module. `None` (leaving `out` untouched) if nothing is signaled yet, or if this
+/// into `out` (and, if this submission also requested a scaled proxy, into
+/// `out_model` too) and frees the slot. Returns `(full_res_dims, model_dims)`:
+/// `full_res_dims` is `Some((width, height, proxy_format))` -- unchanged meaning from
+/// before `working_scale` existed, the caller's full-resolution-capture-completed
+/// signal -- and `model_dims`, independent of it, is `Some((model_width,
+/// model_height))` exactly when `out_model` was actually populated this call. `None`
+/// for `full_res_dims` (both left untouched) if nothing is signaled yet, or if this
 /// slot's fence reported a real error (left `pending` forever rather than guessed
 /// safe to reuse).
 ///
@@ -898,15 +1237,22 @@ fn build_pipeline(
 /// request outstanding (see `run`'s own orchestration) -- by the time that's true,
 /// any earlier capture headed for this same wire slot has already been polled out
 /// and sent, so this GPU slot is free too, not just "some" slot in a shared pool.
-fn poll_pipeline_capture(pipeline: &mut CapturePipeline, slot: usize, device: &ash::Device, out: &mut Vec<u8>) -> Option<(u32, u32, u32)> {
+fn poll_pipeline_capture(
+    pipeline: &mut CapturePipeline,
+    slot: usize,
+    device: &ash::Device,
+    out: &mut Vec<u8>,
+    out_model: &mut Vec<u8>,
+) -> (Option<(u32, u32, u32)>, Option<(u32, u32)>) {
     let slot = &mut pipeline.slots[slot];
-    let dims = slot.pending?;
+    let Some((width, height, proxy_format, model_dims)) = slot.pending else { return (None, None) };
     // SAFETY: `slot.buf.fence` belongs to this slot; a status query never touches
     // command-buffer/buffer/memory state, so it's sound to call regardless of
-    // whether the submission this fence guards has actually completed yet.
+    // whether the submission this fence guards has actually completed yet. The same
+    // fence guards `slot.model`'s blit/copy too (recorded into and submitted on the
+    // same command buffer), so one status query covers both.
     match unsafe { device.get_fence_status(slot.buf.fence) } {
         Ok(true) => {
-            let (width, height, proxy_format) = dims;
             let bytes_per_pixel = neuralforge_protocol::enums::proxy_format::bytes_per_pixel(proxy_format) as u64;
             let frame_bytes = (u64::from(width) * u64::from(height) * bytes_per_pixel) as usize;
             // SAFETY: `slot.buf.ptr` is a live host-coherent mapping of at least
@@ -919,11 +1265,29 @@ fn poll_pipeline_capture(pipeline: &mut CapturePipeline, slot: usize, device: &a
             let captured = unsafe { std::slice::from_raw_parts(slot.buf.ptr, frame_bytes) };
             out.clear();
             out.extend_from_slice(captured);
+            let model_result = match (model_dims, slot.model.as_ref()) {
+                (Some((mw, mh)), Some(m)) if m.width == mw && m.height == mh => {
+                    let model_bytes = (mw as usize) * (mh as usize) * 4;
+                    if (m.capacity as usize) >= model_bytes {
+                        // SAFETY: same reasoning as `captured` above -- `m.ptr` is a
+                        // live host-coherent mapping of at least `model_bytes`
+                        // (`build_model_scratch` sizes it to exactly `width*height*4`),
+                        // and the fence just confirmed signaled covers this write too.
+                        let model_captured = unsafe { std::slice::from_raw_parts(m.ptr, model_bytes) };
+                        out_model.clear();
+                        out_model.extend_from_slice(model_captured);
+                        Some((mw, mh))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
             slot.pending = None;
-            Some(dims)
+            (Some((width, height, proxy_format)), model_result)
         }
-        Ok(false) => None, // still in flight -- leave `pending`, check again next call
-        Err(_) => None,     // real device error -- leave `pending`; never guess reuse is safe
+        Ok(false) => (None, None), // still in flight -- leave `pending`, check again next call
+        Err(_) => (None, None),    // real device error -- leave `pending`; never guess reuse is safe
     }
 }
 
@@ -934,23 +1298,49 @@ fn poll_pipeline_capture(pipeline: &mut CapturePipeline, slot: usize, device: &a
 /// module. Never waits, never touches a slot that is still `pending`. See
 /// [`poll_pipeline_capture`]'s own doc comment for why an indexed, dedicated slot per
 /// wire slot is sound (not a free-pool search like this function had before v3).
+/// `model`, when `Some((model_width, model_height, format))`, additionally builds (or
+/// resizes) this slot's [`ModelScratch`] and records the scaled blit into the same
+/// command buffer -- see that type's own doc comment. A scratch build/resize failure
+/// is not fatal to the capture itself: this function still records and submits the
+/// full-resolution capture exactly as it would with `model: None`, just without the
+/// scaled proxy this one frame (the caller's own fallback, described on
+/// [`poll_or_submit_capture`], sends the full-resolution proxy instead).
 #[allow(clippy::too_many_arguments)]
 fn submit_pipeline_capture(
     pipeline: &mut CapturePipeline,
     slot: usize,
     device: &ash::Device,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
     queue: vk::Queue,
     image: vk::Image,
     initial_layout: vk::ImageLayout,
     width: u32,
     height: u32,
     proxy_format: u32,
+    model: Option<(u32, u32, vk::Format)>,
 ) -> bool {
     let slot = &mut pipeline.slots[slot];
     if slot.pending.is_some() {
         return false;
     }
-    if !record_capture_commands(device, slot.buf.cmd, image, initial_layout, slot.buf.buffer, width, height) {
+    let model_dims = if let Some((model_width, model_height, format)) = model {
+        let needs_rebuild = slot.model.as_ref().is_none_or(|m| m.width != model_width || m.height != model_height);
+        if needs_rebuild {
+            if let Some(old) = slot.model.take() {
+                // SAFETY: `slot.pending` is `None` here (checked above) -- this slot's
+                // previous submission, if any, already had its fence confirmed
+                // signaled by `poll_pipeline_capture` before `pending` was cleared, so
+                // nothing submitted against the old scratch can still be in flight.
+                unsafe { old.destroy(device) };
+            }
+            slot.model = build_model_scratch(device, instance, physical_device, model_width, model_height, format);
+        }
+        slot.model.as_ref().map(|m| (m.image, m.buffer, model_width, model_height))
+    } else {
+        None
+    };
+    if !record_capture_commands(device, slot.buf.cmd, image, initial_layout, slot.buf.buffer, width, height, model_dims) {
         return false;
     }
     // SAFETY: `slot.buf.fence` is `pending: None` here -- either never used yet
@@ -970,7 +1360,7 @@ fn submit_pipeline_capture(
     if unsafe { device.queue_submit(queue, &[submit], slot.buf.fence) }.is_err() {
         return false;
     }
-    slot.pending = Some((width, height, proxy_format));
+    slot.pending = Some((width, height, proxy_format, model_dims.map(|(_, _, w, h)| (w, h))));
     true
 }
 
@@ -981,7 +1371,12 @@ pub unsafe fn destroy_pipeline(pipeline: Option<CapturePipeline>, device: &ash::
     if let Some(p) = pipeline {
         for slot in &p.slots {
             // SAFETY: forwarded from this function's own contract.
-            unsafe { slot.buf.destroy(device) };
+            unsafe {
+                slot.buf.destroy(device);
+                if let Some(model) = &slot.model {
+                    model.destroy(device);
+                }
+            }
         }
     }
 }
@@ -1104,7 +1499,9 @@ fn submit_direct_capture(
     if direct.pending.is_some() {
         return false;
     }
-    if !record_capture_commands(device, direct.buf.cmd, image, initial_layout, direct.buf.buffer, width, height) {
+    // `working_scale` is not wired into the dma-buf path -- see `poll_or_submit_capture`'s
+    // own doc comment on why.
+    if !record_capture_commands(device, direct.buf.cmd, image, initial_layout, direct.buf.buffer, width, height, None) {
         return false;
     }
     // SAFETY: `direct.buf.fence` is `pending: None` here -- either never used yet
@@ -2108,10 +2505,12 @@ mod tests {
         let mut direct: [Option<DirectCapture>; 2] = [None, None];
         let mut gpu_compose: Option<crate::composition::gpu::GpuCompose> = None;
         let mut original_scratch = Vec::new();
+        let mut model_scratch = Vec::new();
         let mut answer_scratch = Vec::new();
         let mut raw_answer_base = Vec::new();
         let mut raw_answer_generation = 0u64;
         let mut last_answer = Vec::new();
+        let mut last_answer_dims = (0u32, 0u32);
         let mut inflight: [Inflight; 2] = Default::default();
         let mut bootstrap_complete = false;
 
@@ -2155,12 +2554,14 @@ mod tests {
                     &mut gpu_compose,
                     &mut shm,
                     &mut original_scratch,
+                    &mut model_scratch,
                     &mut inflight,
                     &mut bootstrap_complete,
                     &mut answer_scratch,
                     &mut raw_answer_base,
                     &mut raw_answer_generation,
                     &mut last_answer,
+                    &mut last_answer_dims,
                 )
             };
             let call_time = call_start.elapsed();
@@ -2248,6 +2649,139 @@ mod tests {
         }
     }
 
+    #[test]
+    fn working_scale_sends_a_genuinely_smaller_proxy_and_still_composites() {
+        // Confirms `working_scale`'s GPU-blit mechanism end to end on a real (or
+        // software) Vulkan device: the proxy that actually reaches the wire is at the
+        // scaled resolution (not the swapchain's own), and the whole pipeline still
+        // reaches a real composited answer without crashing, hanging, or leaking --
+        // the objective checkpoint `GHOSTING_PLAN.md` step 1 calls for before this
+        // lands on real hardware.
+        let Some((_entry, instance, physical_device, device, queue, queue_family)) = test_device() else {
+            eprintln!("working_scale_sends_a_genuinely_smaller_proxy_and_still_composites: no Vulkan loader/ICD, skipping");
+            return;
+        };
+
+        let path = scratch_path("working_scale");
+        let mut shm = ShmClient::default();
+        assert!(shm.test_open_at(&path), "test-only open_at should always succeed against a scratch path");
+        let hdr_ptr = shm.test_header_ptr();
+        // SAFETY: `hdr_ptr` is this test's own live mapping, same technique the
+        // sibling test above already uses.
+        let hdr = unsafe { &*(hdr_ptr as *mut neuralforge_protocol::ShmHeader) };
+        hdr.helper_state.store(neuralforge_protocol::enums::helper_state::RUNNING, AtomicOrdering::Relaxed);
+        // 0.5 -- comfortably clear of `scaled_dims`' own 64px floor at this test's
+        // resolution, so the assertions below are testing the scale factor, not the
+        // floor.
+        hdr.working_scale_bits.store(0.5f32.to_bits(), AtomicOrdering::Relaxed);
+
+        // A fake helper that watches BOTH slots (protocol v3) and, on seeing a new
+        // request, immediately asserts the proxy it was actually sent is at the
+        // scaled resolution -- not the swapchain's own -- before answering. Any
+        // mismatch fails the test from inside the helper thread via `sent_wrong_size`
+        // rather than silently accepting whatever arrived, which a "does it
+        // eventually composite" check alone would not catch.
+        let (width, height) = (256u32, 192u32);
+        let (expected_model_w, expected_model_h) = scaled_dims(width, height, 0.5);
+        assert_ne!((expected_model_w, expected_model_h), (width, height), "0.5 at 256x192 must actually produce a smaller proxy, or this test proves nothing");
+        let sent_wrong_size = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (stop_clone, wrong_clone) = (Arc::clone(&stop), Arc::clone(&sent_wrong_size));
+        let helper = std::thread::spawn(move || {
+            // SAFETY: the mapping outlives this thread (joined before the test ends).
+            let hdr = unsafe { &*(hdr_ptr as *mut neuralforge_protocol::ShmHeader) };
+            let mut last_seen = [0u32; 2];
+            while !stop_clone.load(AtomicOrdering::Relaxed) {
+                for slot in 0..2 {
+                    let req = hdr.seq_req_slot(slot).load(AtomicOrdering::Relaxed);
+                    if req != 0 && req != last_seen[slot] {
+                        last_seen[slot] = req;
+                        let (w, h) = (hdr.width_slot(slot).load(AtomicOrdering::Relaxed), hdr.height_slot(slot).load(AtomicOrdering::Relaxed));
+                        if (w, h) != (expected_model_w, expected_model_h) {
+                            wrong_clone.store(true, AtomicOrdering::Relaxed);
+                        }
+                        hdr.seq_resp_slot(slot).store(req, AtomicOrdering::Relaxed);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+
+        let proxy_format = neuralforge_protocol::enums::proxy_format::RGBA8;
+        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool = unsafe { device.create_command_pool(&pool_info, None) }.expect("failed to create the test's own command pool");
+        let (image, image_memory) = make_present_src_image(&device, &mem_props, queue, pool, width, height);
+
+        let mut resources: Option<CaptureResources> = None;
+        let mut pipeline: Option<CapturePipeline> = None;
+        let mut direct: [Option<DirectCapture>; 2] = [None, None];
+        let mut gpu_compose: Option<crate::composition::gpu::GpuCompose> = None;
+        let mut original_scratch = Vec::new();
+        let mut model_scratch = Vec::new();
+        let mut answer_scratch = Vec::new();
+        let mut raw_answer_base = Vec::new();
+        let mut raw_answer_generation = 0u64;
+        let mut last_answer = Vec::new();
+        let mut last_answer_dims = (0u32, 0u32);
+        let mut inflight: [Inflight; 2] = Default::default();
+        let mut bootstrap_complete = false;
+
+        let mut composited = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !composited {
+            // SAFETY: `image` is this test's own, currently `PRESENT_SRC_KHR`; `queue`
+            // is used from this one thread only, exactly like `run`'s own contract.
+            let sem = unsafe {
+                run(
+                    &device, &instance, physical_device, queue, queue_family, image, vk::ImageLayout::PRESENT_SRC_KHR, image, width, height,
+                    proxy_format, false, &mut resources, &mut pipeline, &mut direct, false, &mut gpu_compose, &mut shm, &mut original_scratch,
+                    &mut model_scratch, &mut inflight, &mut bootstrap_complete, &mut answer_scratch, &mut raw_answer_base, &mut raw_answer_generation,
+                    &mut last_answer, &mut last_answer_dims,
+                )
+            };
+            if let Some(sem) = sem {
+                let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+                let wait_stage = vk::PipelineStageFlags::ALL_COMMANDS;
+                let submit = vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&wait_stage)).build();
+                unsafe {
+                    device.queue_submit(queue, &[submit], wait_fence).unwrap();
+                    device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
+                    device.destroy_fence(wait_fence, None);
+                }
+                composited = true;
+            } else if !last_answer.is_empty() {
+                composited = true;
+            }
+            assert!(!sent_wrong_size.load(AtomicOrdering::Relaxed), "the helper observed a proxy request at the wrong resolution -- working_scale did not shrink it");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(composited, "the scaled pipeline must eventually composite a real answer within 5s, same as the unscaled path already does");
+
+        stop.store(true, AtomicOrdering::Relaxed);
+        helper.join().unwrap();
+
+        unsafe { device.device_wait_idle() }.unwrap();
+        // SAFETY: every semaphore this test waited on has a completed, waited-for
+        // fence behind it; the idle wait just above confirms every capture-pipeline
+        // slot's own fence (including any `ModelScratch` this run built) too.
+        unsafe {
+            device.destroy_image(image, None);
+            device.free_memory(image_memory, None);
+            device.destroy_command_pool(pool, None);
+            destroy(resources, &device);
+            destroy_pipeline(pipeline, &device);
+            for slot in direct {
+                destroy_direct_capture(slot, &device);
+            }
+            if let Some(gpu) = gpu_compose {
+                gpu.destroy(&device);
+            }
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+        }
+    }
+
     /// Measures, at a real GTA resolution, how much GPU-queue time one present's worth
     /// of `run`'s injected work actually costs -- the number behind the fps collapse.
     ///
@@ -2317,10 +2851,12 @@ mod tests {
         let mut direct: [Option<DirectCapture>; 2] = [None, None];
         let mut gpu_compose: Option<crate::composition::gpu::GpuCompose> = None;
         let mut original_scratch = Vec::new();
+        let mut model_scratch = Vec::new();
         let mut answer_scratch = Vec::new();
         let mut raw_answer_base = Vec::new();
         let mut raw_answer_generation = 0u64;
         let mut last_answer = Vec::new();
+        let mut last_answer_dims = (0u32, 0u32);
         let mut inflight: [Inflight; 2] = Default::default();
         let mut bootstrap_complete = false;
 
@@ -2343,8 +2879,8 @@ mod tests {
                 run(&device, &instance, physical_device, queue, queue_family, image,
                     vk::ImageLayout::PRESENT_SRC_KHR, image, width, height, proxy_format, false,
                     &mut resources, &mut pipeline, &mut direct, false, &mut gpu_compose, &mut shm,
-                    &mut original_scratch, &mut inflight, &mut bootstrap_complete, &mut answer_scratch,
-                    &mut raw_answer_base, &mut raw_answer_generation, &mut last_answer)
+                    &mut original_scratch, &mut model_scratch, &mut inflight, &mut bootstrap_complete, &mut answer_scratch,
+                    &mut raw_answer_base, &mut raw_answer_generation, &mut last_answer, &mut last_answer_dims)
             };
             let cpu_cost = c.elapsed();
             if sem.is_some() {

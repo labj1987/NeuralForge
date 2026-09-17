@@ -215,7 +215,28 @@
 
 # Changelog
 
-- **Unreleased — step 1/step 4 investigation, no behavior change.** Attempted to wire
+- **v0.1.67 — `working_scale` is wired in, real: run the model at a fraction of the
+  frame's resolution.** The earlier CPU-resample attempt (below) was measured too slow
+  for the present thread and shelved; this is the GPU-blit version instead
+  (`vkCmdBlitImage`, a hardware resize unit, sub-millisecond): `CapturePipeline` blits
+  the captured frame down to the model's resolution before it crosses SHM as the
+  proxy, and `composition::gpu` blits the helper's smaller answer back up before the
+  existing, unmodified compose shader ever reads it. The full-resolution frame itself,
+  and the compositor's motion-mask reference, are unaffected either way.
+  `working_scale` above `1.0` (supersampling) is not wired into the compose side yet --
+  only `<= 1.0` (downscaling the model's own work) runs end to end tonight. Measured
+  live on `lordnikon` with `working_scale=0.75`, a real GTA session: model evaluation
+  resolution 2560x1440 → 1920x1080, helper eval time (p50) **26 ms → 11.3 ms** (~2.3x),
+  no Xid/driver errors, no Vulkan validation errors, layer stayed mapped into the game
+  process. 61 layer tests pass (two new ones added: a real-Vulkan integration test
+  confirming the proxy actually shrinks and the pipeline still composites, and a
+  compose-level test confirming the upscaled answer actually reaches the shader and an
+  oversized answer is safely rejected rather than overflowing the staging buffer).
+  Visual correctness (does the enhancement still look right at the blit-upscaled
+  resolution) still needs a live look, same as every visual check this project has
+  ever needed. Full account in `GHOSTING_PLAN.md` §1c.
+
+- **v0.1.66 — step 1/step 4 investigation, no behavior change (superseded above).** Attempted to wire
   `working_scale` (run the model at a fraction of the frame's resolution) into
   `capture::run`'s hot path via a CPU resample. Built and tested a real, separable
   resize (`composition::downscale::resample_rgba8`, finally putting the project's

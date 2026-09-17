@@ -220,6 +220,18 @@ struct ComposeSlot {
     fence: vk::Fence,
     sized: Option<Sized_>,
     cached_generation: u64,
+    /// `working_scale`'s compose-side scratch: an intermediate image at the answer's
+    /// own (usually smaller) resolution, blitted up into `Sized_::model_answer`
+    /// before the compute shader reads it -- the same `vkCmdBlitImage`/
+    /// `VK_FILTER_LINEAR` mechanism `capture::ModelScratch` uses on the capture side,
+    /// so the compute shader itself (and every image binding downstream of
+    /// `model_answer`) is completely unaware scaling happened at all. Independent of
+    /// `sized`'s own lifetime -- the answer's resolution and the output's resolution
+    /// change on different triggers (a `working_scale` edit vs. a swapchain resize),
+    /// so tying this to `ensure_sized`'s full rebuild would destroy/rebuild
+    /// `original`/`proxy`/`output` for no reason whenever only one of them changes.
+    /// `None` until the first scaled answer is ever composited on this slot.
+    small_answer: Option<(Image, u32, u32)>,
 }
 
 impl ComposeSlot {
@@ -235,7 +247,7 @@ impl ComposeSlot {
         // SAFETY: starting signaled means this slot's first real use never blocks on a
         // fence nothing has submitted work against yet.
         let Ok(fence) = (unsafe { device.create_fence(&fence_info, None) }) else { return None };
-        Some(Self { descriptor_set, cmd, fence, sized: None, cached_generation: 0 })
+        Some(Self { descriptor_set, cmd, fence, sized: None, cached_generation: 0, small_answer: None })
     }
 
     /// (Re)builds this slot's own images/staging buffer if `width`/`height` changed
@@ -414,6 +426,35 @@ impl ComposeSlot {
         true
     }
 
+    /// `working_scale`'s compose-side counterpart to `capture::CapturePipeline`'s own
+    /// `ensure_model_scratch`-equivalent lazy build/rebuild -- see `small_answer`'s
+    /// own doc comment on why this is a separate image with its own independent
+    /// lifetime rather than folded into `ensure_sized`.
+    fn ensure_small_answer(&mut self, device: &ash::Device, mem_props: &vk::PhysicalDeviceMemoryProperties, width: u32, height: u32) -> bool {
+        if let Some((_, w, h)) = &self.small_answer {
+            if *w == width && *h == height {
+                return true;
+            }
+        }
+        if let Some((old, _, _)) = self.small_answer.take() {
+            // SAFETY: called only after this slot's own fence has been waited on --
+            // every caller of this method (`present_temporal_delta_async`) does so
+            // before reaching this point, mirroring `ensure_sized`'s identical
+            // reasoning -- never while GPU work referencing this image might still
+            // be in flight.
+            unsafe { old.destroy(device) };
+        }
+        let usage = vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC;
+        // Only `TRANSFER_DST`/`TRANSFER_SRC` are actually needed (this image is never
+        // bound to the compute shader, only blitted from) -- `create_storage_image`
+        // bakes `STORAGE` into every image it builds regardless, accepted here as a
+        // harmless simplification rather than a second, near-identical image builder
+        // just to drop one usage flag.
+        let Some(image) = create_storage_image(device, mem_props, width, height, usage) else { return false };
+        self.small_answer = Some((image, width, height));
+        true
+    }
+
     fn begin_ensured(&mut self, device: &ash::Device, mem_props: &vk::PhysicalDeviceMemoryProperties, width: u32, height: u32, original: &[u8], model_answer: &[u8]) -> Option<u64> {
         let frame_bytes = (u64::from(width) * u64::from(height) * 4) as usize;
         if original.len() < frame_bytes || model_answer.len() < frame_bytes {
@@ -582,9 +623,20 @@ impl ComposeSlot {
     /// Records a lightweight temporal carry pass.  It reads the current swapchain
     /// image into device-local storage, applies the cached model delta, then writes
     /// the result back; no per-frame CPU readback or upload is involved.
-    unsafe fn record_temporal_delta_into_image(&self, device: &ash::Device, pipeline: vk::Pipeline, pipeline_layout: vk::PipelineLayout, width: u32, height: u32, frame_bytes: u64, update_cache: bool, bgr_order: bool, target_image: vk::Image) {
+    /// `answer_width`/`answer_height` are the model answer's *own* resolution --
+    /// usually equal to `width`/`height`, but smaller when `working_scale` is active
+    /// (see [`ComposeSlot::small_answer`]'s own doc comment). When they differ, the
+    /// staging buffer's second half (uploaded at `answer_width*answer_height*4`
+    /// bytes, not the full `frame_bytes`) goes into `self.small_answer` first, then a
+    /// GPU blit (`VK_FILTER_LINEAR`) grows it up into `s.model_answer` -- after which
+    /// the rest of this function, and the compute shader it dispatches, reads
+    /// `s.model_answer` exactly as it always has, completely unaware scaling
+    /// happened at all.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn record_temporal_delta_into_image(&self, device: &ash::Device, pipeline: vk::Pipeline, pipeline_layout: vk::PipelineLayout, width: u32, height: u32, answer_width: u32, answer_height: u32, frame_bytes: u64, update_cache: bool, bgr_order: bool, target_image: vk::Image) {
         let s = self.sized.as_ref().expect("caller already ensured this");
         let cached_before = self.cached_generation != 0;
+        let scaled_answer = answer_width != width || answer_height != height;
         unsafe {
             let target_to_src = image_barrier(target_image, vk::ImageLayout::PRESENT_SRC_KHR, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_READ);
             device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[target_to_src]);
@@ -600,7 +652,30 @@ impl ComposeSlot {
                 ];
                 device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &to_dst);
                 device.cmd_copy_buffer_to_image(self.cmd, s.staging_buffer, s.proxy.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, 0)]);
-                device.cmd_copy_buffer_to_image(self.cmd, s.staging_buffer, s.model_answer.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, frame_bytes)]);
+                if scaled_answer {
+                    // `self.small_answer` was already ensured sized to
+                    // `(answer_width, answer_height)` by `present_temporal_delta_async`
+                    // before this call -- required precondition, matching every other
+                    // `self.sized.as_ref().expect(...)` in this file.
+                    let (small, _, _) = self.small_answer.as_ref().expect("caller already ensured this");
+                    let small_to_dst = image_barrier(small.image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE);
+                    device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[small_to_dst]);
+                    device.cmd_copy_buffer_to_image(self.cmd, s.staging_buffer, small.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(answer_width, answer_height, frame_bytes)]);
+                    let small_to_src = image_barrier(small.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::TRANSFER_READ);
+                    device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[small_to_src]);
+                    let blit = vk::ImageBlit::builder()
+                        .src_subresource(vk::ImageSubresourceLayers::builder().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1).build())
+                        .src_offsets([vk::Offset3D::default(), vk::Offset3D { x: answer_width as i32, y: answer_height as i32, z: 1 }])
+                        .dst_subresource(vk::ImageSubresourceLayers::builder().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1).build())
+                        .dst_offsets([vk::Offset3D::default(), vk::Offset3D { x: width as i32, y: height as i32, z: 1 }])
+                        .build();
+                    // `s.model_answer.image` was already transitioned to
+                    // `TRANSFER_DST_OPTIMAL` in `to_dst` above -- the blit target here
+                    // is the same layout the direct-copy branch below would have used.
+                    device.cmd_blit_image(self.cmd, small.image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, s.model_answer.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[blit], vk::Filter::LINEAR);
+                } else {
+                    device.cmd_copy_buffer_to_image(self.cmd, s.staging_buffer, s.model_answer.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, frame_bytes)]);
+                }
                 let to_general = [
                     image_barrier(s.proxy.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::GENERAL, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ),
                     image_barrier(s.model_answer.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::GENERAL, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ),
@@ -654,6 +729,9 @@ impl ComposeSlot {
                 device.free_memory(s.cached_memory, None);
                 device.destroy_buffer(s.current_buffer, None);
                 device.free_memory(s.current_memory, None);
+            }
+            if let Some((small_answer, _, _)) = &self.small_answer {
+                small_answer.destroy(device);
             }
             device.destroy_fence(self.fence, None);
         }
@@ -1023,9 +1101,21 @@ impl GpuCompose {
         unsafe { device.wait_for_fences(&[self.sync.fence], true, u64::MAX) }.is_ok()
     }
 
+    /// `answer_width`/`answer_height` are `answer`'s own resolution -- pass
+    /// `(width, height)` for the pre-`working_scale` behavior (`answer` must then be
+    /// exactly `width*height*4` bytes, same as always); a smaller pair triggers the
+    /// GPU-blit upscale in `record_temporal_delta_into_image`. Deliberately does not
+    /// support `answer_width*answer_height > width*height` (a `working_scale` above
+    /// `1.0`, supersampling): the shared staging buffer this function uploads into is
+    /// sized from `(width, height)` alone (`ensure_sized`, unchanged), so a genuinely
+    /// larger answer would overflow it -- caught below and treated as "nothing to
+    /// composite this frame" rather than risking that. `working_scale` below `1.0` is
+    /// unaffected; only the above-`1.0` (supersampling) direction is out of scope for
+    /// this compose-side path tonight.
+    #[allow(clippy::too_many_arguments)]
     pub fn present_temporal_delta_async(
         &mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, queue: vk::Queue,
-        width: u32, height: u32, base: &[u8], answer: &[u8], generation: u64, bgr_order: bool, target_image: vk::Image,
+        width: u32, height: u32, answer_width: u32, answer_height: u32, base: &[u8], answer: &[u8], generation: u64, bgr_order: bool, target_image: vk::Image,
     ) -> Option<vk::Semaphore> {
         let semaphore = self.present_semaphores.get(target_image, || unsafe {
             device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).ok()
@@ -1034,18 +1124,21 @@ impl GpuCompose {
         let slot = &mut self.async_slots[idx];
         if unsafe { device.wait_for_fences(&[slot.slot.fence], true, u64::MAX) }.is_err() { return None; }
         let bytes = (u64::from(width) * u64::from(height) * 4) as usize;
-        if generation == 0 || base.len() < bytes || answer.len() < bytes { return None; }
+        let answer_bytes = (u64::from(answer_width) * u64::from(answer_height) * 4) as usize;
+        if generation == 0 || base.len() < bytes || answer.len() < answer_bytes || answer_bytes > bytes { return None; }
         let props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
         if !slot.slot.ensure_sized(device, &props, width, height) { return None; }
+        let scaled_answer = answer_width != width || answer_height != height;
+        if scaled_answer && !slot.slot.ensure_small_answer(device, &props, answer_width, answer_height) { return None; }
         let update = slot.slot.cached_generation != generation;
         if update {
             let s = slot.slot.sized.as_ref().expect("ensured");
-            unsafe { std::ptr::copy_nonoverlapping(base.as_ptr(), s.staging_ptr, bytes); std::ptr::copy_nonoverlapping(answer.as_ptr(), s.staging_ptr.add(bytes), bytes); }
+            unsafe { std::ptr::copy_nonoverlapping(base.as_ptr(), s.staging_ptr, bytes); std::ptr::copy_nonoverlapping(answer.as_ptr(), s.staging_ptr.add(bytes), answer_bytes); }
         }
         if unsafe { device.reset_command_buffer(slot.slot.cmd, vk::CommandBufferResetFlags::empty()) }.is_err() { return None; }
         let begin = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         if unsafe { device.begin_command_buffer(slot.slot.cmd, &begin) }.is_err() { return None; }
-        unsafe { slot.slot.record_temporal_delta_into_image(device, self.pipeline, self.pipeline_layout, width, height, bytes as u64, update, bgr_order, target_image); }
+        unsafe { slot.slot.record_temporal_delta_into_image(device, self.pipeline, self.pipeline_layout, width, height, answer_width, answer_height, bytes as u64, update, bgr_order, target_image); }
         if unsafe { device.end_command_buffer(slot.slot.cmd) }.is_err() || unsafe { device.reset_fences(&[slot.slot.fence]) }.is_err() { return None; }
         let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&slot.slot.cmd)).signal_semaphores(std::slice::from_ref(&semaphore)).build();
         if unsafe { device.queue_submit(queue, &[submit], slot.slot.fence) }.is_err() { return None; }
@@ -1469,6 +1562,116 @@ mod tests {
 
         // SAFETY: same reasoning as the test above.
         unsafe {
+            gpu.destroy(&device);
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+        }
+    }
+
+    /// A small host-visible/host-coherent buffer pre-filled with `bytes`, for
+    /// uploading test fixture content into an image via `cmd_copy_buffer_to_image`.
+    /// Caller destroys/frees both returned handles once the upload's fence signals.
+    fn build_upload_staging(device: &ash::Device, mem_props: &vk::PhysicalDeviceMemoryProperties, bytes: &[u8]) -> (vk::Buffer, vk::DeviceMemory) {
+        let buf_info = vk::BufferCreateInfo::builder().size(bytes.len() as u64).usage(vk::BufferUsageFlags::TRANSFER_SRC).sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer = unsafe { device.create_buffer(&buf_info, None) }.unwrap();
+        let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
+        let type_index = find_memory_type(mem_props, reqs.memory_type_bits, vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT).unwrap();
+        let memory = unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(type_index), None) }.unwrap();
+        unsafe { device.bind_buffer_memory(buffer, memory, 0).unwrap() };
+        let ptr = unsafe { device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }.unwrap().cast::<u8>();
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) };
+        unsafe { device.unmap_memory(memory) };
+        (buffer, memory)
+    }
+
+    #[test]
+    fn present_temporal_delta_async_upscales_a_smaller_answer_and_rejects_an_oversized_one() {
+        // `working_scale`'s compose-side counterpart to `capture.rs`'s own
+        // `working_scale_sends_a_genuinely_smaller_proxy_and_still_composites` --
+        // that test proves the *pipeline* end to end; this one proves this specific
+        // function's own two documented behaviors directly: (1) a smaller `answer`
+        // genuinely lands in the output (not silently dropped/left native), and (2)
+        // an `answer` larger than the frame (the out-of-scope `working_scale > 1.0`
+        // case, see this function's own doc comment) is safely rejected rather than
+        // overflowing the shared staging buffer.
+        let Some((_entry, instance, physical_device, device, queue, queue_family)) = test_device() else {
+            eprintln!("present_temporal_delta_async_upscales_a_smaller_answer_and_rejects_an_oversized_one: no Vulkan loader/ICD, skipping");
+            return;
+        };
+        let Some(mut gpu) = GpuCompose::new(&device, queue_family) else {
+            eprintln!("present_temporal_delta_async_upscales_a_smaller_answer_and_rejects_an_oversized_one: GpuCompose::new failed, skipping");
+            unsafe { device.destroy_device(None); instance.destroy_instance(None) };
+            return;
+        };
+        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool = unsafe { device.create_command_pool(&pool_info, None) }.unwrap();
+
+        let (width, height) = (16u32, 16u32);
+        let (answer_width, answer_height) = (8u32, 8u32);
+        let base = vec![50u8; (width * height * 4) as usize]; // what the model was shown ("proxy").
+        let answer = vec![200u8; (answer_width * answer_height * 4) as usize]; // the model's answer: brighter than `base`, a real delta.
+        let target = make_target_image(&device, &mem_props, width, height);
+        // `record_temporal_delta_into_image` reads the shader's "current frame"
+        // (`u_original`) straight off `target_image`'s own live content, *not* from
+        // `base` -- the motion mask compares that against `base` ("proxy") to decide
+        // how much of the model's delta to keep. For this test to actually exercise
+        // the delta (not have the mask suppress it because the target starts
+        // uninitialized, far from `base`), `target` needs `base`'s own bytes as its
+        // starting content -- a stable/motionless frame, exactly the case
+        // `stability` should hold near its maximum for.
+        let staging = build_upload_staging(&device, &mem_props, &base);
+        let cmd = unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)) }.unwrap()[0];
+        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+        unsafe {
+            device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
+            let to_dst = image_barrier(target.image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE);
+            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_dst]);
+            device.cmd_copy_buffer_to_image(cmd, staging.0, target.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, 0)]);
+            let to_present = image_barrier(target.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::empty());
+            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[to_present]);
+            device.end_command_buffer(cmd).unwrap();
+            device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&cmd)).build()], fence).unwrap();
+            device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
+            device.destroy_buffer(staging.0, None);
+            device.free_memory(staging.1, None);
+        }
+
+        // (1) A smaller answer must still be accepted and actually change the output.
+        let sem = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, answer_width, answer_height, &base, &answer, 1, false, target.image);
+        assert!(sem.is_some(), "a genuinely smaller answer must still be composited, not rejected");
+        let sem = sem.unwrap();
+        let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+        let wait_stage = vk::PipelineStageFlags::ALL_COMMANDS;
+        unsafe {
+            device.queue_submit(queue, &[vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&wait_stage)).build()], wait_fence).unwrap();
+            device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
+            device.destroy_fence(wait_fence, None);
+        }
+        // Present->transfer-src round trip so `read_back_image` (which assumes
+        // `PRESENT_SRC_KHR`) can read it -- `present_temporal_delta_async` itself
+        // already leaves `target` in `PRESENT_SRC_KHR` (see its own barrier at the
+        // end of `record_temporal_delta_into_image`), so no extra transition needed.
+        let out = read_back_image(&device, &mem_props, queue, pool, target.image, width, height);
+        // `base` (50) is uniform, so the motion mask holds `stability` at its
+        // maximum everywhere -- the composited pixel should sit meaningfully above
+        // `base` and not still be exactly `base`, proving the (upscaled) answer
+        // really reached the shader, not a silently-empty/no-op composite.
+        let avg = out.chunks_exact(4).map(|p| p[0] as u32).sum::<u32>() / (out.len() as u32 / 4);
+        assert!(avg > 60, "composited output (avg r={avg}) should be visibly brighter than the 50-valued base if the upscaled answer reached the shader");
+
+        // (2) An answer *larger* than the frame (working_scale > 1.0, out of scope
+        // for this function -- see its own doc comment) must be rejected, not
+        // overflow the shared staging buffer.
+        let big_answer = vec![200u8; ((width + 8) * (height + 8) * 4) as usize];
+        let oversized = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width + 8, height + 8, &base, &big_answer, 2, false, target.image);
+        assert!(oversized.is_none(), "an answer larger than the frame must be safely rejected, not overflow the staging buffer");
+
+        unsafe {
+            device.device_wait_idle().unwrap();
+            device.destroy_fence(fence, None);
+            device.destroy_command_pool(pool, None);
+            target.destroy(&device);
             gpu.destroy(&device);
             device.destroy_device(None);
             instance.destroy_instance(None);
