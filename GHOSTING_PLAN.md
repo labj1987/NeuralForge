@@ -1,7 +1,100 @@
 # Ghosting: what upstream does differently, and the plan to fix it
 
-Status: **proposal for review** (2026-09-16). Nothing below is implemented except the
-rollback in §1. Decisions needed are in §5.
+Status: **in progress** (last updated 2026-09-17, overnight session). Alex reviewed and
+approved: order 1→2→3→5→4, Quality as the default mode, `working_scale` 0.75, attempt
+step 4. Step 1 was attempted and hit a real, measured obstacle (§1a) that changes its
+scope; step 4 was investigated and also turned out larger than estimated (§1b). Nothing
+new was deployed to lordnikon this session beyond what v0.1.65 already had — seeing both
+steps 1 and 4 need real Vulkan/cross-process surgery in the project's most crash-prone
+area, with Alex asleep and unable to catch a live problem, the call was to stop and hand
+back a corrected, evidence-based plan rather than gamble on lordnikon overnight.
+
+### 1a. Step 1 (`working_scale`) — the CPU approach is measured non-viable
+
+The natural-looking implementation — capture at full resolution as today, resample the
+bytes down to `working_scale × (w,h)` on the CPU before sending them over SHM, and
+resample the model's smaller answer back up before compositing — was built and tested
+(`composition::downscale::resample_rgba8`, a real, tested, separable resize reusing the
+project's existing Lanczos/Catmull-Rom/Mitchell-Netravali/Kaiser kernels, which until now
+were themselves dead code, computed but never called by anything).
+
+Measured at GTA's real resolution (2560×1440 ↔ 1920×1080, release build,
+`composition::downscale::tests::real_resolution_resample_timing`):
+
+```
+down (2560x1440 -> 1920x1080): 315 ms
+up   (1920x1080 -> 2560x1440): 546 ms
+```
+
+That is far worse than the 87 ms PCIe-BAR bug this same session fixed, and this call
+would sit inline in `capture::run` on the game's present thread. **Not wired in; not
+deployed.** The resample function itself is correct and kept (unit-tested: identity
+resize is byte-exact, flat-color resize doesn't drift, dimensions are always exact,
+a downscale→upscale roundtrip stays close to the original) — it is real groundwork, just
+not usable as-is on the hot path.
+
+**The actual fix needs to be on the GPU**: `vkCmdBlitImage` (`VK_FILTER_LINEAR`, a
+hardware-implemented resize unit) inserted into `CapturePipeline`'s existing
+image→buffer copy (shrink before the buffer, on the capture side) and into
+`composition::gpu`'s existing buffer→image upload step (grow back up, on the answer
+side) — in both cases the *existing*, already-tested compute shader (`compose.comp`)
+would keep reading full-resolution images exactly as it does today; only the resource
+sizing and one blit call per side would change. That is real, correctness-critical
+surgery on `Sized_`/`ComposeSlot` — the exact structures this project's own history
+documents as its most crash-prone — and was deliberately not attempted unsupervised
+overnight. This is the concrete next step for step 1, not a restart.
+
+### 1b. Step 4 (motion vectors) — larger than "re-enable a stub"
+
+Investigated `crates/layer/src/optical_flow.rs` (the code `prepare_motion_resources`
+currently short-circuits past). It already does something more specific than assumed:
+it creates its own **private Vulkan device** via a fresh `vkCreateDevice` call, on the
+same physical GPU, but that call happens *inside the game's own process*, invoked from
+`prepare_motion_resources` at the exact moment (per that function's own comment) "during
+a live game's swapchain transition" — which is the documented driver-crash trigger.
+
+So simply removing the early `return` would very plausibly reproduce the original
+crash: the problem was never "motion vectors are unstable," it was "creating a second
+Vulkan device from within the game's process, mid-swapchain-transition, crashes this
+driver." A private device on the same physical GPU is not automatically safe just
+because it's a separate logical device — it is still contending for the same GSP
+firmware queue from within the process the game's own device transition is disrupting.
+
+The safer design from §3's plan — computing flow **in the Windows helper process**
+instead — is a real, different architecture, not a small change: the helper is a
+separate OS process (under Wine/Proton) with its own independent Vulkan device already
+set up for NGX/DXVK-NVAPI. Moving flow computation there means:
+- A new `VK_NV_optical_flow` session on the helper's *own* device (need to confirm the
+  extension is exposed through DXVK-NVAPI's Vulkan implementation under Wine — not
+  verified yet).
+- The layer sending two consecutive captured frames (or the helper keeping its own
+  Frame[N-1]) across the existing SHM transport instead of one.
+- New protocol/SHM wiring so the helper's own computed flow reaches `DLSSNR.MVec`
+  without a round trip back through the layer.
+
+This is genuinely comparable in size to step 1, not a quick toggle, and it touches a
+second process's Vulkan setup this project has comparatively little live-tested
+experience with. Correctly identifying *why* the existing code crashes (a same-process,
+mid-transition second device — not "motion vectors are inherently unsafe") is the real
+deliverable from tonight's look at this: it means the helper-side design is still the
+right target, now for a verified reason instead of an assumed one.
+
+## 5a. Updated recommendation for Alex
+
+Both step 1 and step 4, done properly, are real Vulkan/cross-process features in the
+project's riskiest area — not something to land unsupervised overnight, and not
+something to rush now that the honest scope is known. Suggested next session, with you
+available to test live on lordnikon:
+1. Build the GPU-blit version of step 1 (§1a) — bounded, mechanical, and the existing
+   compose shader test harness (`gpu_dispatch_matches_the_cpu_reference`) extends
+   naturally to cover it.
+2. Re-measure the objective number (`capture_hot_path_cost_per_present` plus the
+   helper's own `eval=` timing) before touching step 2's synchronous mode at all — step
+   2's expected fps math (§4's table) depends on step 1's real result, not the estimate.
+3. Revisit step 4 with the helper-side design once 1–3 are landed and validated, since
+   it is now understood to be its own project-sized piece of work, not a quick unstub.
+
+The original status line below (proposal for review, 2026-09-16) is kept for history.
 
 ## 1. Where things stand tonight
 

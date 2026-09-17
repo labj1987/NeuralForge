@@ -215,6 +215,24 @@
 
 # Changelog
 
+- **Unreleased — step 1/step 4 investigation, no behavior change.** Attempted to wire
+  `working_scale` (run the model at a fraction of the frame's resolution) into
+  `capture::run`'s hot path via a CPU resample. Built and tested a real, separable
+  resize (`composition::downscale::resample_rgba8`, finally putting the project's
+  existing but previously-dead Lanczos/Catmull-Rom/Mitchell-Netravali/Kaiser kernels to
+  use) — measured at GTA's real resolution it costs 315-546 ms, far worse than the
+  87 ms bug fixed earlier tonight, and unusable inline on the present thread. Not wired
+  in; nothing new deployed. The real fix needs a GPU blit (`vkCmdBlitImage`) inserted
+  into the capture and compose pipelines instead of a CPU resize — left for a session
+  where live testing on real hardware is possible. Separately investigated re-enabling
+  motion vectors (`optical_flow.rs`): confirmed the documented crash trigger is a
+  *second Vulkan device created from within the game's own process during its
+  swapchain transition*, not motion vectors themselves being unsafe — so the
+  helper-side design in `GHOSTING_PLAN.md` (compute flow in the separate Windows
+  helper process, which already owns its own independent device) is the right target,
+  now for a verified reason. Both findings, and the corrected plan, are in
+  `GHOSTING_PLAN.md`.
+
 - **v0.1.65 — ghosting mitigation and the plan for the real fix.** Live GTA testing on
   v0.1.64 confirmed the fps fix ("great performance", 120s) with the enhancement applied,
   and ghosting still present. Tightened `compose.comp`'s `carry_delta` motion mask

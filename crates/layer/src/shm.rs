@@ -31,6 +31,27 @@ pub struct CompositionSettings {
     pub debug_view: u32,
     pub apply_model: bool,
     pub neural_enabled: bool,
+    /// What fraction of the frame's resolution the model works at -- see
+    /// [`neuralforge_protocol::ShmHeader::working_scale_bits`]'s own doc comment.
+    /// `1.0` (the default) means "model resolution == frame resolution", the only
+    /// value this pipeline supported before 2026-09-17 -- callers that skip scaling
+    /// whenever this is exactly `1.0` get the identical, unmodified code path.
+    ///
+    /// Read here but genuinely unused by any caller as of 2026-09-17 (hence the
+    /// `dead_code` allow): a real attempt to wire it into `capture::run`'s per-present
+    /// hot path used `composition::downscale::resample_rgba8` (a plain CPU resize) and
+    /// measured it at 315-546 ms at GTA's own resolution -- far worse than the 87 ms
+    /// PCIe-BAR bug this same session fixed, and unusable on the present thread. The
+    /// resample function itself is real, tested, and kept (`downscale.rs`'s own tests);
+    /// what's missing is a GPU-blit-based version (`vkCmdBlitImage`, a hardware unit,
+    /// sub-millisecond) wired into `CapturePipeline`'s capture-side buffer and
+    /// `composition::gpu`'s answer-upload step -- real Vulkan surgery in this project's
+    /// most crash-prone area, deliberately not attempted unsupervised overnight. See
+    /// `GHOSTING_PLAN.md`'s step 1 for the full account and the corrected plan.
+    #[allow(dead_code)]
+    pub working_scale: f32,
+    #[allow(dead_code)]
+    pub scaling_downscaler: u32,
 }
 
 /// One process's connection to the mapping. Not `Clone` — there is exactly one of these
@@ -196,6 +217,8 @@ impl ShmClient {
             debug_view: hdr.debug_view.load(Ordering::Relaxed),
             apply_model: hdr.apply_model.load(Ordering::Relaxed) != 0,
             neural_enabled: hdr.neural_enabled(),
+            working_scale: f32::from_bits(hdr.working_scale_bits.load(Ordering::Relaxed)),
+            scaling_downscaler: hdr.scaling_downscaler.load(Ordering::Relaxed),
         })
     }
 

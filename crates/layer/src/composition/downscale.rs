@@ -120,6 +120,150 @@ pub fn support_radius(downscaler_kind: u32) -> f32 {
     }
 }
 
+/// One axis's worth of resample weights for every output sample: `taps[i]` is the
+/// (first source index, weights starting there) pair for output index `i`. Shared by
+/// both passes of [`resample_rgba8`] -- computed once per axis, not once per pixel.
+struct AxisPlan {
+    /// `first[i]` is the smallest source index output sample `i` reads from; the
+    /// weights for it live at `weights[weight_offsets[i]..weight_offsets[i+1]]`.
+    first: Vec<i32>,
+    weight_offsets: Vec<usize>,
+    weights: Vec<f32>,
+}
+
+fn plan_axis(src_len: u32, dst_len: u32, downscaler_kind: u32) -> AxisPlan {
+    let src_len_f = src_len as f32;
+    let dst_len_f = dst_len as f32;
+    // Minifying stretches the kernel's own footprint by the minification ratio -- the
+    // standard fix for a resize filter used to downsample (an unstretched kernel
+    // would alias, sampling the source no more densely than the *output* asks for
+    // rather than respecting how much *source* detail needs to be averaged away).
+    // Magnifying uses the kernel at its native width: there's no source detail to
+    // alias away, just more output samples than input ones.
+    let scale = (src_len_f / dst_len_f).max(1.0);
+    let radius = support_radius(downscaler_kind) * scale;
+    let mut first = Vec::with_capacity(dst_len as usize);
+    let mut weight_offsets = Vec::with_capacity(dst_len as usize + 1);
+    let mut weights = Vec::new();
+    weight_offsets.push(0);
+    for i in 0..dst_len {
+        // Sample centers align pixel *centers*, not edges (`+0.5 ... -0.5`) -- the
+        // standard image-resize convention; aligning edges instead would visibly
+        // shift content toward a corner on any non-integer scale factor.
+        let center = (i as f32 + 0.5) * (src_len_f / dst_len_f) - 0.5;
+        let lo = (center - radius).floor() as i32;
+        let hi = (center + radius).ceil() as i32;
+        let start_len = weights.len();
+        let mut sum = 0.0f32;
+        for tap in lo..=hi {
+            let x = (tap as f32 - center) / scale;
+            let w = kernel(x, downscaler_kind);
+            weights.push(w);
+            sum += w;
+        }
+        // Renormalize so the taps actually used (after the edge-clamp in the caller
+        // folds outside-source taps back onto the nearest valid one) still sum to
+        // exactly 1 -- otherwise a resize near the border measurably dims or
+        // brightens that edge, and finite-precision kernel evaluation dims/brightens
+        // very slightly everywhere even ignoring edges.
+        if sum.abs() > 1e-6 {
+            for w in &mut weights[start_len..] {
+                *w /= sum;
+            }
+        }
+        first.push(lo);
+        weight_offsets.push(weights.len());
+    }
+    AxisPlan { first, weight_offsets, weights }
+}
+
+/// Resamples an interleaved RGBA8 buffer from `(src_w, src_h)` to `(dst_w, dst_h)`
+/// using the [`neuralforge_protocol::enums::downscaler`] kernel named by
+/// `downscaler_kind`, applied separably (horizontal pass, then vertical) exactly as
+/// this module's own doc comment says every kernel here is meant to be used. Works in
+/// either direction -- minifying (sending a smaller proxy to the model) or magnifying
+/// (bringing its smaller answer back up to the frame's own resolution) -- since an
+/// interpolating resize kernel is standard for both (this is not a downscale-only
+/// operation despite the module's name). Edge taps clamp to the nearest valid source
+/// pixel rather than reading out of bounds (standard "clamp to edge" resize
+/// behavior). Identity-sized calls (`src_w==dst_w && src_h==dst_h`) skip all of the
+/// above and copy the exact input bytes -- every caller's behavior before this
+/// function existed, still exact when scaling is off.
+///
+/// `src` must hold at least `src_w * src_h * 4` bytes; a shorter buffer is treated as
+/// all-zero padding rather than panicking, matching this crate's general "never crash
+/// the game over a malformed frame" discipline. Returns exactly `dst_w * dst_h * 4`
+/// bytes.
+pub fn resample_rgba8(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32, downscaler_kind: u32) -> Vec<u8> {
+    let dst_len = (dst_w as usize) * (dst_h as usize) * 4;
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+        return vec![0u8; dst_len];
+    }
+    if src_w == dst_w && src_h == dst_h {
+        let mut out = vec![0u8; dst_len];
+        let n = out.len().min(src.len());
+        out[..n].copy_from_slice(&src[..n]);
+        return out;
+    }
+    let get = |x: i32, y: i32, c: usize| -> f32 {
+        let x = x.clamp(0, src_w as i32 - 1) as usize;
+        let y = y.clamp(0, src_h as i32 - 1) as usize;
+        let idx = (y * src_w as usize + x) * 4 + c;
+        src.get(idx).copied().unwrap_or(0) as f32
+    };
+
+    let plan_x = plan_axis(src_w, dst_w, downscaler_kind);
+    let plan_y = plan_axis(src_h, dst_h, downscaler_kind);
+
+    // Horizontal pass: (src_w, src_h) -> (dst_w, src_h), still in f32 (a resize
+    // filter's weights are signed and can overshoot 0..255 mid-computation --
+    // clamping only happens once, on the final byte write below).
+    let mut mid = vec![0f32; (dst_w as usize) * (src_h as usize) * 4];
+    for y in 0..src_h as i32 {
+        for (x, &first) in plan_x.first.iter().enumerate() {
+            let w_range = plan_x.weight_offsets[x]..plan_x.weight_offsets[x + 1];
+            let weights = &plan_x.weights[w_range];
+            let mut acc = [0f32; 4];
+            for (t, &w) in weights.iter().enumerate() {
+                let sx = first + t as i32;
+                for c in 0..4 {
+                    acc[c] += get(sx, y, c) * w;
+                }
+            }
+            let out_idx = (y as usize * dst_w as usize + x) * 4;
+            mid[out_idx..out_idx + 4].copy_from_slice(&acc);
+        }
+    }
+
+    // Vertical pass: (dst_w, src_h) -> (dst_w, dst_h), reading `mid` with the same
+    // edge-clamp convention as `get` above (min/max instead of `get`'s modulo-free
+    // clamp since `mid` is already a plain, fully populated buffer, not the original
+    // sparse-length-tolerant `src`).
+    let mid_get = |x: usize, y: i32, c: usize| -> f32 {
+        let y = y.clamp(0, src_h as i32 - 1) as usize;
+        mid[(y * dst_w as usize + x) * 4 + c]
+    };
+    let mut out = vec![0u8; dst_len];
+    for x in 0..dst_w as usize {
+        for (y, &first) in plan_y.first.iter().enumerate() {
+            let w_range = plan_y.weight_offsets[y]..plan_y.weight_offsets[y + 1];
+            let weights = &plan_y.weights[w_range];
+            let mut acc = [0f32; 4];
+            for (t, &w) in weights.iter().enumerate() {
+                let sy = first + t as i32;
+                for c in 0..4 {
+                    acc[c] += mid_get(x, sy, c) * w;
+                }
+            }
+            let out_idx = (y * dst_w as usize + x) * 4;
+            for c in 0..4 {
+                out[out_idx + c] = acc[c].round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +336,94 @@ mod tests {
     fn unknown_downscaler_falls_back_to_lanczos3() {
         assert_eq!(kernel(0.5, downscaler::FSR1), kernel(0.5, downscaler::LANCZOS3));
         assert_eq!(kernel(0.5, 999), kernel(0.5, downscaler::LANCZOS3));
+    }
+
+    fn gradient_rgba8(w: u32, h: u32) -> Vec<u8> {
+        (0..(w as usize * h as usize))
+            .flat_map(|i| {
+                let x = (i % w as usize) as u8;
+                let y = (i / w as usize) as u8;
+                [x, y, x.wrapping_add(y), 255]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn identity_resize_is_byte_for_byte_the_input() {
+        let src = gradient_rgba8(37, 23);
+        for &d in &[downscaler::LANCZOS3, downscaler::BICUBIC, downscaler::CATMULL_ROM] {
+            let out = resample_rgba8(&src, 37, 23, 37, 23, d);
+            assert_eq!(out, src, "identity resize must be an exact copy, kernel {d}");
+        }
+    }
+
+    #[test]
+    fn resizing_a_flat_colour_image_stays_that_colour() {
+        // A constant-color source is the sharpest test of weight normalization: any
+        // bug that leaves per-tap weights not summing to 1 (a clamped edge tap, a
+        // stretched-kernel miscalculation) shows up as the output drifting off the
+        // flat input color, brightest right at the border where edge-clamping bites
+        // hardest.
+        let (w, h) = (16u32, 12u32);
+        let src: Vec<u8> = (0..(w as usize * h as usize)).flat_map(|_| [200u8, 100, 50, 255]).collect();
+        for &d in &[downscaler::LANCZOS3, downscaler::BICUBIC, downscaler::CATMULL_ROM, downscaler::KAISER3] {
+            for (dw, dh) in [(11u32, 9u32), (23, 17), (16, 12)] {
+                let out = resample_rgba8(&src, w, h, dw, dh, d);
+                assert_eq!(out.len(), (dw as usize) * (dh as usize) * 4);
+                for px in out.chunks_exact(4) {
+                    assert!(
+                        (px[0] as i32 - 200).abs() <= 1 && (px[1] as i32 - 100).abs() <= 1 && (px[2] as i32 - 50).abs() <= 1,
+                        "flat-color resize {w}x{h}->{dw}x{dh} kernel {d} drifted to {px:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn downscale_then_upscale_roundtrip_stays_close_to_the_original() {
+        // Not a golden pixel-exact reference (a resize this general has no simple
+        // closed form) -- a coarse but real correctness check: shrinking then
+        // growing a smooth gradient back to its original size should reproduce
+        // something close to the original, not garbage from a transposed axis or an
+        // off-by-one in the tap window.
+        let (w, h) = (64u32, 48u32);
+        let src = gradient_rgba8(w, h);
+        let small = resample_rgba8(&src, w, h, 48, 36, downscaler::LANCZOS3);
+        let back = resample_rgba8(&small, 48, 36, w, h, downscaler::LANCZOS3);
+        assert_eq!(back.len(), src.len());
+        let max_diff = src.iter().zip(back.iter()).map(|(a, b)| (*a as i32 - *b as i32).unsigned_abs()).max().unwrap();
+        assert!(max_diff <= 40, "downscale/upscale roundtrip drifted too far: max per-channel diff {max_diff}");
+    }
+
+    #[test]
+    fn output_dimensions_are_always_exact() {
+        for (sw, sh, dw, dh) in [(2560u32, 1440u32, 1920u32, 1080u32), (1920, 1080, 2560, 1440), (1, 1, 5, 5), (5, 5, 1, 1)] {
+            let src = gradient_rgba8(sw, sh);
+            let out = resample_rgba8(&src, sw, sh, dw, dh, downscaler::LANCZOS3);
+            assert_eq!(out.len(), (dw as usize) * (dh as usize) * 4, "{sw}x{sh}->{dw}x{dh}");
+        }
+    }
+
+    #[test]
+    fn real_resolution_resample_timing() {
+        // Not a pass/fail assertion -- this project's `working_scale` runs this
+        // function inline on the game's present thread (see `capture::run`'s own
+        // doc comments on why CPU cost there is exactly what caused the v0.1.64 fps
+        // collapse), so the honest cost at real dimensions needs to be visible in
+        // every test run, not just asserted "fast enough" against a guessed bound.
+        let (w, h) = (2560u32, 1440u32);
+        let (mw, mh) = (1920u32, 1080u32);
+        let full = gradient_rgba8(w, h);
+        let small = gradient_rgba8(mw, mh);
+        let t = std::time::Instant::now();
+        let down = resample_rgba8(&full, w, h, mw, mh, downscaler::LANCZOS3);
+        let down_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let t = std::time::Instant::now();
+        let up = resample_rgba8(&small, mw, mh, w, h, downscaler::LANCZOS3);
+        let up_ms = t.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(down.len(), (mw as usize) * (mh as usize) * 4);
+        assert_eq!(up.len(), (w as usize) * (h as usize) * 4);
+        println!("resample_rgba8 timing @ 2560x1440<->1920x1080 (debug build): down={down_ms:.2}ms up={up_ms:.2}ms");
     }
 }
