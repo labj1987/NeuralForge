@@ -215,6 +215,19 @@
 
 # Changelog
 
+- **v0.1.65 — ghosting mitigation and the plan for the real fix.** Live GTA testing on
+  v0.1.64 confirmed the fps fix ("great performance", 120s) with the enhancement applied,
+  and ghosting still present. Tightened `compose.comp`'s `carry_delta` motion mask
+  (0.005..0.032 threshold, cubic falloff) — the best of three variants tried live against
+  GTA's built-in benchmark ("closer to upstream"); a variant scaling the threshold by the
+  model's own edit strength made the picture worse and was reverted. This is a band-aid:
+  the ghost is structural (an answer computed ~26 ms ago re-applied onto frames that have
+  since moved). `GHOSTING_PLAN.md` records what upstream does instead — synchronous
+  per-frame presentation, the model at ~0.75 scale, optical-flow motion vectors with
+  history — and the proposed steps (wire `working_scale`, a synchronous "Quality" mode,
+  an explicit `DLSSNR.Reset` policy, real motion vectors, and closing the layer-deploy
+  gap where AppImage updates never refresh the installed layer `.so`).
+
 ## 0.1.30 — 2026-09-11
 
 - **Fixed the AppImage update mechanism itself** — reported live: "I cannot update

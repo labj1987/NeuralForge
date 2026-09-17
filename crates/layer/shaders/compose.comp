@@ -200,11 +200,32 @@ void main() {
   vec3 model = SrgbDecode(bgr ? imageLoad(u_model_answer, pixel).bgr : imageLoad(u_model_answer, pixel).rgb);
 
   if (params.carry_delta != 0u) {
-    // A model result belongs to `proxy`'s older frame.  Carry its delta only
-    // where the current pixel still resembles that source: camera movement then
-    // presents the clean current frame instead of dragging old scenery across it.
+    // A model result belongs to `proxy`'s older frame. Carry its delta only where the
+    // current pixel still resembles that source, so camera/object movement presents the
+    // clean current frame instead of dragging the old, spatially-fixed enhancement
+    // across it -- that drag is exactly the ghosting reported at real-hardware testing
+    // (2026-09-16). Two levers make the suppression bite harder than the original
+    // 0.015..0.10 range, which was too loose (stale enhancement leaked onto moved
+    // content):
+    //   1. A tight smoothstep (0.005..0.032): a pixel that changed by more than ~3.2%
+    //      in any channel since the model saw it is treated as fully moved, its stale
+    //      delta dropped entirely; below ~0.5% it is held static and gets the full
+    //      delta. Anything in between fades proportionally.
+    //   2. Cubing `stability` biases the fade hard toward suppression across that whole
+    //      transition band, so partial motion loses the ghost quickly while genuinely
+    //      static enhancement (stability near 1) is barely touched.
+    // Net tradeoff: the enhancement fades sooner during motion (least visible exactly
+    // when things move) in exchange for less ghost trail. Tuned live against GTA's
+    // built-in benchmark 2026-09-16 (see GHOSTING_PLAN.md for the full record): this
+    // was the best of three variants tried -- fewer ghosts than the original at the
+    // same fps. A further variant that scaled the threshold by the model's own edit
+    // strength (`|model - proxy|`) was tried and rejected: it made the picture visibly
+    // worse. This mask is a mitigation, not the fix -- a stale delta on moved content
+    // cannot be made ghost-free without knowing where the content went (motion
+    // vectors) or not carrying stale deltas at all; GHOSTING_PLAN.md has the plan.
     float motion = max(max(abs(original.r - proxy.r), abs(original.g - proxy.g)), abs(original.b - proxy.b));
-    float stability = 1.0 - smoothstep(0.015, 0.10, motion);
+    float stability = 1.0 - smoothstep(0.005, 0.032, motion);
+    stability *= stability * stability;
     vec3 encoded = SrgbEncode(clamp(original + (model - proxy) * stability, 0.0, 1.0));
     imageStore(u_output, pixel, vec4(bgr ? encoded.bgr : encoded, 1.0));
     return;
