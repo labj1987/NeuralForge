@@ -179,6 +179,23 @@ fn build_model_scratch(
     // image (same 32-bit compatibility class), so `encode.comp`'s `rgba8` qualifier is
     // correct against the view rather than relying on a driver tolerating a mismatch.
     let want_encode = encode.is_some() && crate::composition::encode_pass::supports_storage(instance, physical_device, format);
+    // Logged once per process, because "is the encode actually running" cannot be read
+    // off the self-check below: on SDR content the encode's own effect is small, so an
+    // unencoded proxy and a correctly encoded one produce similar deltas against the
+    // reference. This line is the unambiguous signal.
+    {
+        static ANNOUNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !ANNOUNCED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            if want_encode {
+                crate::log!("[encode] active: dispatching over the {width}x{height} scratch ({format:?}), composition uses mode 2");
+            } else if encode.is_none() {
+                crate::log!("[encode] unavailable: the encode pipeline itself failed to build, composition stays on mode 1");
+            } else {
+                crate::log!("[encode] unavailable: {format:?} has no STORAGE_IMAGE support on this device, composition stays on mode 1");
+            }
+            crate::logging::flush();
+        }
+    }
     let mut usage = vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC;
     let mut create_flags = vk::ImageCreateFlags::empty();
     if want_encode {
@@ -725,6 +742,34 @@ fn poll_or_submit_capture(
         let (full, model_dims) = poll_pipeline_capture(p, slot, device, original_scratch, model_scratch);
         if full.is_some() {
             if let Some((mw, mh)) = model_dims {
+                // Encode self-check, once per process: the untouched frame and the
+                // GPU-encoded proxy are both sitting in CPU memory right here, so the
+                // GPU's answer can be compared against the arithmetic it was supposed
+                // to perform -- real-hardware verification of the encode that needs
+                // nobody to look at a screen. Only possible when the proxy is
+                // pixel-aligned with the frame, which means a working scale of exactly
+                // 1.0; at any other scale it logs nothing rather than comparing
+                // different rasters. See `composition::encode::compare_to_reference`
+                // for what a given delta does and does not prove.
+                static CHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if (mw, mh) == (width, height) && !CHECKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    match crate::composition::encode::compare_to_reference(
+                        original_scratch,
+                        model_scratch,
+                        encode_push.bgr_order != 0,
+                        encode_push.white_point,
+                        encode_push.reversible_mode,
+                    ) {
+                        Some((max_delta, mean_delta, pixels)) => crate::log!(
+                            "[encode] self-check vs CPU reference: max_delta={max_delta} mean_delta={mean_delta:.4} over {pixels} px                              (white_point={} reversible_mode={} bgr_order={}) -- 0-2 is rounding, large means the GPU path is wrong",
+                            encode_push.white_point,
+                            encode_push.reversible_mode,
+                            encode_push.bgr_order,
+                        ),
+                        None => crate::log!("[encode] self-check skipped: proxy and frame are different rasters"),
+                    }
+                    crate::logging::flush();
+                }
                 shm.set_frame_info(slot, mw, mh, proxy_format);
                 shm.write_proxy(slot, model_scratch);
                 return Some((mw, mh));

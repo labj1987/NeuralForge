@@ -125,6 +125,77 @@ pub fn encode_proxy(frame_linear: [f32; 3], white_point: f32, mode: u32) -> [f32
     }
 }
 
+fn srgb_decode_byte(byte: u8) -> f32 {
+    let c = f32::from(byte) / 255.0;
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn srgb_encode_byte(linear: f32) -> u8 {
+    let c = linear.clamp(0.0, 1.0);
+    let encoded = if c <= 0.0031308 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
+    (encoded.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+/// The whole encode on one RGBA8 pixel, byte in and byte out -- the CPU twin of what
+/// `shaders/encode.comp` does on the GPU, for exactly the same inputs.
+pub fn reference_encode_pixel(pixel: [u8; 4], bgr_order: bool, white_point: f32, mode: u32) -> [u8; 4] {
+    let (r, g, b) = if bgr_order { (pixel[2], pixel[1], pixel[0]) } else { (pixel[0], pixel[1], pixel[2]) };
+    let linear = [srgb_decode_byte(r), srgb_decode_byte(g), srgb_decode_byte(b)];
+    let display = encode_proxy(linear, white_point, mode);
+    let out = [srgb_encode_byte(display[0]), srgb_encode_byte(display[1]), srgb_encode_byte(display[2])];
+    if bgr_order {
+        [out[2], out[1], out[0], pixel[3]]
+    } else {
+        [out[0], out[1], out[2], pixel[3]]
+    }
+}
+
+/// Checks a GPU-produced proxy against this module's own CPU reference, pixel for
+/// pixel, and reports `(max_channel_delta, mean_channel_delta, pixels_compared)`.
+///
+/// This is what makes the encode verifiable on real hardware without anyone looking at
+/// a screen: the layer holds the untouched frame and the encoded proxy in CPU memory at
+/// the same moment, so the GPU's answer can simply be compared to the arithmetic it was
+/// supposed to perform. A max delta of 0-2 is rounding; anything large means the GPU
+/// path is wrong (a channel-order mistake shows up immediately and hugely, since red
+/// and blue diverge far more than one count).
+///
+/// `None` when the two buffers do not describe the same raster -- the proxy is only
+/// pixel-aligned with the frame at a working scale of exactly 1.0, so a caller wanting
+/// this check has to ask for that scale.
+pub fn compare_to_reference(
+    original_rgba: &[u8],
+    proxy_rgba: &[u8],
+    bgr_order: bool,
+    white_point: f32,
+    mode: u32,
+) -> Option<(u8, f32, usize)> {
+    if original_rgba.len() != proxy_rgba.len() || original_rgba.len() < 4 {
+        return None;
+    }
+    let mut max_delta = 0u8;
+    let mut total = 0u64;
+    let mut channels = 0usize;
+    for (frame, got) in original_rgba.chunks_exact(4).zip(proxy_rgba.chunks_exact(4)) {
+        let want = reference_encode_pixel([frame[0], frame[1], frame[2], frame[3]], bgr_order, white_point, mode);
+        // Alpha is carried through untouched by both paths, so only colour is compared.
+        for i in 0..3 {
+            let delta = want[i].abs_diff(got[i]);
+            max_delta = max_delta.max(delta);
+            total += u64::from(delta);
+            channels += 1;
+        }
+    }
+    if channels == 0 {
+        return None;
+    }
+    Some((max_delta, total as f32 / channels as f32, channels / 3))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,6 +300,66 @@ mod tests {
             let out = encode_proxy([0.0, 0.0, 0.0], 1.0, mode);
             assert!(out.iter().all(|c| close(*c, 0.0)), "mode {mode} moved black: {out:?}");
         }
+    }
+
+    #[test]
+    fn comparing_a_reference_encode_against_itself_is_exact() {
+        // The self-check has to be exact on its own output, or a real GPU delta could
+        // not be distinguished from the check's own noise.
+        let frame: Vec<u8> = (0..64u32).flat_map(|i| [(i * 3) as u8, (i * 5) as u8, (i * 7) as u8, 255]).collect();
+        let encoded: Vec<u8> = frame
+            .chunks_exact(4)
+            .flat_map(|p| reference_encode_pixel([p[0], p[1], p[2], p[3]], false, 1.0, reversible_mode::KNEE))
+            .collect();
+        let (max, mean, pixels) = compare_to_reference(&frame, &encoded, false, 1.0, reversible_mode::KNEE).expect("same raster");
+        assert_eq!(max, 0, "reference disagreed with itself");
+        assert_eq!(mean, 0.0);
+        assert_eq!(pixels, 64);
+    }
+
+    #[test]
+    fn the_self_check_catches_a_swapped_channel_order() {
+        // The single most likely GPU-side mistake, and the one that is invisible in
+        // unit tests of the curves alone. Encoding with the wrong order has to show up
+        // as a large delta, not a rounding-sized one.
+        //
+        // The pixels have to be *bright* and asymmetric for this to be a real test. On
+        // an 8-bit display-referred frame with a white point of 1.0 the normalized
+        // values never exceed 1.0, so the peak clamp never fires and the knee only
+        // fires above 0.75 luminance -- below that the encode is the identity, under
+        // which a channel swap is symmetric on the way in and out and cancels exactly.
+        // (That is also why the encode changes little in an SDR midtone: its work is in
+        // the highlights. See `compose.comp`'s mode 2, which is what makes the ratio
+        // non-degenerate regardless of how much the encode moved.)
+        // Where the encode is order-sensitive at all is narrower than it looks, and
+        // worth stating because it bounds what this check can prove:
+        //
+        //   * below 0.75 luminance the knee is the identity, and a swap applied on the
+        //     way in and undone on the way out cancels exactly;
+        //   * once the peak clamp fires, the net scale is `1/peak` -- and peak is the
+        //     max over the three channels, which does not care about their order, so a
+        //     swap cancels exactly there too;
+        //   * in between -- knee firing, peak still inside the cube -- the scale comes
+        //     from luminance, which weights the channels unequally, and a swap shows.
+        //
+        // So the check catches an order mistake on bright in-gamut content and is blind
+        // to one on dark or clipped content. That is a property of the encode, not of
+        // the check; a small delta here is not proof the order is right.
+        let frame: Vec<u8> = (0..32u32).flat_map(|i| [255u8, 250, (i * 2) as u8, 255]).collect();
+        let wrong_order: Vec<u8> = frame
+            .chunks_exact(4)
+            .flat_map(|p| reference_encode_pixel([p[0], p[1], p[2], p[3]], true, 1.0, reversible_mode::KNEE))
+            .collect();
+        let (max, _, _) = compare_to_reference(&frame, &wrong_order, false, 1.0, reversible_mode::KNEE).expect("same raster");
+        assert!(max > 4, "a swapped channel order only moved {max} counts -- the check would not catch it");
+    }
+
+    #[test]
+    fn the_self_check_refuses_mismatched_rasters_rather_than_reporting_nonsense() {
+        // At any working scale below 1.0 the proxy is smaller than the frame, and
+        // comparing them pixel-for-pixel would be meaningless rather than merely
+        // imprecise.
+        assert!(compare_to_reference(&[0; 64], &[0; 32], false, 1.0, reversible_mode::KNEE).is_none());
     }
 
     #[test]
