@@ -131,6 +131,52 @@ confirmed**: the visual result (does the enhancement still look correct at the
 now-blit-upscaled resolution, any softness from the linear-only filter) -- that needs
 Alex's own eyes, same as every visual check this project has ever needed.
 
+## 1d. Post-relicense: reading upstream's real present hook and helper confirms the
+full architecture (2026-09-17, third pass, licensing no longer a constraint)
+
+With the clean-room boundary gone, read `layer_linux/src/layer.cpp` (the real
+`vkQueuePresentKHR` hook) and `helper/main.cpp` (the real per-frame helper loop)
+directly. Two things earlier passes got wrong or left unconfirmed, now settled by the
+actual code:
+
+**Upstream's presentation is genuinely, unconditionally synchronous — not "re-anchored
+with no wait" as §1a's reading of the shader comment alone suggested.**
+`ProcessPresent` (`layer.cpp`): leg 1 (capture) submits and **blocks**
+(`vkWaitForFences`) every frame; the round trip to the helper
+(`ShmProcessFrame`) is called **inline, synchronously, on the present thread**, no
+frame-skip, no throttle, unconditionally on every single present; leg 2 (compose)
+submits without waiting (its fence is collected lazily at the top of the *next*
+frame). So every displayed frame really did just finish a real model evaluation —
+that's the actual reason the ratio-transfer/no-suppression math in the shader holds up
+for them: not cleverness in the formula, but the architecture never lets `proxy`/
+`model` fall more than about one frame behind `original`. This *is* exactly this
+project's own "step 2" (a synchronous "Quality" mode), confirmed as upstream's *only*
+mode, not an optional extra. It only works because of the next point:
+
+**Real motion vectors live entirely in the helper, not the layer.** `helper/main.cpp`'s
+`NeuralState` owns `OpticalFlowState flow` directly alongside the NGX model state —
+one `VkCtx`, created once at helper startup, used for both NGX evaluation and NVOF.
+`SetupOpticalFlow`/`RunOpticalFlow` are called from the helper's own already-running
+per-frame loop (never from a game-process swapchain-transition hook — confirming
+§1b's conclusion), and every failure path disables flow and logs rather than crashing
+the helper (`Log("[helper] estimated motion vectors unavailable")`). Scene-cut
+detection (`DetectSceneCut`) runs on the CPU against the raw SHM proxy bytes the
+helper already has. Upstream's own comment: "The layer hands over a finished
+swapchain image and nothing else, so the field is estimated here... rather than read
+from a game that has one" — confirming real engine motion vectors were never on the
+table for either project; NVOF estimation is the actual technique either way.
+
+**What this changes about the plan:** step 4 (motion vectors) is now the best-scoped,
+lowest-risk item left — build it in `neuralforge-helper` (Rust, Windows-side), lazily,
+fail-soft, exactly mirroring this proven pattern; it never needs to touch the game
+process or the layer's own device at all. Step 2 (synchronous mode) is also more
+realistic than earlier estimated: tonight's `working_scale` fix already brought eval
+to ~11ms p50 at 0.75 scale on real hardware — within reach of a real frame budget at
+60-80fps, which is in the range Alex just measured live on the *current* async
+design anyway. Doing step 2 for real would trade nothing for something: same
+ballpark fps, ghosting eliminated at the root instead of mitigated by the mode-1
+compose formula.
+
 ## 5a. Updated recommendation for Alex
 
 Both step 1 and step 4, done properly, are real Vulkan/cross-process features in the
