@@ -84,12 +84,22 @@ sh_remote "export DISPLAY=:0 WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user
              XAUTHORITY=\$(ls -t /run/user/1000/.mutter-Xwaylandauth.* 2>/dev/null | head -1); \
            setsid nohup /home/alex/.local/share/Steam/ubuntu12_32/steam -applaunch $APP_ID >/tmp/rig-test-launch.log 2>&1 & sleep 3; echo launched"
 
-say "waiting for the layer to actually present frames (up to 8 minutes)"
-# The Rockstar launcher and story load take minutes and cannot be scripted past; the
-# layer's own frame counter moving is the only reliable "we are really rendering" signal.
+say "waiting for the Rockstar launcher to actually start the game"
+# Measured: the launcher's own startup plus its cloud-save sync took over six minutes,
+# which used to be charged against the game's load time and made the wait below time
+# out roughly a minute after the game finally started. The two waits are separate now.
+sh_remote "for i in \$(seq 1 120); do
+    if pgrep -f 'GTA5_Enhanced[.]exe' >/dev/null 2>&1; then echo \"game process up after \$((i*5))s\"; exit 0; fi
+    sleep 5
+  done; echo 'TIMED OUT: the launcher never started the game'; exit 1"
+
+say "waiting for the layer to actually present frames (up to 10 minutes from game start)"
+# The layer's own frame counter moving is the only reliable "we are really rendering and
+# really capturing" signal -- the game can be up, windowed and burning CPU while capture
+# never triggers (see the pass_through/GENERAL gate in device.rs).
 sh_remote "export NEURALFORGE_SHM=$SHM NEURALFORGE_UID=1000
   start=\$('$CLI' shmctl status | awk -F= '/^layer_frames=/{print \$2}')
-  for i in \$(seq 1 96); do
+  for i in \$(seq 1 120); do
     sleep 5
     now=\$('$CLI' shmctl status | awk -F= '/^layer_frames=/{print \$2}')
     if [ \"\$now\" != \"\$start\" ]; then echo \"frames flowing after \$((i*5))s (layer_frames \$start -> \$now)\"; exit 0; fi
@@ -107,6 +117,9 @@ sh_remote "export NEURALFORGE_SHM=$SHM NEURALFORGE_UID=1000
   echo \"presented fps: \$(( (b - a) / $SAMPLE ))\"
   echo \"helper round trips/s: \$(( (h1 - h0) / $SAMPLE ))\"
   '$CLI' shmctl status | grep -E 'helper_state|model_up|helper_upload_ms|helper_eval_ms|helper_readback_ms|layer_ms|working_scale|max_ratio|transfer_strength|colour_strength|reversible_mode'"
+
+say "why capture did or did not trigger"
+sh_remote "journalctl --since '25 min ago' -o cat 2>/dev/null | grep -E 'present skipped' | tail -3 || echo 'no skip reasons logged (capture triggered normally)'"
 
 say "encode verification, straight from the layer's own log"
 sh_remote "journalctl --since '15 min ago' -o cat 2>/dev/null | grep -E '\[encode\]' | tail -5 || echo 'no [encode] lines -- the encode never ran'"

@@ -656,6 +656,39 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 let tap = state.tap_sources_by_destination.get(&image).and_then(|source|
                     state.tapped_source_layouts.get(source).map(|layout| (*source, *layout)));
                 if sw.pass_through && !matches!(tap, Some((_, vk::ImageLayout::GENERAL))) {
+                    // Why this frame produced no enhancement at all, said out loud.
+                    //
+                    // A pass-through swapchain can still be composed onto *if* the
+                    // game's own render source (the image it blits into the swapchain)
+                    // is tracked and currently in GENERAL. That is a layout
+                    // coincidence: the tracked layout oscillates
+                    // GENERAL -> TRANSFER_SRC_OPTIMAL -> GENERAL as the game records
+                    // its own barriers, so whether present lands on a GENERAL means
+                    // the difference between "the app enhances the frame" and "the app
+                    // silently does nothing". Both have really happened on the same
+                    // build minutes apart, which is exactly why this needs to be
+                    // diagnosable from a log rather than guessed at.
+                    //
+                    // Logged once per distinct reason so it identifies the state
+                    // without joining the per-barrier spam.
+                    static REPORTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+                    let reason = match tap {
+                        None => 0u32,
+                        Some((_, layout)) => layout.as_raw().unsigned_abs().wrapping_add(1),
+                    };
+                    if REPORTED.swap(reason, std::sync::atomic::Ordering::Relaxed) != reason {
+                        match tap {
+                            None => crate::log!(
+                                "[layer] present skipped: swapchain is pass_through and this image has no tracked render source \
+                                 -- nothing to compose from, so this frame is untouched"
+                            ),
+                            Some((_, layout)) => crate::log!(
+                                "[layer] present skipped: swapchain is pass_through and its render source is in {layout:?}, not GENERAL \
+                                 -- capture only triggers on GENERAL, so this frame is untouched"
+                            ),
+                        }
+                        crate::logging::flush();
+                    }
                     continue;
                 }
                 if !claim_primary(self.device.handle(), sc, sw.width, sw.height) {
