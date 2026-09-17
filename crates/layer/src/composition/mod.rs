@@ -14,4 +14,5 @@
 pub mod apply;
 pub mod color;
 pub mod downscale;
+pub mod encode;
 pub mod gpu;

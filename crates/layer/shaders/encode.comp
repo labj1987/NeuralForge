@@ -1,0 +1,138 @@
+#version 450
+
+// The encode pass: builds the proxy the model is actually shown.
+//
+// Ported from DLSS5VKLayer's `dlssnr.hlsl` (AGPL-3.0), which describes leg 1 of the
+// pass as `swapchain -> frame -> ENCODE -> proxy (+ the untouched keep)`. Until this
+// existed, this project skipped the encode entirely and handed the model a
+// bit-identical copy of the frame. Two consequences, both measured live:
+//
+//   * The ratio transfer (`compose.comp`'s mode 0, upstream's own resolve) degenerates
+//     when `proxy == original` -- its rescale target collapses to the frame itself and
+//     the model's answer is discarded. That is what pushed this project onto an
+//     additive path with a per-pixel motion mask, and that mask re-derives from noisy
+//     frame deltas every frame, which is visible as shimmer.
+//   * The model is shown blown highlights instead of gradation. Upstream: "the model
+//     is never shown a field of flat white whose blown pixels flip between frames --
+//     unstable input is unstable output".
+//
+// The curve is a pure function of the pixel, so the resolve can reproduce it exactly
+// rather than needing the encoded proxy kept around at full resolution.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// In-place: reads the captured frame's bytes and writes the encoded proxy over them.
+// Safe as a single dispatch because every invocation touches only its own pixel.
+//
+// Declared `rgba8` and swizzled through `bgr_order` rather than being given a BGRA
+// view, matching `compose.comp`: this project's own images are always the R8G8B8A8
+// twin, carrying whatever channel order the real swapchain uses, and the shader is
+// told which that is. See `compose.comp`'s `bgr_order` comment.
+layout(binding = 0, rgba8) uniform image2D u_proxy;
+
+layout(push_constant) uniform Params {
+  // What the model should treat as white. The resolve undoes this divide.
+  float white_point;
+  uint bgr_order;
+  // 0: the classic soft knee (upstream's default, and this pass's).
+  // 1/2: the unclipped Neutwo proxy. >=3: the hybrid curve.
+  uint reversible_mode;
+} params;
+
+float Luminance(vec3 rgb) {
+  return dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+}
+
+vec3 SrgbDecode(vec3 c) {
+  bvec3 lo = lessThanEqual(c, vec3(0.04045));
+  vec3 hi = pow((c + 0.055) / 1.055, vec3(2.4));
+  return mix(hi, c / 12.92, lo);
+}
+
+vec3 SrgbEncode(vec3 c) {
+  c = clamp(c, 0.0, 1.0);
+  bvec3 lo = lessThanEqual(c, vec3(0.0031308));
+  vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
+  return clamp(mix(hi, c * 12.92, lo), 0.0, 1.0);
+}
+
+// A soft knee instead of a hard ceiling: anything above 0.75 luminance is rolled off
+// rather than clipped. The per-channel headroom afterwards is not cosmetic -- the
+// roll-off is on luminance, in which blue counts for seven percent, so a saturated
+// blue can sit above 1.0 with a low luminance, pass the knee untouched, and then be
+// clipped by the encode's own saturate. Clipping one channel of a triple is a hue
+// rotation: upstream measured exactly that as "the green cast over every blue thing in
+// GTA V" -- the sky, the denim, the minimap. One scalar on the whole triple cannot
+// move hue, so the peak channel is brought to 1 that way instead.
+vec3 SoftKnee(vec3 display) {
+  float display_luma = Luminance(display);
+  if (display_luma > 0.75) {
+    float rolled = 0.75 + 0.25 * (1.0 - exp(-(display_luma - 0.75) / 0.25));
+    display *= rolled / display_luma;
+  }
+  float peak = max(display.r, max(display.g, display.b));
+  if (peak > 1.0) {
+    display /= peak;
+  }
+  return display;
+}
+
+// [0, inf) -> [0, 1) with no clip point, applied as one scalar on the peak channel so
+// the three channels keep their ratios and hue cannot bend.
+float Neutwo(float x) {
+  return x * inversesqrt(x * x + 1.0);
+}
+
+vec3 NeutwoEncode(vec3 v) {
+  v = max(v, vec3(0.0));
+  float m = max(v.r, max(v.g, v.b));
+  if (m <= 1e-6) {
+    return v;
+  }
+  return v * (Neutwo(m) / m);
+}
+
+// Identity below the knee -- so midtones are exactly what the soft knee already gave
+// -- and an unclipped Neutwo-of-the-excess above it, so highlights get the gradation
+// the model needs. C1-continuous at the knee.
+float HybridCurve(float m) {
+  const float k = 0.75;
+  if (m <= k) {
+    return m;
+  }
+  float e = (m - k) / (1.0 - k);
+  return k + (1.0 - k) * (e * inversesqrt(e * e + 1.0));
+}
+
+vec3 HybridEncode(vec3 v) {
+  v = max(v, vec3(0.0));
+  float m = max(v.r, max(v.g, v.b));
+  if (m <= 1e-6) {
+    return v;
+  }
+  return v * (HybridCurve(m) / m);
+}
+
+void main() {
+  ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+  ivec2 size = imageSize(u_proxy);
+  if (pixel.x >= size.x || pixel.y >= size.y) {
+    return;
+  }
+
+  bool bgr = params.bgr_order != 0u;
+  vec4 stored = imageLoad(u_proxy, pixel);
+  vec3 frame = SrgbDecode(bgr ? stored.bgr : stored.rgb);
+
+  vec3 normalized = frame / max(params.white_point, 1e-6);
+  vec3 display;
+  if (params.reversible_mode == 0u) {
+    display = SoftKnee(normalized);
+  } else if (params.reversible_mode >= 3u) {
+    display = HybridEncode(normalized);
+  } else {
+    display = NeutwoEncode(normalized);
+  }
+
+  vec3 encoded = SrgbEncode(display);
+  imageStore(u_proxy, pixel, vec4(bgr ? encoded.bgr : encoded, stored.a));
+}
