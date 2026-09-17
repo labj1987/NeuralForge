@@ -713,6 +713,14 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     continue;
                 }
                 if !claim_primary(self.device.handle(), sc, sw.width, sw.height) {
+                    // Another swapchain (or another device) already holds the session's
+                    // primary claim -- normal when a game keeps a second swapchain
+                    // alive, but indistinguishable from a bug without saying so.
+                    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        crate::log!("[layer] present skipped: this swapchain ({}x{}) is not the session's primary claim", sw.width, sw.height);
+                        crate::logging::flush();
+                    }
                     break;
                 }
                 let Some(&queue_family) = state.queue_families.get(&queue) else {
@@ -720,6 +728,20 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     // `vkGetDeviceQueue2` call (e.g. an app using `VK_KHR_synchronization2`
                     // queue submission paths this layer doesn't intercept) -- no family
                     // to build a command pool on, so fail open rather than guess one.
+                    //
+                    // Silent until 2026-09-17, and silence here is indistinguishable
+                    // from the app being broken: every present returns untouched while
+                    // the layer looks perfectly healthy in every other respect.
+                    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        crate::log!(
+                            "[layer] present skipped: the presenting queue was never seen through vkGetDeviceQueue/vkGetDeviceQueue2, \
+                             so its family is unknown and no command pool can be built -- every frame will pass through untouched \
+                             ({} queues known)",
+                            state.queue_families.len()
+                        );
+                        crate::logging::flush();
+                    }
                     break;
                 };
                 let width = sw.width;
@@ -730,6 +752,11 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 let State { shm, capture, capture_pipeline, direct_capture, external_memory_host, gpu_compose, original_scratch, model_scratch, inflight, bootstrap_complete, answer_scratch, raw_answer_base, raw_answer_generation, last_answer, last_answer_dims, hotkey, .. } = &mut *state;
                 shm.poll_toggle_hotkey(hotkey);
                 if shm.model_known_unavailable() {
+                    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        crate::log!("[layer] present skipped: the helper reported the model permanently unavailable for this session");
+                        crate::logging::flush();
+                    }
                     // The helper has permanently disabled itself for this session
                     // (see `ngx::ensure_feature`'s one-shot design) -- nothing will
                     // ever evaluate a captured frame, so paying for the capture
