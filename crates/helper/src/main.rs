@@ -38,7 +38,102 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use ash::vk;
-use neuralforge_helper::{frame, guard, ngx, shm};
+use neuralforge_helper::{frame, guard, ngx, optical_flow, shm};
+
+/// Real motion vectors for this frame, or an empty `Vec` when they're unavailable
+/// for any reason (structurally, a transient failure, a scene cut, or simply the
+/// first frame after the session was just (re)built) -- the caller already treats
+/// empty motion as "no vectors this frame", the same fail-open contract this crate
+/// uses everywhere else. See `optical_flow.rs`'s own doc comment for the mechanism.
+#[allow(clippy::too_many_arguments)]
+fn estimate_motion(
+    flow_queue: Option<&optical_flow::FlowQueue>,
+    flow: &mut Option<optical_flow::OpticalFlow>,
+    prev_proxy: &mut Vec<u8>,
+    instance: &ash::Instance,
+    device: &ash::Device,
+    physical_device: vk::PhysicalDevice,
+    proxy: &[u8],
+    width: u32,
+    height: u32,
+    proxy_format: u32,
+    motion_scale: [f32; 2],
+    quality: u32,
+) -> Vec<u8> {
+    // Structurally unavailable (no extension/feature/queue-family support at all,
+    // decided once in `create_vulkan_context`) -- never worth attempting.
+    let Some(flow_queue) = flow_queue else { return Vec::new() };
+    let bgr = proxy_format == neuralforge_protocol::enums::proxy_format::BGRA8;
+
+    let needs_rebuild = !flow.as_ref().is_some_and(|f| f.width == width && f.height == height);
+    if needs_rebuild {
+        if let Some(old) = flow.take() {
+            // SAFETY: the last `estimate` call on this session (if any) already
+            // drained its queue (`estimate`'s own `queue_wait_idle`); nothing is
+            // in flight.
+            unsafe { old.destroy(device) };
+        }
+        prev_proxy.clear(); // a rebuilt session has no history to compare against either.
+        match optical_flow::OpticalFlow::new(instance, device, physical_device, flow_queue, width, height, quality) {
+            Ok(f) => *flow = Some(f),
+            Err(e) => {
+                // Logged once, not every frame this keeps failing at the same
+                // resolution -- a genuine, structural "this GPU/driver combination
+                // can't do it at this size" doesn't improve by retrying every 200us.
+                static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !LOGGED.swap(true, Ordering::Relaxed) {
+                    neuralforge_helper::log!("[mvec] optical flow session unavailable at {width}x{height}: {e}");
+                }
+                return Vec::new();
+            }
+        }
+    }
+    let Some(f) = flow.as_mut() else { return Vec::new() };
+
+    // A scene cut invalidates whatever history the session's own images hold --
+    // reset (by rebuilding) rather than let a stale reference frame produce a flow
+    // field describing content that's no longer on screen. DLSS5VKLayer's own
+    // `helper/main.cpp` runs the same kind of check (`DetectSceneCut`) for the same
+    // reason -- independent reimplementation of the same generic technique, not a
+    // port (see `optical_flow::is_scene_cut`'s own doc comment).
+    let cut = prev_proxy.len() == proxy.len() && optical_flow::is_scene_cut(prev_proxy, proxy, width, height, 40);
+    if cut {
+        // SAFETY: same reasoning as the rebuild path above.
+        unsafe { f.destroy(device) };
+        *flow = None;
+        prev_proxy.clear();
+        neuralforge_helper::log!("[mvec] scene cut detected, resetting motion history");
+        return Vec::new();
+    }
+
+    let vectors = match f.estimate(device, proxy, bgr) {
+        Ok(Some(v)) => v,
+        // First frame after a (re)build: this call just seeded history, no vectors
+        // to report yet -- not a failure, `prev_proxy` still needs updating below so
+        // the *next* call has something to compare against.
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                neuralforge_helper::log!("[mvec] estimate failed, disabling for this session: {e}");
+            }
+            // A real failure, not just "no answer yet" -- drop the session so this
+            // doesn't retry (and potentially fail the same way) every single frame
+            // forever; the caller's own enabled/opt-in check still runs every frame,
+            // so turning the toggle off and back on (or a helper restart) tries fresh.
+            unsafe { f.destroy(device) };
+            *flow = None;
+            prev_proxy.clear();
+            return Vec::new();
+        }
+    };
+    prev_proxy.clear();
+    prev_proxy.extend_from_slice(proxy);
+    if vectors.is_empty() {
+        return Vec::new();
+    }
+    neuralforge_protocol::motion::encode(&vectors, motion_scale)
+}
 
 fn store_ms(field: &std::sync::atomic::AtomicU32, duration: Duration) {
     field.store(
@@ -76,7 +171,7 @@ fn main() {
     neuralforge_helper::log!("[helper] shm attached");
     neuralforge_helper::logging::flush();
 
-    let Some((entry, instance, physical_device, device, queue)) = create_vulkan_context() else {
+    let Some((entry, instance, physical_device, device, queue, flow_queue)) = create_vulkan_context() else {
         neuralforge_helper::log!("[helper] failed to create a Vulkan context");
         neuralforge_helper::logging::flush();
         hdr.helper_state.store(neuralforge_protocol::enums::helper_state::NO_VULKAN, Ordering::Relaxed);
@@ -97,6 +192,7 @@ fn main() {
         Ordering::Relaxed,
     );
     neuralforge_helper::log!("[helper] NGX snippet disabled={}", snippet.disabled);
+    neuralforge_helper::log!("[mvec] optical flow queue: {}", if flow_queue.is_some() { "available" } else { "unavailable (no extension/feature/queue-family support)" });
     neuralforge_helper::logging::flush();
 
     // Protocol v3 (`PROTOCOL_V3_DESIGN.md`): one persistent `FrameResources` per wire
@@ -109,6 +205,11 @@ fn main() {
     // reasoning). Each slot is still processed to completion, one at a time, before
     // the other is even checked this same loop tick.
     let mut frame_resources: [Option<frame::FrameResources>; 2] = [None, None];
+    // Slot-0-only, same as the `motion`/`frame_mvec_valid` convention it replaces --
+    // protocol v3 never duplicated the motion payload for slot 1 (see
+    // `process_request`'s own doc comment on why).
+    let mut flow: Option<optical_flow::OpticalFlow> = None;
+    let mut prev_proxy: Vec<u8> = Vec::new();
     // Resized (not reallocated fresh every frame) to whatever the current frame's
     // real byte count is -- never the full `MAX_FRAME` reservation, which is sized for
     // the protocol's absolute ceiling (7680x4320 float16), not a typical frame.
@@ -127,7 +228,8 @@ fn main() {
             last_seq_req[slot] = seq_req;
             process_request(
                 hdr, &shm, &device, &instance, physical_device, queue, &mut snippet,
-                &mut frame_resources[slot], slot, seq_req, helper_delay, &mut frames,
+                &mut frame_resources[slot], flow_queue.as_ref(), &mut flow, &mut prev_proxy,
+                slot, seq_req, helper_delay, &mut frames,
             );
         }
         hdr.heartbeat.fetch_add(1, Ordering::Relaxed);
@@ -140,6 +242,11 @@ fn main() {
         if let Some(f) = f {
             unsafe { f.destroy(&device) };
         }
+    }
+    // SAFETY: same reasoning -- `estimate`'s own `queue_wait_idle` already drained
+    // whatever this session last submitted, and the loop above just stopped.
+    if let Some(f) = flow {
+        unsafe { f.destroy(&device) };
     }
     ngx::teardown(snippet);
     hdr.helper_state.store(neuralforge_protocol::enums::helper_state::STOPPED, Ordering::Relaxed);
@@ -178,6 +285,9 @@ fn process_request(
     queue: vk::Queue,
     snippet: &mut ngx::NgxSnippet,
     frame_resources: &mut Option<frame::FrameResources>,
+    flow_queue: Option<&optical_flow::FlowQueue>,
+    flow: &mut Option<optical_flow::OpticalFlow>,
+    prev_proxy: &mut Vec<u8>,
     slot: usize,
     seq_req: u32,
     helper_delay: Duration,
@@ -189,11 +299,6 @@ fn process_request(
     let bytes = (neuralforge_protocol::enums::proxy_format::bytes_per_pixel(proxy_format) * (width as usize) * (height as usize))
         .min(neuralforge_protocol::MAX_FRAME);
     let n = bytes;
-    let mut motion = Vec::new();
-    if slot == 0 && hdr.frame_mvec_valid.load(Ordering::Relaxed) != 0 {
-        motion.resize((width as usize * height as usize * 4).min(neuralforge_protocol::MAX_FRAME), 0);
-        shm.read_motion(&mut motion);
-    }
     let motion_scale = neuralforge_protocol::motion::scales(hdr.frame_mvec_scale_mode.load(Ordering::Relaxed), width, height);
     // Fixed addresses/capacity regardless of this frame's own width/height --
     // `FrameResources::new` decides for itself (per its own doc comment) whether
@@ -231,6 +336,37 @@ fn process_request(
     // own `seq_req`; slot 0's and slot 1's regions are disjoint fixed regions in the
     // mapping (`PROTOCOL_V3_DESIGN.md`).
     let (proxy, answer) = unsafe { shm.frame_regions(slot, n) };
+
+    // Real motion vectors, estimated here in the helper -- see `optical_flow.rs`'s
+    // own doc comment for the architecture and why this replaced the layer-side
+    // stub. Slot 0 only, matching the pre-existing convention (protocol v3 never
+    // duplicated the motion payload for slot 1). `NEURALFORGE_MVEC_HELPER` is a
+    // deliberate, explicit opt-in on top of the header's own `mvec_enabled` toggle:
+    // this is genuinely unvalidated on real hardware as of the commit that adds it
+    // (see GHOSTING_PLAN.md step 4) -- some users' persisted config already has
+    // `mvec_enabled=1` from when this toggle was a no-op, and this crate should not
+    // silently start doing something new and untested just because an old, inert
+    // setting happens to already be on.
+    let motion = if slot == 0
+        && hdr.mvec_enabled()
+        && neuralforge_protocol::enums::proxy_format::is_8bit(proxy_format)
+        && std::env::var_os("NEURALFORGE_MVEC_HELPER").is_some()
+    {
+        estimate_motion(flow_queue, flow, prev_proxy, instance, device, physical_device, proxy, width, height, proxy_format, motion_scale, hdr.mvec_quality.load(Ordering::Relaxed))
+    } else {
+        // Toggled off (or the opt-in isn't set): drop any live session so the next
+        // time it's turned on starts clean (matches `DestroyOpticalFlow`/
+        // `userDisabled` in DLSS5VKLayer's own helper -- an explicit off state, not
+        // just "stop calling estimate" while a session silently idles).
+        if let Some(f) = flow.take() {
+            // SAFETY: `estimate`'s own `queue_wait_idle` (the last call this session
+            // was used for, if ever) already guarantees nothing is in flight.
+            unsafe { f.destroy(device) };
+        }
+        prev_proxy.clear();
+        Vec::new()
+    };
+
     let timing = if ready && neuralforge_protocol::enums::proxy_format::is_8bit(proxy_format) {
         (|| {
             if !frame_resources.as_ref().is_some_and(|f| f.matches(0, width, height, proxy_format)) {
@@ -316,9 +452,49 @@ const WANTED_DEVICE_EXTENSIONS: &[&str] = &[
     "VK_NV_optical_flow",
     "VK_NVX_binary_import",
     "VK_NVX_image_view_handle",
+    // Added for real motion vectors (`optical_flow.rs`, 2026-09-17): both are
+    // `VK_NV_optical_flow`'s own real dependencies (`vkCmdOpticalFlowExecuteNV`
+    // synchronizes via `VK_KHR_synchronization2`'s timeline-barrier API;
+    // `VK_KHR_format_feature_flags2` is the extended format-query struct optical
+    // flow's own image-format negotiation uses). Requested only when actually
+    // present, exactly like every other entry in this list -- their absence just
+    // means `ensure_flow_queue` below never finds a usable combination, not that
+    // device creation itself is affected.
+    "VK_KHR_synchronization2",
+    "VK_KHR_format_feature_flags2",
 ];
 
-fn create_vulkan_context() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDevice, ash::Device, vk::Queue)> {
+/// The queue family/index that will actually run `vkCmdOpticalFlowExecuteNV`,
+/// resolved once here (never re-queried per-frame) because Vulkan requires every
+/// queue a device will ever use to be requested at `vkCreateDevice` time -- unlike
+/// `frame::FrameResources`/NGX feature rebuilds, this can't be deferred to first use.
+///
+/// Returns `None` whenever optical flow genuinely isn't usable on this device: no
+/// extension support, no driver-level feature support (a real, separate check from
+/// "the extension string is present" -- `vkGetPhysicalDeviceFeatures2` is what
+/// upstream's own `helper/main.cpp` checks too, not just extension enumeration), or
+/// no queue family exposing `VK_QUEUE_OPTICAL_FLOW_BIT_NV`. Every caller treats that
+/// exactly like a disabled feature -- this crate never fails to start NGX over it.
+fn find_flow_family(instance: &ash::Instance, pd: vk::PhysicalDevice, enabled_extension_names: &[&str]) -> Option<u32> {
+    if !enabled_extension_names.contains(&"VK_NV_optical_flow") || !enabled_extension_names.contains(&"VK_KHR_synchronization2") {
+        return None;
+    }
+    let mut optical_features = vk::PhysicalDeviceOpticalFlowFeaturesNV::default();
+    let mut sync_features = vk::PhysicalDeviceSynchronization2Features::default();
+    // SAFETY: `pd` is a handle this process already enumerated; both feature structs
+    // are default-initialized `VkBool32`-bearing structs, valid to chain and read.
+    unsafe {
+        instance.get_physical_device_features2(pd, &mut vk::PhysicalDeviceFeatures2::builder().push_next(&mut optical_features).push_next(&mut sync_features));
+    }
+    if optical_features.optical_flow == 0 || sync_features.synchronization2 == 0 {
+        return None;
+    }
+    // SAFETY: `pd` is a handle this process already enumerated.
+    let families = unsafe { instance.get_physical_device_queue_family_properties(pd) };
+    families.iter().position(|p| p.queue_flags.contains(vk::QueueFlags::OPTICAL_FLOW_NV | vk::QueueFlags::TRANSFER)).map(|i| i as u32)
+}
+
+fn create_vulkan_context() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDevice, ash::Device, vk::Queue, Option<optical_flow::FlowQueue>)> {
     // SAFETY: dynamically loads `vulkan-1.dll` via the `loaded` feature; the usual
     // caveats of loading an arbitrary shared library apply and are accepted here the
     // same way every other `ash` consumer accepts them.
@@ -358,16 +534,45 @@ fn create_vulkan_context() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDev
     let enabled_c: Vec<std::ffi::CString> = enabled.iter().map(|e| std::ffi::CString::new(*e).unwrap()).collect();
     let enabled_ptrs: Vec<*const std::ffi::c_char> = enabled_c.iter().map(|c| c.as_ptr()).collect();
 
-    let queue_info = [vk::DeviceQueueCreateInfo::builder().queue_family_index(0).queue_priorities(&[1.0]).build()];
-    let device_create_info =
-        vk::DeviceCreateInfo::builder().queue_create_infos(&queue_info).enabled_extension_names(&enabled_ptrs);
+    // `find_flow_family` re-checked here (not just trusted from a caller) is the one
+    // source of truth for whether optical flow is genuinely usable -- extension
+    // strings present *and* the driver-level features on, *and* a real queue family.
+    // `None` means every path below behaves exactly as it did before this feature
+    // existed: one queue on family 0, no extra features chained. Requesting a queue
+    // family a second time in the same `DeviceQueueCreateInfo` array is invalid per
+    // the Vulkan spec, so family 0 doubling as the flow family (common -- many
+    // NVIDIA parts expose optical flow on their main graphics/compute family) is
+    // handled by not adding a second entry for it, only chaining the extra features.
+    let flow_family = find_flow_family(&instance, physical_device, &enabled);
+    let mut queue_infos = vec![vk::DeviceQueueCreateInfo::builder().queue_family_index(0).queue_priorities(&[1.0]).build()];
+    if let Some(family) = flow_family {
+        if family != 0 {
+            queue_infos.push(vk::DeviceQueueCreateInfo::builder().queue_family_index(family).queue_priorities(&[1.0]).build());
+        }
+    }
+    let mut optical_features = vk::PhysicalDeviceOpticalFlowFeaturesNV::builder().optical_flow(true);
+    let mut sync_features = vk::PhysicalDeviceSynchronization2Features::builder().synchronization2(true);
+    let mut device_create_info =
+        vk::DeviceCreateInfo::builder().queue_create_infos(&queue_infos).enabled_extension_names(&enabled_ptrs);
+    if flow_family.is_some() {
+        device_create_info = device_create_info.push_next(&mut optical_features).push_next(&mut sync_features);
+    }
     // SAFETY: `device_create_info` is valid; queue family 0 exists on every physical
-    // device (the Vulkan spec guarantees at least one queue family); `enabled_ptrs`
-    // point at only extensions just confirmed present in `available_names`, and
-    // `enabled_c` (which owns the bytes they point into) outlives this call.
+    // device (the Vulkan spec guarantees at least one queue family), and `flow_family`
+    // (when `Some`) was itself confirmed present by `find_flow_family`'s own
+    // enumeration just above; `enabled_ptrs` point at only extensions just confirmed
+    // present in `available_names`, and `enabled_c` (which owns the bytes they point
+    // into), `optical_features`, `sync_features` all outlive this call.
     let device = unsafe { instance.create_device(physical_device, &device_create_info, None) }.ok()?;
-    // SAFETY: `device` was just created with exactly one queue on family 0, index 0.
+    // SAFETY: `device` was just created with a queue on family 0, index 0 (always
+    // requested above).
     let queue = unsafe { device.get_device_queue(0, 0) };
+    let flow_queue = flow_family.map(|family| optical_flow::FlowQueue {
+        family,
+        // SAFETY: `family` is either 0 (already known valid) or was just requested
+        // as this device's second queue above -- either way, index 0 on it is valid.
+        queue: unsafe { device.get_device_queue(family, 0) },
+    });
 
-    Some((entry, instance, physical_device, device, queue))
+    Some((entry, instance, physical_device, device, queue, flow_queue))
 }

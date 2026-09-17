@@ -215,6 +215,25 @@
 
 # Changelog
 
+- **v0.1.69 — real motion vectors, built and cross-compiled, opt-in pending real-hardware
+  validation.** New `crates/helper/src/optical_flow.rs`: `VK_NV_optical_flow` estimated
+  between consecutive proxy frames, on the helper's own already-created device (never a
+  private one, never touching the game process) -- the architecture DLSS5VKLayer's own
+  AGPL-3.0 helper actually uses, confirmed by reading it directly. Scene cuts reset the
+  session (CPU luma delta, independently reimplementing the same technique upstream's
+  `DetectSceneCut` uses) instead of carrying a flow field across them. Feeds
+  `frame::evaluate`'s existing `motion`/`reset_history` parameters, which have been wired
+  and unused since before this module existed. Gated behind an explicit
+  `NEURALFORGE_MVEC_HELPER=1` environment variable on top of the existing `mvec_enabled`
+  toggle -- nothing changes for anyone who doesn't set it, deliberately, since this is
+  genuinely unvalidated on real optical-flow hardware as of this release. Compiles clean
+  (native and the real `x86_64-pc-windows-gnu` cross build, dev and release); 8 real unit
+  tests pass under Wine; the actual `neuralforge-helper.exe`, run under Wine without a
+  real NVIDIA GPU, starts cleanly and correctly falls back with zero effect on NGX. Real
+  optical-flow execution, driver-crash risk, and any actual ghosting improvement remain
+  unmeasured until tested live -- see `GHOSTING_PLAN.md` §4a for the honest account of
+  what is and isn't validated.
+
 - **v0.1.67 — `working_scale` is wired in, real: run the model at a fraction of the
   frame's resolution.** The earlier CPU-resample attempt (below) was measured too slow
   for the present thread and shelved; this is the GPU-blit version instead

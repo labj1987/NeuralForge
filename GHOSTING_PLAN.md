@@ -177,6 +177,72 @@ design anyway. Doing step 2 for real would trade nothing for something: same
 ballpark fps, ghosting eliminated at the root instead of mitigated by the mode-1
 compose formula.
 
+## 4a. Step 4 (motion vectors) is built, cross-compiled, unit-tested -- not yet
+validated on real hardware (2026-09-17, fourth session, lordnikon down)
+
+Built the helper-side design §1d confirmed: `crates/helper/src/optical_flow.rs`
+(`OpticalFlow`, an independent reimplementation of the same generic
+`VK_NV_optical_flow` session/grid/execute pattern DLSS5VKLayer's own AGPL-3.0 helper
+uses -- adapted from this project's own dead layer-side attempt, but taking the
+helper's already-created device instead of creating a private one, and with no
+`Drop` impl since it no longer owns that device). `crates/helper/src/main.rs`'s
+`create_vulkan_context` now discovers an optical-flow-capable queue family (if any),
+chains `VkPhysicalDeviceOpticalFlowFeaturesNV`/`Synchronization2Features` into device
+creation only when genuinely supported, and requests a second queue only when the
+flow family differs from the main one -- every path where optical flow isn't
+available (no extension, no driver feature, no compatible family) falls through to
+the *exact* device-creation shape this crate always used, unchanged. `estimate_motion`
+in `process_request` lazily builds/rebuilds the session on a resolution change,
+resets it on a detected scene cut (`optical_flow::is_scene_cut`, CPU luma delta,
+independently reimplementing the same technique DLSS5VKLayer's `DetectSceneCut`
+uses), and feeds real vectors into `frame::evaluate`'s existing `motion`/
+`reset_history` parameters -- infrastructure that already existed and was already
+wired, just never had a real producer before now. The vector→bytes packing reuses
+`neuralforge_protocol::motion::encode` (already real, already tested) rather than
+duplicating it.
+
+**Deliberately gated behind an explicit `NEURALFORGE_MVEC_HELPER=1` environment
+variable**, on top of the header's own `mvec_enabled` toggle: this is genuinely
+unvalidated on real optical-flow hardware, and some users' persisted config
+(including lordnikon's own `config.ini`, from when the toggle was a no-op) already
+has `mvec_enabled=1` -- without this extra gate the feature would silently start
+doing something new and untested the next time the helper starts. Nothing changes
+for anyone who doesn't set the variable.
+
+**What's actually been validated, honestly:**
+- Compiles clean (native `cargo check` and the real `x86_64-pc-windows-gnu` cross
+  compile, dev and release).
+- 8 real unit tests (upsampling/grid-edge-cases/scene-cut/the integration point with
+  `motion::encode`) pass, executed for real under Wine (`wine
+  target/.../neuralforge_helper-*.exe`, the same binary CI would produce) -- not just
+  compiled.
+- The real `neuralforge-helper.exe`, run under Wine on this dev machine (no real
+  NVIDIA GPU, no `nvngx_dlssnr.dll`), starts cleanly and correctly reports `[mvec]
+  optical flow queue: unavailable` with zero effect on the rest of the helper -- NGX
+  loading, its own fail-open, everything else proceeds exactly as it always did. This
+  is the property that mattered most to get right without hardware to test on: the
+  device-creation change cannot break the *existing*, working NGX path even when
+  optical flow itself isn't available.
+
+**What has NOT been validated, and can't be from this machine:**
+- Real `VK_NV_optical_flow` session creation, grid negotiation, and execute on an
+  actual NVIDIA GPU.
+- Whether lordnikon's RTX 5070 exposes optical flow on queue family 0 (shared with
+  NGX work) or a separate family -- both code paths exist and compile, only one will
+  actually run there.
+- Whether this measurably reduces ghosting/shimmer at all, or interacts badly with
+  the mode-1 compose formula's own motion suppression (§1c) -- the two haven't been
+  tested together.
+- Any of the driver-crash risk this design was specifically meant to avoid (a private
+  device created during a swapchain transition) -- this design doesn't do that, but
+  "doesn't do the thing that caused the old crash" is a design argument, not a
+  measurement.
+
+Next step, once lordnikon is back: deploy, set `NEURALFORGE_MVEC_HELPER=1`, watch
+`journalctl -k` for Xid errors the same way every other hardware validation in this
+project has, and check the helper log for `[mvec]` lines confirming a real session
+came up (`optical flow queue: available`, no `session unavailable` line).
+
 ## 5a. Updated recommendation for Alex
 
 Both step 1 and step 4, done properly, are real Vulkan/cross-process features in the
