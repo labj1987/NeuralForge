@@ -440,10 +440,26 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             // TRANSFER_SRC/TRANSFER_DST, or the format/extent/sample-count combination
             // doesn't survive `vkGetPhysicalDeviceImageFormatProperties` with the
             // enlarged usage -- a real surface limitation, not a display-mode artifact.
-            crate::log!("[layer] capture admission declined for {}x{} fmt={:?} usage={:?} present_mode={:?} extended_semantics={}",
+            // When `candidate` itself rejected it, narrow down which check: `pNext`'s
+            // leading `sType` (every `pNext` struct starts with `{sType, pNext}` per
+            // the Vulkan spec, so reading it through `VkBaseInStructure` is valid for
+            // any real extension struct), `flags`, and `image_array_layers` are each
+            // reported directly instead of collapsing them into one boolean, since a
+            // display-mode fix (e.g. leaving exclusive fullscreen, which is what adds
+            // `VkSurfaceFullScreenExclusiveInfoEXT` to `pNext`) only helps if `pNext`
+            // is actually the one that's non-null here.
+            let p_next_type = (!create_info.p_next.is_null()).then(|| {
+                // SAFETY: a non-null `pNext` on a `VkSwapchainCreateInfoKHR` the
+                // application already passed to a real `vkCreateSwapchainKHR` call
+                // must point at a valid extension struct, which per spec always
+                // begins with `VkStructureType sType`.
+                unsafe { (*create_info.p_next.cast::<vk::BaseInStructure>()).s_type }
+            });
+            crate::log!("[layer] capture admission declined for {}x{} fmt={:?} usage={:?} present_mode={:?} extended_semantics={} p_next_type={:?} flags={:?} array_layers={}",
                 create_info.image_extent.width, create_info.image_extent.height,
                 create_info.image_format, create_info.image_usage, create_info.present_mode,
-                !crate::surface_usage::candidate(create_info));
+                !crate::surface_usage::candidate(create_info), p_next_type, create_info.flags,
+                create_info.image_array_layers);
         }
         let mut swapchain = vk::SwapchainKHR::null();
         let alloc_ptr = allocator.map_or(std::ptr::null(), std::ptr::from_ref);
