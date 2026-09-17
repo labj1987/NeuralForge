@@ -246,19 +246,44 @@ void main() {
     float stability = 1.0 - smoothstep(0.01, 0.06, motion);
     vec3 upgraded = original + edit * stability * clamp(params.transfer_strength, 0.0, 1.0);
 
-    // Guard, adapted from DLSS5VKLayer's own shape for this same additive rule: bound
-    // the result's luminance within a factor of the *current* original's own
-    // luminance, so a strong or still-partly-stale edit cannot blow a pixel out or
-    // crush it, however large `edit` is. `max_ratio` doubles as that factor here
-    // (already the "how far may this pass move a pixel" control on the other mode).
+    // Guard, ported from DLSS5VKLayer's `dlssnr.hlsl` (AGPL-3.0) directly, replacing
+    // the symmetric `original_luminance * add_guard` bound this used to carry.
+    //
+    // The old bound was symmetric and epsilon-gated, which is precisely the failure
+    // upstream's own source documents and fixes: "in linear light divided by paper
+    // white a shadowed pixel sits around a thousandth, so a tiny absolute edit from
+    // the model becomes an enormous ratio, hits the clamp, and doubles that pixel's
+    // brightness. The next frame it lands slightly differently and the pixel drops
+    // back. That is the boiling: patches of lighter colour crawling over otherwise
+    // still geometry, worst where the picture is darkest." A `> 1e-5` test does not
+    // prevent that -- it only skips pixels that are *exactly* black, and every
+    // near-black pixel above it still gets the full symmetric factor.
+    //
+    // Three pieces, all upstream's:
+    //   * a ratio floor added above *and* below, so the ratio falls smoothly to 1 as
+    //     luminance approaches zero instead of exploding ("no edit at all is the
+    //     right answer for a pixel with no light in it");
+    //   * `lift`, shrinking the room to *brighten* toward none as a pixel approaches
+    //     black -- relighting cannot invent light, and below the floor a lift
+    //     amplifies 8-bit quantisation rather than the model's verdict;
+    //   * `drop`, shrinking the room to *darken* toward none as a pixel approaches
+    //     white -- a detail pass has no business dimming a light source.
+    // One scalar taken from luminance and applied to the whole triple, never
+    // per-channel: a per-channel bound is a hue distorter on saturated pixels.
+    const float kRatioFloor = 1.0 / 512.0;
     float original_luminance = Luminance(original);
     float sum_luminance = Luminance(upgraded);
-    if (sum_luminance > 1e-5 && original_luminance > 1e-5) {
-      float add_guard = max(params.max_ratio, 1.0);
-      float max_luminance = original_luminance * add_guard;
-      float min_luminance = original_luminance / add_guard;
-      if (sum_luminance > max_luminance) upgraded *= max_luminance / sum_luminance;
-      else if (sum_luminance < min_luminance) upgraded *= min_luminance / sum_luminance;
+    float guard = max(params.max_ratio, 1.0);
+    float lift = mix(1.0, guard, smoothstep(0.0, 8.0 * kRatioFloor, original_luminance));
+    float drop = mix(1.0 / guard, 1.0, smoothstep(0.6, 1.1, original_luminance));
+    float luma_ratio = (sum_luminance + kRatioFloor) / (original_luminance + kRatioFloor);
+    float bounded_ratio = clamp(luma_ratio, drop, lift);
+    // Back out the luminance that bounded ratio asks for, then rescale the additive
+    // result onto it. Scaling (rather than replacing) keeps the edit's own hue and
+    // detail while the brightness movement stays inside the bound.
+    float target_luminance = max((original_luminance + kRatioFloor) * bounded_ratio - kRatioFloor, 0.0);
+    if (sum_luminance > 1e-6) {
+      upgraded *= target_luminance / sum_luminance;
     }
     result = GamutCompressReversible(upgraded);
   } else {
