@@ -146,13 +146,17 @@ EULA, depending on jurisdiction and how you use it. There's no license grant her
 that mechanism and none implied — use it at your own legal risk, for personal,
 non-commercial use.
 
-The composition/color pipeline in `crates/layer/src/composition/` is original work
-rederived from public, permissively-licensed sources (see ATTRIBUTION.md); no
-GPL-licensed code was read or ported to build it.
+As of 2026-09-17 this project directly reads and adapts source from
+[DLSS5VKLayer](https://github.com/bmitch87/DLSS5VKLayer) (AGPL-3.0) — see
+[ATTRIBUTION.md](ATTRIBUTION.md) for what's taken and from where. Earlier versions of
+this composition pipeline were clean-room (no GPL/AGPL code read or ported); that
+boundary no longer holds, which is why the project's own license changed to match
+(below).
 
 ## License
 
-This project's own code is MIT-licensed — see [LICENSE](LICENSE). It links against and
+This project's own code is licensed under the **GNU Affero General Public License
+v3.0 or later (AGPL-3.0-or-later)** — see [LICENSE](LICENSE). It links against and
 depends on NVIDIA's proprietary NGX SDK/DLLs at runtime, which are not covered by that
 license and are not redistributed here.
 

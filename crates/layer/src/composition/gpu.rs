@@ -49,7 +49,10 @@ struct PushConstants {
     /// Matches `compose.comp`'s own `params.bgr_order` field exactly (same offset,
     /// same 4-byte size as the `f32`s above it -- no padding to worry about).
     bgr_order: u32,
-    carry_delta: u32,
+    /// Matches `compose.comp`'s own `params.mode`: 0 selects the classic ratio-transfer
+    /// (`UpgradeToneMap`), 1 selects the guarded-additive formula the async
+    /// held-answer path needs instead -- see that shader's own doc comment on why.
+    mode: u32,
 }
 
 struct Image {
@@ -515,7 +518,7 @@ impl ComposeSlot {
 
             device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline_layout, 0, std::slice::from_ref(&self.descriptor_set), &[]);
-            let push = PushConstants { colour_strength, transfer_strength, max_ratio, bgr_order: bgr_order as u32, carry_delta: 0 };
+            let push = PushConstants { colour_strength, transfer_strength, max_ratio, bgr_order: bgr_order as u32, mode: 0 };
             let push_bytes = std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<PushConstants>());
             device.cmd_push_constants(self.cmd, pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, push_bytes);
             device.cmd_dispatch(self.cmd, width.div_ceil(8), height.div_ceil(8), 1);
@@ -623,6 +626,21 @@ impl ComposeSlot {
     /// Records a lightweight temporal carry pass.  It reads the current swapchain
     /// image into device-local storage, applies the cached model delta, then writes
     /// the result back; no per-frame CPU readback or upload is involved.
+    /// Despite the name (kept to avoid a bigger rename tonight -- see
+    /// `ATTRIBUTION.md`/`GHOSTING_PLAN.md`), this no longer carries a "delta" across
+    /// frames: `compose.comp`'s `carry_delta` branch was deleted 2026-09-17 after
+    /// reading DLSS5VKLayer's own resolve function (AGPL-3.0), which documents trying
+    /// exactly that reprojection technique and measuring it a dead end. What this
+    /// dispatches now is the same ratio-transfer `UpgradeToneMap` path
+    /// `record_upload_and_compute` already used -- `s.proxy`/`s.model_answer` are
+    /// still whatever the most recent answer pair is (held between round trips,
+    /// updated only when `update_cache` is true, unchanged from before), and
+    /// `s.original` is still read fresh off `target_image` every single call
+    /// (unchanged from before) -- this function's real remaining value versus just
+    /// calling `record_upload_and_compute` directly is the caching/device-local-copy
+    /// performance structure below (upload only on a new generation, otherwise reuse
+    /// `s.cached_buffer`), not any longer a different composition strategy.
+    ///
     /// `answer_width`/`answer_height` are the model answer's *own* resolution --
     /// usually equal to `width`/`height`, but smaller when `working_scale` is active
     /// (see [`ComposeSlot::small_answer`]'s own doc comment). When they differ, the
@@ -696,7 +714,12 @@ impl ComposeSlot {
             device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[], &[], &[original_general]);
             device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline_layout, 0, std::slice::from_ref(&self.descriptor_set), &[]);
-            let push = PushConstants { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, bgr_order: bgr_order as u32, carry_delta: 1 };
+            // mode: 1 -- the guarded-additive formula; see compose.comp's own doc
+            // comment on why the classic ratio-transfer (mode 0) self-cancels here.
+            // transfer_strength/max_ratio are hardcoded defaults, not yet threaded
+            // from live settings the way the mode-0 call site's are -- a reasonable
+            // follow-up, not attempted tonight.
+            let push = PushConstants { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, bgr_order: bgr_order as u32, mode: 1 };
             let push_bytes = std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<PushConstants>());
             device.cmd_push_constants(self.cmd, pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, push_bytes);
             device.cmd_dispatch(self.cmd, width.div_ceil(8), height.div_ceil(8), 1);

@@ -23,7 +23,7 @@ default-members = [
 version = "0.1.67"
 edition = "2021"
 authors = ["Alex Brown"]
-license = "MIT"
+license = "AGPL-3.0-or-later"
 
 # Workspace-wide because Cargo profiles (other than a few per-package-overridable
 # knobs, and `panic` isn't one of them) apply to the whole build, not one member.

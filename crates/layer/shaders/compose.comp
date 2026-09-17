@@ -55,9 +55,11 @@ layout(push_constant) uniform Params {
   // every composited frame -- see `swapchain::is_bgr_order`'s doc comment (Rust
   // side) for the full story.
   uint bgr_order;
-  // Carry the model's enhancement delta from its source frame onto the current
-  // frame, preserving camera motion while the helper evaluates the next answer.
-  uint carry_delta;
+  // 0: the classic ratio-transfer (`UpgradeToneMap`), used by the sync/one-shot
+  // dispatch path where `proxy` and `original` are not usually bit-identical.
+  // 1: guarded-additive, used by the async held-answer path -- see the comment
+  // where it's read, below, for why that path needs a different formula.
+  uint mode;
 } params;
 
 float Luminance(vec3 rgb) {
@@ -199,48 +201,82 @@ void main() {
   vec3 proxy = SrgbDecode(bgr ? imageLoad(u_proxy, pixel).bgr : imageLoad(u_proxy, pixel).rgb);
   vec3 model = SrgbDecode(bgr ? imageLoad(u_model_answer, pixel).bgr : imageLoad(u_model_answer, pixel).rgb);
 
-  if (params.carry_delta != 0u) {
-    // A model result belongs to `proxy`'s older frame. Carry its delta only where the
-    // current pixel still resembles that source, so camera/object movement presents the
-    // clean current frame instead of dragging the old, spatially-fixed enhancement
-    // across it -- that drag is exactly the ghosting reported at real-hardware testing
-    // (2026-09-16). Two levers make the suppression bite harder than the original
-    // 0.015..0.10 range, which was too loose (stale enhancement leaked onto moved
-    // content):
-    //   1. A tight smoothstep (0.005..0.032): a pixel that changed by more than ~3.2%
-    //      in any channel since the model saw it is treated as fully moved, its stale
-    //      delta dropped entirely; below ~0.5% it is held static and gets the full
-    //      delta. Anything in between fades proportionally.
-    //   2. Cubing `stability` biases the fade hard toward suppression across that whole
-    //      transition band, so partial motion loses the ghost quickly while genuinely
-    //      static enhancement (stability near 1) is barely touched.
-    // Net tradeoff: the enhancement fades sooner during motion (least visible exactly
-    // when things move) in exchange for less ghost trail. Tuned live against GTA's
-    // built-in benchmark 2026-09-16 (see GHOSTING_PLAN.md for the full record): this
-    // was the best of three variants tried -- fewer ghosts than the original at the
-    // same fps. A further variant that scaled the threshold by the model's own edit
-    // strength (`|model - proxy|`) was tried and rejected: it made the picture visibly
-    // worse. This mask is a mitigation, not the fix -- a stale delta on moved content
-    // cannot be made ghost-free without knowing where the content went (motion
-    // vectors) or not carrying stale deltas at all; GHOSTING_PLAN.md has the plan.
+  vec3 result;
+  if (params.mode == 1u) {
+    // Guarded-additive, for the async held-answer path (`carry_delta`, deleted
+    // 2026-09-17 -- see git history -- used to live here as a motion-suppressed
+    // reprojection of this same edit; replaced after reading DLSS5VKLayer's own
+    // `dlssnr.hlsl` (AGPL-3.0) directly).
+    //
+    // Upstream's resolve function documents trying exactly that reprojection
+    // technique for its *main* path and measuring it a dead end twice ("the model
+    // re-decides its detail with the framing, so an old answer does not belong to a
+    // new frame and reprojecting it only moves where the disagreement lands"); their
+    // fix there is to re-anchor to a ratio-transfer every frame with no motion
+    // suppression at all -- mode 0, below, is that formula, and this project already
+    // had it (independently, from RenoDX). But mode 0 measurably self-cancels a
+    // strong answer on this project's own async path specifically: unlike upstream,
+    // this pipeline's `proxy` is a bit-identical copy of `original` at capture time
+    // (no separate tone-mapping/encode step in between), so whenever the scene has
+    // not moved, mode 0's ratio-rescale target collapses to `original` itself and the
+    // model's answer is discarded regardless of how strong it is -- a real, previously
+    // measured bug (see capture.rs's doc comment on `proxy == original`), and this
+    // shader's own test caught it again live while building this change.
+    //
+    // The core here is adapted instead from DLSS5VKLayer's *other* mode ("native +
+    // edit", `gTransfer == 2`): add the model's own edit onto the current frame
+    // directly, rather than rescaling toward the model's answer by a ratio that can
+    // vanish. Upstream credits that rule's shape to xenmods/DLSSNR-Cost-Scaler (MIT);
+    // no code from either project is copied here, only the strategy (additive,
+    // current-anchored, luminance-guarded).
+    //
+    // What IS added here that upstream's version does not need: a motion-based
+    // suppression term. Upstream's round trip evidently keeps `proxy`/`model` close
+    // enough behind `original` that an unconditional additive edit does not visibly
+    // drag. This project's, even after the 2026-09-17 `working_scale` fix, measures
+    // 11-26ms end to end -- at 120fps a multi-frame staleness window, long enough
+    // that an unconditional additive edit visibly drags the model's spatially-fixed
+    // correction across content that has since moved (the ghosting this project has
+    // fought since v0.1.49). So: additive core (fixes the self-cancellation bug,
+    // confirmed live), still faded by how far the current pixel has moved from the
+    // model's own source frame (fixes the drag) -- a genuine synthesis grounded in
+    // measured differences between the two pipelines, not a literal port either way.
+    vec3 edit = model - proxy;
     float motion = max(max(abs(original.r - proxy.r), abs(original.g - proxy.g)), abs(original.b - proxy.b));
-    float stability = 1.0 - smoothstep(0.005, 0.032, motion);
-    stability *= stability * stability;
-    vec3 encoded = SrgbEncode(clamp(original + (model - proxy) * stability, 0.0, 1.0));
-    imageStore(u_output, pixel, vec4(bgr ? encoded.bgr : encoded, 1.0));
-    return;
+    float stability = 1.0 - smoothstep(0.01, 0.06, motion);
+    vec3 upgraded = original + edit * stability * clamp(params.transfer_strength, 0.0, 1.0);
+
+    // Guard, adapted from DLSS5VKLayer's own shape for this same additive rule: bound
+    // the result's luminance within a factor of the *current* original's own
+    // luminance, so a strong or still-partly-stale edit cannot blow a pixel out or
+    // crush it, however large `edit` is. `max_ratio` doubles as that factor here
+    // (already the "how far may this pass move a pixel" control on the other mode).
+    float original_luminance = Luminance(original);
+    float sum_luminance = Luminance(upgraded);
+    if (sum_luminance > 1e-5 && original_luminance > 1e-5) {
+      float add_guard = max(params.max_ratio, 1.0);
+      float max_luminance = original_luminance * add_guard;
+      float min_luminance = original_luminance / add_guard;
+      if (sum_luminance > max_luminance) upgraded *= max_luminance / sum_luminance;
+      else if (sum_luminance < min_luminance) upgraded *= min_luminance / sum_luminance;
+    }
+    result = GamutCompressReversible(upgraded);
+  } else {
+    // Mode 0: the classic ratio-transfer (`UpgradeToneMap`), for the sync/one-shot
+    // dispatch path, where `proxy` need not be bit-identical to `original`. See the
+    // comment above for why the async held-answer path (mode 1) cannot safely use
+    // this one.
+    vec3 upgraded = UpgradeToneMap(original, proxy, model, params.colour_strength);
+    // The transfer is a ratio against the proxy's own pixel, guarded by max_ratio so a
+    // near-black proxy pixel can't produce an unbounded multiply/divide (see
+    // neuralforge_protocol::ShmHeader::max_ratio_bits's doc comment).
+    vec3 safe_proxy = max(proxy, vec3(1e-4));
+    vec3 transfer_ratio = clamp(upgraded / safe_proxy, 1.0 / params.max_ratio, params.max_ratio);
+    vec3 transferred = original * transfer_ratio;
+
+    vec3 blended = mix(original, transferred, clamp(params.transfer_strength, 0.0, 1.0));
+    result = GamutCompressReversible(blended);
   }
-
-  vec3 upgraded = UpgradeToneMap(original, proxy, model, params.colour_strength);
-  // The transfer is a ratio against the proxy's own pixel, guarded by max_ratio so a
-  // near-black proxy pixel can't produce an unbounded multiply/divide (see
-  // neuralforge_protocol::ShmHeader::max_ratio_bits's doc comment).
-  vec3 safe_proxy = max(proxy, vec3(1e-4));
-  vec3 transfer_ratio = clamp(upgraded / safe_proxy, 1.0 / params.max_ratio, params.max_ratio);
-  vec3 transferred = original * transfer_ratio;
-
-  vec3 blended = mix(original, transferred, clamp(params.transfer_strength, 0.0, 1.0));
-  vec3 result = GamutCompressReversible(blended);
 
   vec3 encoded = SrgbEncode(result);
   // Swizzle back to the real upload order before storing -- `u_output`'s bytes get

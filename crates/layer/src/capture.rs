@@ -927,12 +927,19 @@ pub unsafe fn run(
     // doc comments) -- independently of whether that processed frame is stale.
     // Re-blitting the same held answer every frame instead removes the alternation:
     // displayed content is always "the model's edit," refreshed at the round trip's
-    // own cadence rather than toggling against untouched frames in between. This
-    // does not fix temporal staleness during fast motion (the tradeoff a real
-    // downscaled-proxy-plus-motion-vector pipeline would remove) -- see this
-    // crate's own doc comment on motion vectors being disabled -- but it removes
-    // the *alternation* specifically, a separate and, per tonight's live testing,
-    // apparently the dominant source of what got called "flicker".
+    // own cadence rather than toggling against untouched frames in between.
+    //
+    // What that composite *does* with a stale answer against a moved current frame
+    // changed 2026-09-17: `composition::gpu::record_temporal_delta_into_image` used
+    // to carry the stale delta forward with a motion-based suppression mask
+    // (`compose.comp`'s deleted `carry_delta` branch) -- this crate independently
+    // arrived at the same reprojection-with-suppression technique DLSS5VKLayer's own
+    // AGPL-3.0 source documents trying and measuring as a dead end. It now
+    // re-anchors to the current frame with a plain ratio-transfer, no suppression,
+    // matching upstream's own resolve function directly -- see
+    // `ATTRIBUTION.md`/`GHOSTING_PLAN.md`. The real fix for genuine motion-driven
+    // staleness is still a downscaled-proxy-plus-motion-vector pipeline (this
+    // crate's own doc comment on motion vectors being disabled), not attempted here.
     if last_answer.is_empty() {
         return None;
     }
