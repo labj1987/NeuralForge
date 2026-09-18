@@ -215,6 +215,52 @@
 
 # Changelog
 
+- **v0.1.74 — the layer was inert on real games, and now isn't.** Admission refused any
+  swapchain whose create info carried a `pNext` chain or non-empty flags, left as a
+  "validate extended creation semantics later" placeholder. Both games on the test rig
+  hit it: DXVK and vkd3d-proton each attach an extension struct (sType 1000505007,
+  newer than the headers this crate builds against). Admission was therefore always
+  declined, the swapchain stayed pass-through, and GTA -- which renders straight into
+  the swapchain image as a colour attachment rather than blitting into it -- offered no
+  render source to tap either. The measured result was a layer that loaded, enabled
+  itself, owned the session lease, reported healthy, tracked 793,394 barrier
+  transitions and captured zero frames. Reading the frame at all needs TRANSFER_SRC on
+  the swapchain, which needs admission. The chain is now walked and only structures
+  that genuinely redefine the images are refused (format lists, device-group,
+  full-screen-exclusive), with the same treatment for flags (protected, mutable-format,
+  split-instance); anything unrecognised passes through untouched, because this module
+  rewrites `image_usage` and nothing else. If the enlarged usage is rejected anyway,
+  the application's own unmodified creation is retried once with `oldSwapchain`
+  cleared, so admission can never cost a game its swapchain. Both 2560x1440 swapchains
+  now report `pass_through=false`, on both backends.
+- **Every silent "does nothing" now names itself.** Five paths used to skip compositing
+  with no output at all -- a pass-through swapchain whose render source is missing or
+  not in GENERAL, a swapchain that is not the session's primary claim, a presenting
+  queue never seen through `vkGetDeviceQueue`, and a model the helper marked
+  permanently unavailable. Each logs its reason once. This is what turned "the app does
+  nothing" from a guess into a diagnosis.
+- **The proxy encode is wired end to end** (`composition::encode_pass`, `encode.comp`):
+  the scratch image gains STORAGE usage and a MUTABLE_FORMAT `R8G8B8A8_UNORM` view, the
+  encode dispatches over it in place between the blit that fills it and the copy that
+  downloads it, and the scratch is requested at every working scale including 1.0.
+  `compose.comp` gains mode 2, the encoded-proxy ratio transfer: proxy and model are
+  both in the encoded space, so their luminance quotient is dimensionless and only a
+  broad relighting factor crosses the round trip -- which is why upstream needs no
+  motion mask, and why the per-pixel mask that produced the shimmer is gone from that
+  path. Mode 1 remains the fallback where the proxy cannot be encoded.
+- **The encode verifies itself on real hardware.** The untouched frame and the
+  GPU-encoded proxy sit in CPU memory at the same moment, so `compare_to_reference`
+  checks the GPU's output against the exact arithmetic it should have performed and
+  logs the max/mean delta, plus a one-shot line saying whether the encode dispatched at
+  all. **Still unverified: no frame has yet been through the encode or mode 2 on real
+  hardware.**
+- **`scripts/rig-test.sh`**: builds both halves, deploys both atomically, forces the
+  helper to launch from the installed path, runs the game, and reports fps, round-trip
+  rate, timings, composition mode and any Xid -- read out of shared memory and the
+  layer log rather than off a screen. Written after half the day's test rounds were
+  wasted on the layer being hand-copied to the installed path while the helper ran from
+  a stale AppImage.
+
 - **v0.1.70 — fix: real motion-vector device setup was NOT actually gated behind
   `NEURALFORGE_MVEC_HELPER`, and it hung the helper on real NVOF hardware.** v0.1.69
   claimed device creation was a no-op without the opt-in env var; it wasn't. Only the
